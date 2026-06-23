@@ -1,5 +1,6 @@
 import { Request, Response } from "express";
 import { z } from "zod";
+import { env } from "../../config/env";
 import { supabase } from "../../db/supabase";
 import { logger } from "../../utils/logger";
 import {
@@ -27,7 +28,7 @@ const connectQuerySchema = z.object({
 
 const callbackQuerySchema = z.object({
   code: z.string().min(1),
-  state: z.string().min(1)
+  state: z.string().min(1).optional()
 });
 
 function sendDatabaseFailure(res: Response, message = "Could not reach Supabase. Check your database settings."): void {
@@ -43,6 +44,24 @@ function sendBeginnerError(res: Response, status: number, message: string): void
     ok: false,
     message
   });
+}
+
+function getSafeAmazonAdsErrorMessage(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return "Please check your Amazon Ads credentials and try again.";
+  }
+
+  const secretValues = [
+    env.AMAZON_ADS_CLIENT_SECRET,
+    env.AMAZON_ADS_CLIENT_ID,
+    env.ENCRYPTION_KEY,
+    env.SUPABASE_SERVICE_ROLE_KEY
+  ].filter((value): value is string => Boolean(value));
+
+  return secretValues.reduce(
+    (message, secretValue) => message.replaceAll(secretValue, "[REDACTED]"),
+    error.message
+  );
 }
 
 async function findAmazonAdsConnectionBySellerId(
@@ -101,7 +120,20 @@ export async function getAmazonAdsConnectUrl(req: Request, res: Response): Promi
 export async function handleAmazonAdsCallback(req: Request, res: Response): Promise<void> {
   try {
     const query = callbackQuerySchema.parse(req.query);
-    const state = parseAmazonAdsState(query.state);
+    const state = query.state
+      ? parseAmazonAdsState(query.state)
+      : {
+          sellerId: undefined,
+          region: env.AMAZON_ADS_REGION,
+          nonce: null
+        };
+
+    if (!query.state) {
+      logger.warn("Amazon Ads callback did not include OAuth state. Continuing with default region.", {
+        region: env.AMAZON_ADS_REGION
+      });
+    }
+
     const tokenResponse = await exchangeAmazonAdsAuthorizationCode(query.code);
 
     const { data: connection, error } = await supabase
@@ -130,22 +162,19 @@ export async function handleAmazonAdsCallback(req: Request, res: Response): Prom
 
     res.json({
       ok: true,
-      message: "Amazon Ads account connected successfully.",
-      connectionId: connection.id,
-      profilesSaved: profiles.length
+      message: "Amazon Ads account connected successfully",
+      profilesCount: profiles.length
     });
   } catch (error) {
     logger.warn("Amazon Ads callback failed safely.", {
-      message: error instanceof Error ? error.message : "Unknown Amazon Ads callback error"
+      message: getSafeAmazonAdsErrorMessage(error)
     });
 
-    sendBeginnerError(
-      res,
-      400,
-      error instanceof Error
-        ? error.message
-        : "Amazon Ads callback failed. Please restart the connection flow."
-    );
+    res.status(400).json({
+      ok: false,
+      message: "Amazon Ads authorization failed",
+      details: getSafeAmazonAdsErrorMessage(error)
+    });
   }
 }
 
