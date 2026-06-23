@@ -16,7 +16,11 @@ const envSchema = z.object({
   AMAZON_APP_ID: z.string().min(1),
   AMAZON_AUTH_BASE_URL: z.string().url().default("https://sellercentral.amazon.com"),
   AMAZON_LWA_TOKEN_URL: z.string().url().default("https://api.amazon.com/auth/o2/token"),
-  AMAZON_SP_API_REGION: z.enum(["NA", "EU", "FE"]).default("NA")
+  AMAZON_SP_API_REGION: z.enum(["NA", "EU", "FE"]).default("NA"),
+  AMAZON_ADS_CLIENT_ID: z.string().optional(),
+  AMAZON_ADS_CLIENT_SECRET: z.string().optional(),
+  AMAZON_ADS_REDIRECT_URI: z.string().optional(),
+  AMAZON_ADS_REGION: z.enum(["NA", "EU", "FE"]).default("NA")
 });
 
 const parsedEnv = envSchema.safeParse(process.env);

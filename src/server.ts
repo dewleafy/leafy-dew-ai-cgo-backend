@@ -2,6 +2,7 @@ import express, { NextFunction, Request, Response } from "express";
 import { ZodError } from "zod";
 import { env } from "./config/env";
 import { supabase } from "./db/supabase";
+import { amazonAdsRouter } from "./modules/amazon-ads/amazon-ads.routes";
 import { amazonRouter } from "./modules/amazon/amazon.routes";
 import { logger } from "./utils/logger";
 
@@ -38,8 +39,9 @@ function sanitizeErrorMessage(message: string): string {
   const secretValues = [
     env.SUPABASE_SERVICE_ROLE_KEY,
     env.AMAZON_LWA_CLIENT_SECRET,
+    env.AMAZON_ADS_CLIENT_SECRET,
     env.ENCRYPTION_KEY
-  ].filter(Boolean);
+  ].filter((value): value is string => Boolean(value));
 
   return secretValues.reduce(
     (safeMessage, secretValue) => safeMessage.replaceAll(secretValue, "[REDACTED]"),
@@ -111,6 +113,7 @@ app.get("/api/system/db-health", async (_req: Request, res: Response) => {
 });
 
 app.use("/api/amazon", amazonRouter);
+app.use("/api/amazon-ads", amazonAdsRouter);
 
 app.use((_req: Request, res: Response) => {
   res.status(404).json({ message: "Route not found." });
