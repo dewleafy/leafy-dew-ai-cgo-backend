@@ -1,0 +1,18 @@
+name: Daily Amazon Ads Sync
+
+on:
+  schedule:
+    # Runs daily at 03:30 UTC = 09:00 India time
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  daily-amazon-ads-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger daily Amazon Ads campaign sync
+        run: |
+          curl -X POST "https://api.leafydew.in/api/amazon-ads/daily-campaign-sync?sellerId=default" \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
+            --fail \
+            --show-error
