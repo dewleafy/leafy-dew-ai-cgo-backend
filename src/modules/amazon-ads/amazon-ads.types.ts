@@ -115,6 +115,33 @@ export type SafeAmazonAdsSearchTermDailyMetric = {
   lastSyncedAt: string | null;
 };
 
+export type AmazonAdsSearchTermSummaryRow = {
+  searchTerm: string;
+  campaignId: string;
+  campaignName: string | null;
+  adGroupId: string;
+  adGroupName: string | null;
+  impressions: number;
+  clicks: number;
+  cost: number;
+  sales: number;
+  orders: number;
+  ctr: number;
+  cpc: number;
+  acos: number | null;
+  roas: number | null;
+  conversionRate: number;
+};
+
+export type AmazonAdsSearchTermSummary = {
+  totals: AmazonAdsDashboardMetricSummary;
+  wastedSearchTerms: AmazonAdsSearchTermSummaryRow[];
+  convertingSearchTerms: AmazonAdsSearchTermSummaryRow[];
+  highClickNoSaleTerms: AmazonAdsSearchTermSummaryRow[];
+  asinSearchTerms: AmazonAdsSearchTermSummaryRow[];
+  topSpendTerms: AmazonAdsSearchTermSummaryRow[];
+};
+
 export type AmazonAdsDashboardMetricSummary = {
   impressions: number;
   clicks: number;

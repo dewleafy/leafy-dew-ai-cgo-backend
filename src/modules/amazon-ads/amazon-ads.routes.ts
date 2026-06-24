@@ -11,14 +11,17 @@ import {
   getAmazonAdsReportJob,
   getAmazonAdsSavedCampaigns,
   getAmazonAdsSearchTermDailyMetrics,
+  getAmazonAdsSearchTermSummary,
   getAmazonAdsStatus,
   handleAmazonAdsCallback,
   postAmazonAdsBackfillCampaignReports,
+  postAmazonAdsBackfillSearchTermReports,
   postAmazonAdsDailyCampaignSync,
   postAmazonAdsDownloadCampaignReport,
   postAmazonAdsDownloadSearchTermReport,
   postAmazonAdsDisconnect,
   postAmazonAdsProcessCampaignReportJobs,
+  postAmazonAdsProcessSearchTermReportJobs,
   postAmazonAdsRequestCampaignReport,
   postAmazonAdsRequestSearchTermReport,
   postAmazonAdsSyncCampaigns,
@@ -37,6 +40,7 @@ amazonAdsRouter.get("/campaigns", asyncHandler(getAmazonAdsCampaigns));
 amazonAdsRouter.get("/saved-campaigns", asyncHandler(getAmazonAdsSavedCampaigns));
 amazonAdsRouter.get("/campaign-daily-metrics", asyncHandler(getAmazonAdsCampaignDailyMetrics));
 amazonAdsRouter.get("/search-term-daily-metrics", asyncHandler(getAmazonAdsSearchTermDailyMetrics));
+amazonAdsRouter.get("/search-term-summary", asyncHandler(getAmazonAdsSearchTermSummary));
 amazonAdsRouter.get("/dashboard-summary", asyncHandler(getAmazonAdsDashboardSummary));
 amazonAdsRouter.get("/report-job/:jobId", asyncHandler(getAmazonAdsReportJob));
 amazonAdsRouter.post("/request-campaign-report", asyncHandler(postAmazonAdsRequestCampaignReport));
@@ -44,7 +48,9 @@ amazonAdsRouter.post("/request-search-term-report", asyncHandler(postAmazonAdsRe
 amazonAdsRouter.post("/download-campaign-report/:jobId", asyncHandler(postAmazonAdsDownloadCampaignReport));
 amazonAdsRouter.post("/download-search-term-report/:jobId", asyncHandler(postAmazonAdsDownloadSearchTermReport));
 amazonAdsRouter.post("/backfill-campaign-reports", asyncHandler(postAmazonAdsBackfillCampaignReports));
+amazonAdsRouter.post("/backfill-search-term-reports", asyncHandler(postAmazonAdsBackfillSearchTermReports));
 amazonAdsRouter.post("/process-campaign-report-jobs", asyncHandler(postAmazonAdsProcessCampaignReportJobs));
+amazonAdsRouter.post("/process-search-term-report-jobs", asyncHandler(postAmazonAdsProcessSearchTermReportJobs));
 amazonAdsRouter.post("/daily-campaign-sync", asyncHandler(postAmazonAdsDailyCampaignSync));
 amazonAdsRouter.post("/sync-campaigns", asyncHandler(postAmazonAdsSyncCampaigns));
 amazonAdsRouter.post("/test-connection", asyncHandler(postAmazonAdsTestConnection));

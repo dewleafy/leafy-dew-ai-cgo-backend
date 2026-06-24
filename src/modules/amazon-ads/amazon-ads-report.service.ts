@@ -5,6 +5,8 @@ import { retry } from "../../utils/retry";
 import { logAmazonAdsApiCall, logSafeAmazonAdsSupabaseError } from "./amazon-ads-client.service";
 import {
   AmazonAdsDashboardSummary,
+  AmazonAdsSearchTermSummary,
+  AmazonAdsSearchTermSummaryRow,
   AmazonAdsConnection,
   AmazonAdsRegion,
   AmazonAdsReportJob,
@@ -82,6 +84,19 @@ type SearchTermMetricRow = CampaignMetricRow & {
   search_term: string;
 };
 
+type SearchTermSummaryMetricRow = {
+  campaign_id: string;
+  campaign_name: string | null;
+  ad_group_id: string;
+  ad_group_name: string | null;
+  search_term: string;
+  impressions: number | string | null;
+  clicks: number | string | null;
+  cost: number | string | null;
+  sales: number | string | null;
+  orders: number | string | null;
+};
+
 type DashboardMetricRow = {
   campaign_id: string;
   campaign_name: string | null;
@@ -99,6 +114,14 @@ type MetricAccumulator = {
   cost: number;
   sales: number;
   orders: number;
+};
+
+type AggregatableMetricRow = {
+  impressions: number | string | null;
+  clicks: number | string | null;
+  cost: number | string | null;
+  sales: number | string | null;
+  orders: number | string | null;
 };
 
 const ACTIVE_REPORT_STATUSES = ["REQUESTED", "PENDING", "PROCESSING", "IN_PROGRESS", "COMPLETED"];
@@ -272,7 +295,7 @@ function createAccumulator(): MetricAccumulator {
   };
 }
 
-function addMetricRow(accumulator: MetricAccumulator, row: DashboardMetricRow): void {
+function addMetricRow(accumulator: MetricAccumulator, row: AggregatableMetricRow): void {
   accumulator.impressions += toNumber(row.impressions);
   accumulator.clicks += toNumber(row.clicks);
   accumulator.cost += toNumber(row.cost);
@@ -562,6 +585,56 @@ export async function hasCampaignReportJobForDate(input: {
   return Boolean(data);
 }
 
+export async function hasSearchTermMetricsForDate(input: {
+  connectionId: string;
+  profileId: string;
+  sellerId: string;
+  date: string;
+}): Promise<boolean> {
+  const { data, error } = await supabase
+    .from("amazon_ads_search_term_daily_metrics")
+    .select("search_term")
+    .eq("connection_id", input.connectionId)
+    .eq("profile_id", input.profileId)
+    .eq("seller_id", input.sellerId)
+    .eq("report_date", input.date)
+    .limit(1)
+    .maybeSingle<{ search_term: string }>();
+
+  if (error) {
+    logSafeAmazonAdsSupabaseError("Could not check existing Amazon Ads search term metrics.", error);
+    throw new Error("Could not check existing Amazon Ads search term metrics.");
+  }
+
+  return Boolean(data);
+}
+
+export async function hasSearchTermReportJobForDate(input: {
+  connectionId: string;
+  profileId: string;
+  sellerId: string;
+  date: string;
+}): Promise<boolean> {
+  const { data, error } = await supabase
+    .from("amazon_ads_report_jobs")
+    .select("id")
+    .eq("connection_id", input.connectionId)
+    .eq("profile_id", input.profileId)
+    .eq("seller_id", input.sellerId)
+    .eq("report_type", "spSearchTerm")
+    .eq("start_date", input.date)
+    .eq("end_date", input.date)
+    .limit(1)
+    .maybeSingle<{ id: string }>();
+
+  if (error) {
+    logSafeAmazonAdsSupabaseError("Could not check Amazon Ads search term report job for date.", error);
+    throw new Error("Could not check existing Amazon Ads search term report jobs.");
+  }
+
+  return Boolean(data);
+}
+
 export async function loadAmazonAdsReportJob(jobId: string): Promise<AmazonAdsReportJob> {
   const { data, error } = await supabase
     .from("amazon_ads_report_jobs")
@@ -602,6 +675,34 @@ export async function listProcessableCampaignReportJobs(input: {
   if (error) {
     logSafeAmazonAdsSupabaseError("Could not list Amazon Ads report jobs.", error);
     throw new Error("Could not list Amazon Ads report jobs.");
+  }
+
+  return ((data ?? []) as AmazonAdsReportJob[])
+    .filter((job) => !FINISHED_REPORT_STATUSES.includes(job.status.toUpperCase()))
+    .slice(0, input.limit);
+}
+
+export async function listProcessableSearchTermReportJobs(input: {
+  connectionId: string;
+  profileId: string;
+  sellerId: string;
+  limit: number;
+}): Promise<AmazonAdsReportJob[]> {
+  const { data, error } = await supabase
+    .from("amazon_ads_report_jobs")
+    .select(
+      "id, connection_id, profile_id, seller_id, report_id, report_type, ad_product, start_date, end_date, status, report_url, failure_reason, requested_at, completed_at"
+    )
+    .eq("connection_id", input.connectionId)
+    .eq("profile_id", input.profileId)
+    .eq("seller_id", input.sellerId)
+    .eq("report_type", "spSearchTerm")
+    .order("requested_at", { ascending: false })
+    .limit(Math.max(input.limit * 3, input.limit));
+
+  if (error) {
+    logSafeAmazonAdsSupabaseError("Could not list Amazon Ads search term report jobs.", error);
+    throw new Error("Could not list Amazon Ads search term report jobs.");
   }
 
   return ((data ?? []) as AmazonAdsReportJob[])
@@ -883,6 +984,112 @@ export async function listSearchTermDailyMetrics(input: {
   return {
     date: reportDate,
     metrics: ((data ?? []) as SearchTermMetricRow[]).map(toSafeSearchTermMetric)
+  };
+}
+
+function isAsinSearchTerm(searchTerm: string): boolean {
+  return /^B[A-Z0-9]{9}$/i.test(searchTerm.trim());
+}
+
+function toSearchTermSummaryRow(
+  accumulator: MetricAccumulator & {
+    searchTerm: string;
+    campaignId: string;
+    campaignName: string | null;
+    adGroupId: string;
+    adGroupName: string | null;
+  }
+): AmazonAdsSearchTermSummaryRow {
+  return {
+    searchTerm: accumulator.searchTerm,
+    campaignId: accumulator.campaignId,
+    campaignName: accumulator.campaignName,
+    adGroupId: accumulator.adGroupId,
+    adGroupName: accumulator.adGroupName,
+    ...summarizeAccumulator(accumulator)
+  };
+}
+
+export async function getSearchTermSummary(input: {
+  sellerId: string;
+  days: number;
+}): Promise<AmazonAdsSearchTermSummary> {
+  const endDate = new Date().toISOString().slice(0, 10);
+  const startDate = new Date(Date.now() - (input.days - 1) * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10);
+
+  const { data, error } = await supabase
+    .from("amazon_ads_search_term_daily_metrics")
+    .select(
+      "campaign_id, campaign_name, ad_group_id, ad_group_name, search_term, impressions, clicks, cost, sales, orders"
+    )
+    .eq("seller_id", input.sellerId)
+    .gte("report_date", startDate)
+    .lte("report_date", endDate);
+
+  if (error) {
+    logSafeAmazonAdsSupabaseError("Could not load Amazon Ads search term summary metrics.", error);
+    throw new Error("Could not load Amazon Ads search term summary.");
+  }
+
+  const totalsAccumulator = createAccumulator();
+  const grouped = new Map<
+    string,
+    MetricAccumulator & {
+      searchTerm: string;
+      campaignId: string;
+      campaignName: string | null;
+      adGroupId: string;
+      adGroupName: string | null;
+    }
+  >();
+
+  for (const row of (data ?? []) as SearchTermSummaryMetricRow[]) {
+    addMetricRow(totalsAccumulator, row);
+
+    const searchTerm = row.search_term;
+    const campaignId = row.campaign_id;
+    const adGroupId = row.ad_group_id;
+    const key = `${searchTerm}::${campaignId}::${adGroupId}`;
+    const accumulator =
+      grouped.get(key) ??
+      {
+        ...createAccumulator(),
+        searchTerm,
+        campaignId,
+        campaignName: row.campaign_name,
+        adGroupId,
+        adGroupName: row.ad_group_name
+      };
+
+    addMetricRow(accumulator, row);
+    accumulator.campaignName = accumulator.campaignName ?? row.campaign_name;
+    accumulator.adGroupName = accumulator.adGroupName ?? row.ad_group_name;
+    grouped.set(key, accumulator);
+  }
+
+  const rows = Array.from(grouped.values()).map((accumulator) => toSearchTermSummaryRow(accumulator));
+
+  return {
+    totals: summarizeAccumulator(totalsAccumulator),
+    wastedSearchTerms: rows
+      .filter((row) => row.cost > 0 && row.sales === 0)
+      .sort((a, b) => b.cost - a.cost)
+      .slice(0, 50),
+    convertingSearchTerms: rows
+      .filter((row) => row.orders > 0 || row.sales > 0)
+      .sort((a, b) => b.sales - a.sales)
+      .slice(0, 50),
+    highClickNoSaleTerms: rows
+      .filter((row) => row.clicks >= 5 && row.sales === 0)
+      .sort((a, b) => b.clicks - a.clicks)
+      .slice(0, 50),
+    asinSearchTerms: rows
+      .filter((row) => isAsinSearchTerm(row.searchTerm))
+      .sort((a, b) => b.cost - a.cost)
+      .slice(0, 50),
+    topSpendTerms: [...rows].sort((a, b) => b.cost - a.cost).slice(0, 50)
   };
 }
 
