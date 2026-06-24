@@ -8,7 +8,8 @@ import {
   AmazonAdsConnection,
   AmazonAdsRegion,
   AmazonAdsReportJob,
-  SafeAmazonAdsCampaignDailyMetric
+  SafeAmazonAdsCampaignDailyMetric,
+  SafeAmazonAdsSearchTermDailyMetric
 } from "./amazon-ads.types";
 
 const AMAZON_ADS_API_ENDPOINTS: Record<AmazonAdsRegion, string> = {
@@ -44,6 +45,16 @@ type RawCampaignMetricRow = {
   sales14d?: string | number;
 };
 
+type RawSearchTermMetricRow = RawCampaignMetricRow & {
+  adGroupId?: string | number;
+  adGroupName?: string;
+  keywordId?: string | number;
+  keyword?: string;
+  matchType?: string;
+  targeting?: string;
+  searchTerm?: string;
+};
+
 type CampaignMetricRow = {
   campaign_id: string;
   campaign_name: string | null;
@@ -59,6 +70,16 @@ type CampaignMetricRow = {
   ctr: number | null;
   conversion_rate: number | null;
   last_synced_at: string | null;
+};
+
+type SearchTermMetricRow = CampaignMetricRow & {
+  ad_group_id: string;
+  ad_group_name: string | null;
+  keyword_id: string | null;
+  keyword: string | null;
+  match_type: string | null;
+  targeting: string | null;
+  search_term: string;
 };
 
 type DashboardMetricRow = {
@@ -127,6 +148,10 @@ function parseGzipJsonRows(buffer: Buffer): RawCampaignMetricRow[] {
   return [];
 }
 
+function parseGzipJsonSearchTermRows(buffer: Buffer): RawSearchTermMetricRow[] {
+  return parseGzipJsonRows(buffer) as RawSearchTermMetricRow[];
+}
+
 function toMetricInsertRow(input: {
   row: RawCampaignMetricRow;
   connectionId: string;
@@ -166,10 +191,58 @@ function toMetricInsertRow(input: {
   };
 }
 
+function toSearchTermMetricInsertRow(input: {
+  row: RawSearchTermMetricRow;
+  connectionId: string;
+  profileId: string;
+  sellerId: string;
+  fallbackDate: string;
+  syncedAt: string;
+}) {
+  const base = toMetricInsertRow(input);
+
+  return {
+    ...base,
+    ad_group_id: String(input.row.adGroupId ?? ""),
+    ad_group_name: input.row.adGroupName ?? null,
+    keyword_id: input.row.keywordId == null ? null : String(input.row.keywordId),
+    keyword: input.row.keyword ?? null,
+    match_type: input.row.matchType ?? null,
+    targeting: input.row.targeting ?? null,
+    search_term: input.row.searchTerm ?? ""
+  };
+}
+
 function toSafeMetric(row: CampaignMetricRow): SafeAmazonAdsCampaignDailyMetric {
   return {
     campaignId: row.campaign_id,
     campaignName: row.campaign_name,
+    reportDate: row.report_date,
+    impressions: row.impressions,
+    clicks: row.clicks,
+    cost: row.cost,
+    sales: row.sales,
+    orders: row.orders,
+    acos: row.acos,
+    roas: row.roas,
+    cpc: row.cpc,
+    ctr: row.ctr,
+    conversionRate: row.conversion_rate,
+    lastSyncedAt: row.last_synced_at
+  };
+}
+
+function toSafeSearchTermMetric(row: SearchTermMetricRow): SafeAmazonAdsSearchTermDailyMetric {
+  return {
+    campaignId: row.campaign_id,
+    campaignName: row.campaign_name,
+    adGroupId: row.ad_group_id,
+    adGroupName: row.ad_group_name,
+    keywordId: row.keyword_id,
+    keyword: row.keyword,
+    matchType: row.match_type,
+    targeting: row.targeting,
+    searchTerm: row.search_term,
     reportDate: row.report_date,
     impressions: row.impressions,
     clicks: row.clicks,
@@ -309,6 +382,103 @@ export async function requestSponsoredProductsCampaignReport(input: {
       logSafeAmazonAdsSupabaseError("Could not save Amazon Ads report job.", error);
     }
     throw new Error("Could not save Amazon Ads report job.");
+  }
+
+  return {
+    jobId: data.id,
+    reportId,
+    status
+  };
+}
+
+export async function requestSponsoredProductsSearchTermReport(input: {
+  accessToken: string;
+  region: AmazonAdsRegion;
+  profileId: string;
+  connectionId: string;
+  sellerId: string;
+  date: string;
+}): Promise<{ jobId: string; reportId: string; status: string }> {
+  const endpoint = "/reporting/reports";
+  const body = {
+    name: `SP search term daily performance ${input.date}`,
+    startDate: input.date,
+    endDate: input.date,
+    configuration: {
+      adProduct: "SPONSORED_PRODUCTS",
+      reportTypeId: "spSearchTerm",
+      groupBy: ["searchTerm"],
+      timeUnit: "DAILY",
+      format: "GZIP_JSON",
+      columns: [
+        "date",
+        "campaignId",
+        "campaignName",
+        "adGroupId",
+        "adGroupName",
+        "keywordId",
+        "keyword",
+        "matchType",
+        "targeting",
+        "searchTerm",
+        "impressions",
+        "clicks",
+        "cost",
+        "purchases14d",
+        "sales14d"
+      ]
+    }
+  };
+
+  const response = await retry(() =>
+    axios.post<CreateReportResponse>(`${AMAZON_ADS_API_ENDPOINTS[input.region]}${endpoint}`, body, {
+      headers: {
+        Authorization: `Bearer ${input.accessToken}`,
+        "Amazon-Advertising-API-ClientId": process.env.AMAZON_ADS_CLIENT_ID ?? "",
+        "Amazon-Advertising-API-Scope": input.profileId,
+        "Content-Type": "application/vnd.createasyncreportrequest.v3+json",
+        Accept: "application/vnd.createasyncreportresponse.v3+json"
+      }
+    })
+  );
+
+  await logAmazonAdsApiCall({
+    connectionId: input.connectionId,
+    endpoint,
+    method: "POST",
+    statusCode: response.status,
+    success: true
+  });
+
+  const reportId = response.data.reportId ?? response.data.report_id;
+
+  if (!reportId) {
+    throw new Error("Amazon Ads did not return a reportId.");
+  }
+
+  const status = response.data.status ?? "PENDING";
+  const { data, error } = await supabase
+    .from("amazon_ads_report_jobs")
+    .insert({
+      connection_id: input.connectionId,
+      profile_id: input.profileId,
+      seller_id: input.sellerId,
+      report_id: reportId,
+      report_type: "spSearchTerm",
+      ad_product: "SPONSORED_PRODUCTS",
+      start_date: input.date,
+      end_date: input.date,
+      status,
+      requested_at: new Date().toISOString()
+    })
+    .select("id")
+    .single<{ id: string }>();
+
+  if (error || !data) {
+    if (error) {
+      logSafeAmazonAdsSupabaseError("Could not save Amazon Ads search term report job.", error);
+    }
+    throw new Error("Could not save Amazon Ads search term report job.");
   }
 
   return {
@@ -552,6 +722,49 @@ export async function downloadAndSaveCampaignReport(job: AmazonAdsReportJob): Pr
   return insertRows.length;
 }
 
+export async function downloadAndSaveSearchTermReport(job: AmazonAdsReportJob): Promise<number> {
+  if (job.report_type !== "spSearchTerm") {
+    throw new Error("This report job is not a Sponsored Products search term report.");
+  }
+
+  if (job.status.toUpperCase() !== "COMPLETED" || !job.report_url) {
+    return 0;
+  }
+
+  const response = await axios.get<ArrayBuffer>(job.report_url, {
+    responseType: "arraybuffer"
+  });
+  const rows = parseGzipJsonSearchTermRows(Buffer.from(response.data));
+  const syncedAt = new Date().toISOString();
+  const insertRows = rows
+    .map((row) =>
+      toSearchTermMetricInsertRow({
+        row,
+        connectionId: job.connection_id,
+        profileId: job.profile_id,
+        sellerId: job.seller_id ?? "default",
+        fallbackDate: job.start_date,
+        syncedAt
+      })
+    )
+    .filter((row) => row.campaign_id.length > 0 && row.ad_group_id.length > 0 && row.search_term.length > 0);
+
+  if (insertRows.length === 0) {
+    return 0;
+  }
+
+  const { error } = await supabase.from("amazon_ads_search_term_daily_metrics").upsert(insertRows, {
+    onConflict: "profile_id,report_date,campaign_id,ad_group_id,search_term"
+  });
+
+  if (error) {
+    logSafeAmazonAdsSupabaseError("Could not save Amazon Ads search term daily metrics.", error);
+    throw new Error("Could not save Amazon Ads search term daily metrics.");
+  }
+
+  return insertRows.length;
+}
+
 export async function markAmazonAdsReportJobSynced(jobId: string): Promise<void> {
   const { error } = await supabase
     .from("amazon_ads_report_jobs")
@@ -617,6 +830,59 @@ export async function listCampaignDailyMetrics(input: {
   return {
     date: reportDate,
     metrics: ((data ?? []) as CampaignMetricRow[]).map(toSafeMetric)
+  };
+}
+
+export async function listSearchTermDailyMetrics(input: {
+  connectionId: string;
+  profileId: string;
+  date?: string;
+}): Promise<{ date: string | null; metrics: SafeAmazonAdsSearchTermDailyMetric[] }> {
+  let reportDate = input.date;
+
+  if (!reportDate) {
+    const { data: latest, error: latestError } = await supabase
+      .from("amazon_ads_search_term_daily_metrics")
+      .select("report_date")
+      .eq("connection_id", input.connectionId)
+      .eq("profile_id", input.profileId)
+      .order("report_date", { ascending: false })
+      .limit(1)
+      .maybeSingle<{ report_date: string }>();
+
+    if (latestError) {
+      logSafeAmazonAdsSupabaseError("Could not find latest Amazon Ads search term metrics date.", latestError);
+      throw new Error("Could not load Amazon Ads search term daily metrics.");
+    }
+
+    reportDate = latest?.report_date;
+  }
+
+  if (!reportDate) {
+    return {
+      date: null,
+      metrics: []
+    };
+  }
+
+  const { data, error } = await supabase
+    .from("amazon_ads_search_term_daily_metrics")
+    .select(
+      "campaign_id, campaign_name, ad_group_id, ad_group_name, keyword_id, keyword, match_type, targeting, search_term, report_date, impressions, clicks, cost, sales, orders, acos, roas, cpc, ctr, conversion_rate, last_synced_at"
+    )
+    .eq("connection_id", input.connectionId)
+    .eq("profile_id", input.profileId)
+    .eq("report_date", reportDate)
+    .order("cost", { ascending: false });
+
+  if (error) {
+    logSafeAmazonAdsSupabaseError("Could not load Amazon Ads search term daily metrics.", error);
+    throw new Error("Could not load Amazon Ads search term daily metrics.");
+  }
+
+  return {
+    date: reportDate,
+    metrics: ((data ?? []) as SearchTermMetricRow[]).map(toSafeSearchTermMetric)
   };
 }
 

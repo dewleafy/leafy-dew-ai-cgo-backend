@@ -91,6 +91,30 @@ export type SafeAmazonAdsCampaignDailyMetric = {
   lastSyncedAt: string | null;
 };
 
+export type SafeAmazonAdsSearchTermDailyMetric = {
+  campaignId: string;
+  campaignName: string | null;
+  adGroupId: string;
+  adGroupName: string | null;
+  keywordId: string | null;
+  keyword: string | null;
+  matchType: string | null;
+  targeting: string | null;
+  searchTerm: string;
+  reportDate: string;
+  impressions: number;
+  clicks: number;
+  cost: number;
+  sales: number;
+  orders: number;
+  acos: number | null;
+  roas: number | null;
+  cpc: number | null;
+  ctr: number | null;
+  conversionRate: number | null;
+  lastSyncedAt: string | null;
+};
+
 export type AmazonAdsDashboardMetricSummary = {
   impressions: number;
   clicks: number;

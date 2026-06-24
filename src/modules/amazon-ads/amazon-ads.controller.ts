@@ -27,17 +27,20 @@ import {
 } from "./amazon-ads-profile.service";
 import {
   downloadAndSaveCampaignReport,
+  downloadAndSaveSearchTermReport,
   getCampaignDashboardSummary,
   hasActiveCampaignReportJobForDate,
   hasCampaignMetricsForDate,
   hasCampaignReportJobForDate,
   listCampaignDailyMetrics,
   listProcessableCampaignReportJobs,
+  listSearchTermDailyMetrics,
   loadAmazonAdsConnectionById,
   loadAmazonAdsReportJob,
   markAmazonAdsReportJobSynced,
   refreshAmazonAdsReportJobStatus,
-  requestSponsoredProductsCampaignReport
+  requestSponsoredProductsCampaignReport,
+  requestSponsoredProductsSearchTermReport
 } from "./amazon-ads-report.service";
 import {
   deleteAmazonAdsTokens,
@@ -678,6 +681,53 @@ export async function postAmazonAdsRequestCampaignReport(req: Request, res: Resp
   }
 }
 
+export async function postAmazonAdsRequestSearchTermReport(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+
+  try {
+    const date = getDateFromQuery(req);
+    const context = await loadAmazonAdsCampaignContext(sellerId);
+
+    if (!context.ok) {
+      if (context.database) {
+        sendDatabaseFailure(res, context.message);
+        return;
+      }
+      sendBeginnerError(res, context.status, context.message);
+      return;
+    }
+
+    const accessToken = await getAmazonAdsAccessToken(context.connection.id);
+    const job = await requestSponsoredProductsSearchTermReport({
+      accessToken,
+      region: context.connection.region,
+      profileId: context.profile.profile_id,
+      connectionId: context.connection.id,
+      sellerId: context.connection.seller_id ?? sellerId,
+      date
+    });
+
+    res.json({
+      ok: true,
+      jobId: job.jobId,
+      reportId: job.reportId,
+      status: job.status,
+      date
+    });
+  } catch (error) {
+    logger.warn("Amazon Ads search term report request failed safely.", {
+      sellerId,
+      message: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+
+    res.status(400).json({
+      ok: false,
+      message: "Could not request Amazon Ads search term report.",
+      details: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+  }
+}
+
 export async function getAmazonAdsReportJob(req: Request, res: Response): Promise<void> {
   const jobId = req.params.jobId;
 
@@ -757,6 +807,48 @@ export async function postAmazonAdsDownloadCampaignReport(req: Request, res: Res
   }
 }
 
+export async function postAmazonAdsDownloadSearchTermReport(req: Request, res: Response): Promise<void> {
+  const jobId = req.params.jobId;
+
+  try {
+    const job = await loadAmazonAdsReportJob(jobId);
+
+    if (job.report_type !== "spSearchTerm") {
+      sendBeginnerError(res, 400, "This report job is not a Sponsored Products search term report.");
+      return;
+    }
+
+    if (job.status.toUpperCase() !== "COMPLETED" || !job.report_url) {
+      res.json({
+        ok: false,
+        message: "Amazon Ads search term report is not ready yet.",
+        jobId,
+        status: job.status
+      });
+      return;
+    }
+
+    const syncedCount = await downloadAndSaveSearchTermReport(job);
+
+    res.json({
+      ok: true,
+      jobId,
+      syncedCount
+    });
+  } catch (error) {
+    logger.warn("Amazon Ads search term report download failed safely.", {
+      jobId,
+      message: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+
+    res.status(400).json({
+      ok: false,
+      message: "Could not download Amazon Ads search term report.",
+      details: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+  }
+}
+
 export async function getAmazonAdsCampaignDailyMetrics(req: Request, res: Response): Promise<void> {
   const sellerId = getSellerIdFromQuery(req);
 
@@ -797,6 +889,51 @@ export async function getAmazonAdsCampaignDailyMetrics(req: Request, res: Respon
     res.status(400).json({
       ok: false,
       message: "Could not load Amazon Ads campaign daily metrics.",
+      details: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+  }
+}
+
+export async function getAmazonAdsSearchTermDailyMetrics(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+
+  try {
+    const date = typeof req.query.date === "string" && req.query.date.trim()
+      ? dateQuerySchema.parse(req.query.date.trim())
+      : undefined;
+    const context = await loadAmazonAdsCampaignContext(sellerId);
+
+    if (!context.ok) {
+      if (context.database) {
+        sendDatabaseFailure(res, context.message);
+        return;
+      }
+      sendBeginnerError(res, context.status, context.message);
+      return;
+    }
+
+    const result = await listSearchTermDailyMetrics({
+      connectionId: context.connection.id,
+      profileId: context.profile.profile_id,
+      date
+    });
+
+    res.json({
+      ok: true,
+      sellerId,
+      profileId: context.profile.profile_id,
+      date: result.date,
+      metrics: result.metrics
+    });
+  } catch (error) {
+    logger.warn("Amazon Ads search term daily metrics request failed safely.", {
+      sellerId,
+      message: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+
+    res.status(400).json({
+      ok: false,
+      message: "Could not load Amazon Ads search term daily metrics.",
       details: getSafeAmazonAdsUnknownErrorMessage(error)
     });
   }
