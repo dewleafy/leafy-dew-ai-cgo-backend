@@ -5,6 +5,7 @@ import {
   getAmazonAdsConnectUrl,
   getAmazonAdsCampaigns,
   getAmazonAdsCampaignDailyMetrics,
+  getAmazonAdsDashboardSummary,
   getAmazonAdsDbHealth,
   getAmazonAdsProfilesController,
   getAmazonAdsReportJob,
@@ -31,6 +32,7 @@ amazonAdsRouter.get("/profiles", asyncHandler(getAmazonAdsProfilesController));
 amazonAdsRouter.get("/campaigns", asyncHandler(getAmazonAdsCampaigns));
 amazonAdsRouter.get("/saved-campaigns", asyncHandler(getAmazonAdsSavedCampaigns));
 amazonAdsRouter.get("/campaign-daily-metrics", asyncHandler(getAmazonAdsCampaignDailyMetrics));
+amazonAdsRouter.get("/dashboard-summary", asyncHandler(getAmazonAdsDashboardSummary));
 amazonAdsRouter.get("/report-job/:jobId", asyncHandler(getAmazonAdsReportJob));
 amazonAdsRouter.post("/request-campaign-report", asyncHandler(postAmazonAdsRequestCampaignReport));
 amazonAdsRouter.post("/download-campaign-report/:jobId", asyncHandler(postAmazonAdsDownloadCampaignReport));

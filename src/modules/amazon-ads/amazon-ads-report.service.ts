@@ -4,6 +4,7 @@ import { supabase } from "../../db/supabase";
 import { retry } from "../../utils/retry";
 import { logAmazonAdsApiCall, logSafeAmazonAdsSupabaseError } from "./amazon-ads-client.service";
 import {
+  AmazonAdsDashboardSummary,
   AmazonAdsConnection,
   AmazonAdsRegion,
   AmazonAdsReportJob,
@@ -58,6 +59,25 @@ type CampaignMetricRow = {
   ctr: number | null;
   conversion_rate: number | null;
   last_synced_at: string | null;
+};
+
+type DashboardMetricRow = {
+  campaign_id: string;
+  campaign_name: string | null;
+  report_date: string;
+  impressions: number | string | null;
+  clicks: number | string | null;
+  cost: number | string | null;
+  sales: number | string | null;
+  orders: number | string | null;
+};
+
+type MetricAccumulator = {
+  impressions: number;
+  clicks: number;
+  cost: number;
+  sales: number;
+  orders: number;
 };
 
 const ACTIVE_REPORT_STATUSES = ["REQUESTED", "PENDING", "PROCESSING", "IN_PROGRESS", "COMPLETED"];
@@ -162,6 +182,49 @@ function toSafeMetric(row: CampaignMetricRow): SafeAmazonAdsCampaignDailyMetric 
     ctr: row.ctr,
     conversionRate: row.conversion_rate,
     lastSyncedAt: row.last_synced_at
+  };
+}
+
+function roundTwo(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+function createAccumulator(): MetricAccumulator {
+  return {
+    impressions: 0,
+    clicks: 0,
+    cost: 0,
+    sales: 0,
+    orders: 0
+  };
+}
+
+function addMetricRow(accumulator: MetricAccumulator, row: DashboardMetricRow): void {
+  accumulator.impressions += toNumber(row.impressions);
+  accumulator.clicks += toNumber(row.clicks);
+  accumulator.cost += toNumber(row.cost);
+  accumulator.sales += toNumber(row.sales);
+  accumulator.orders += toNumber(row.orders);
+}
+
+function summarizeAccumulator(accumulator: MetricAccumulator) {
+  return {
+    impressions: roundTwo(accumulator.impressions),
+    clicks: roundTwo(accumulator.clicks),
+    cost: roundTwo(accumulator.cost),
+    sales: roundTwo(accumulator.sales),
+    orders: roundTwo(accumulator.orders),
+    ctr: roundTwo(safeDivide(accumulator.clicks, accumulator.impressions, 100) ?? 0),
+    cpc: roundTwo(safeDivide(accumulator.cost, accumulator.clicks) ?? 0),
+    acos:
+      accumulator.sales > 0
+        ? roundTwo(safeDivide(accumulator.cost, accumulator.sales, 100) ?? 0)
+        : null,
+    roas:
+      accumulator.cost > 0
+        ? roundTwo(safeDivide(accumulator.sales, accumulator.cost) ?? 0)
+        : null,
+    conversionRate: roundTwo(safeDivide(accumulator.orders, accumulator.clicks, 100) ?? 0)
   };
 }
 
@@ -528,5 +591,97 @@ export async function listCampaignDailyMetrics(input: {
   return {
     date: reportDate,
     metrics: ((data ?? []) as CampaignMetricRow[]).map(toSafeMetric)
+  };
+}
+
+export async function getCampaignDashboardSummary(input: {
+  connectionId: string;
+  profileId: string;
+  sellerId: string;
+  days: number;
+}): Promise<AmazonAdsDashboardSummary> {
+  const endDate = new Date().toISOString().slice(0, 10);
+  const startDate = new Date(Date.now() - (input.days - 1) * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10);
+
+  const { data, error } = await supabase
+    .from("amazon_ads_campaign_daily_metrics")
+    .select("campaign_id, campaign_name, report_date, impressions, clicks, cost, sales, orders")
+    .eq("connection_id", input.connectionId)
+    .eq("profile_id", input.profileId)
+    .eq("seller_id", input.sellerId)
+    .gte("report_date", startDate)
+    .lte("report_date", endDate)
+    .order("report_date", { ascending: true });
+
+  if (error) {
+    logSafeAmazonAdsSupabaseError("Could not load Amazon Ads dashboard summary metrics.", error);
+    throw new Error("Could not load Amazon Ads dashboard summary.");
+  }
+
+  const rows = (data ?? []) as DashboardMetricRow[];
+  const totalsAccumulator = createAccumulator();
+  const dailyMap = new Map<string, MetricAccumulator>();
+  const campaignMap = new Map<string, MetricAccumulator & { campaignId: string; campaignName: string | null }>();
+  let zeroSalesSpend = 0;
+
+  for (const row of rows) {
+    addMetricRow(totalsAccumulator, row);
+
+    const dailyAccumulator = dailyMap.get(row.report_date) ?? createAccumulator();
+    addMetricRow(dailyAccumulator, row);
+    dailyMap.set(row.report_date, dailyAccumulator);
+
+    const campaignAccumulator =
+      campaignMap.get(row.campaign_id) ??
+      {
+        ...createAccumulator(),
+        campaignId: row.campaign_id,
+        campaignName: row.campaign_name
+      };
+    addMetricRow(campaignAccumulator, row);
+    campaignAccumulator.campaignName = campaignAccumulator.campaignName ?? row.campaign_name;
+    campaignMap.set(row.campaign_id, campaignAccumulator);
+
+    const rowSales = toNumber(row.sales);
+    const rowCost = toNumber(row.cost);
+    if (rowSales <= 0 && rowCost > 0) {
+      zeroSalesSpend += rowCost;
+    }
+  }
+
+  const dailyTrend = Array.from(dailyMap.entries()).map(([date, accumulator]) => ({
+    date,
+    ...summarizeAccumulator(accumulator)
+  }));
+  const campaigns = Array.from(campaignMap.values())
+    .map((accumulator) => ({
+      campaignId: accumulator.campaignId,
+      campaignName: accumulator.campaignName,
+      ...summarizeAccumulator(accumulator)
+    }))
+    .sort((a, b) => b.cost - a.cost);
+
+  const bestCampaignByClicks =
+    campaigns.length > 0
+      ? campaigns.reduce((best, campaign) => (campaign.clicks > best.clicks ? campaign : best), campaigns[0])
+      : null;
+  const highestSpendCampaign =
+    campaigns.length > 0
+      ? campaigns.reduce((highest, campaign) => (campaign.cost > highest.cost ? campaign : highest), campaigns[0])
+      : null;
+
+  return {
+    dateRange: {
+      startDate,
+      endDate
+    },
+    totals: summarizeAccumulator(totalsAccumulator),
+    dailyTrend,
+    campaigns,
+    bestCampaignByClicks,
+    highestSpendCampaign,
+    zeroSalesSpend: roundTwo(zeroSalesSpend)
   };
 }

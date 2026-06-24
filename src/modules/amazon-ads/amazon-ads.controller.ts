@@ -26,6 +26,7 @@ import {
 } from "./amazon-ads-profile.service";
 import {
   downloadAndSaveCampaignReport,
+  getCampaignDashboardSummary,
   hasActiveCampaignReportJobForDate,
   hasCampaignMetricsForDate,
   listCampaignDailyMetrics,
@@ -880,6 +881,49 @@ export async function postAmazonAdsProcessCampaignReportJobs(req: Request, res: 
     res.status(400).json({
       ok: false,
       message: "Could not process Amazon Ads campaign report jobs.",
+      details: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+  }
+}
+
+export async function getAmazonAdsDashboardSummary(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+
+  try {
+    const days = getDaysFromQuery(req);
+    const context = await loadAmazonAdsCampaignContext(sellerId);
+
+    if (!context.ok) {
+      if (context.database) {
+        sendDatabaseFailure(res, context.message);
+        return;
+      }
+      sendBeginnerError(res, context.status, context.message);
+      return;
+    }
+
+    const summary = await getCampaignDashboardSummary({
+      connectionId: context.connection.id,
+      profileId: context.profile.profile_id,
+      sellerId: context.connection.seller_id ?? sellerId,
+      days
+    });
+
+    res.json({
+      ok: true,
+      sellerId,
+      days,
+      ...summary
+    });
+  } catch (error) {
+    logger.warn("Amazon Ads dashboard summary request failed safely.", {
+      sellerId,
+      message: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+
+    res.status(400).json({
+      ok: false,
+      message: "Could not load Amazon Ads dashboard summary.",
       details: getSafeAmazonAdsUnknownErrorMessage(error)
     });
   }

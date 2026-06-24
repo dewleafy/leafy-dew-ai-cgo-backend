@@ -91,6 +91,41 @@ export type SafeAmazonAdsCampaignDailyMetric = {
   lastSyncedAt: string | null;
 };
 
+export type AmazonAdsDashboardMetricSummary = {
+  impressions: number;
+  clicks: number;
+  cost: number;
+  sales: number;
+  orders: number;
+  ctr: number;
+  cpc: number;
+  acos: number | null;
+  roas: number | null;
+  conversionRate: number;
+};
+
+export type AmazonAdsDashboardCampaignSummary = AmazonAdsDashboardMetricSummary & {
+  campaignId: string;
+  campaignName: string | null;
+};
+
+export type AmazonAdsDashboardDailyTrend = AmazonAdsDashboardMetricSummary & {
+  date: string;
+};
+
+export type AmazonAdsDashboardSummary = {
+  dateRange: {
+    startDate: string;
+    endDate: string;
+  };
+  totals: AmazonAdsDashboardMetricSummary;
+  dailyTrend: AmazonAdsDashboardDailyTrend[];
+  campaigns: AmazonAdsDashboardCampaignSummary[];
+  bestCampaignByClicks: AmazonAdsDashboardCampaignSummary | null;
+  highestSpendCampaign: AmazonAdsDashboardCampaignSummary | null;
+  zeroSalesSpend: number;
+};
+
 export type AmazonAdsConfigCheck = {
   adsClientIdPresent: boolean;
   adsClientSecretPresent: boolean;
