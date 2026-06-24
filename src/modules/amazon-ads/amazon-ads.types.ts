@@ -33,6 +33,26 @@ export type AmazonAdsProfile = {
   accountInfo?: Record<string, unknown>;
 };
 
+export type AmazonAdsStoredProfile = {
+  profile_id: string;
+  country_code: string | null;
+  currency_code: string | null;
+  timezone: string | null;
+  account_info: Record<string, unknown> | null;
+};
+
+export type SafeAmazonAdsCampaign = {
+  campaignId: string;
+  name: string | null;
+  campaignType: string | null;
+  targetingType: string | null;
+  state: string | null;
+  status: string | null;
+  dailyBudget: number | string | null;
+  startDate: string | null;
+  endDate: string | null;
+};
+
 export type AmazonAdsConfigCheck = {
   adsClientIdPresent: boolean;
   adsClientSecretPresent: boolean;

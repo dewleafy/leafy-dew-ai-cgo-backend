@@ -2,7 +2,7 @@ import axios from "axios";
 import { supabase } from "../../db/supabase";
 import { logger } from "../../utils/logger";
 import { retry } from "../../utils/retry";
-import { AmazonAdsProfile, AmazonAdsRegion } from "./amazon-ads.types";
+import { AmazonAdsProfile, AmazonAdsRegion, SafeAmazonAdsCampaign } from "./amazon-ads.types";
 
 const AMAZON_ADS_API_ENDPOINTS: Record<AmazonAdsRegion, string> = {
   NA: "https://advertising-api.amazon.com",
@@ -33,6 +33,31 @@ function sanitizeAmazonAdsLogValue(value: string | undefined): string | undefine
     (safeValue, secretValue) => safeValue.replaceAll(secretValue, "[REDACTED]"),
     value
   );
+}
+
+function toSafeCampaign(campaign: Record<string, unknown>): SafeAmazonAdsCampaign {
+  const campaignId = campaign.campaignId ?? campaign.campaign_id ?? campaign.id;
+  const budget =
+    campaign.dailyBudget ??
+    campaign.daily_budget ??
+    (campaign.budget && typeof campaign.budget === "object"
+      ? (campaign.budget as Record<string, unknown>).budget
+      : null);
+
+  return {
+    campaignId: String(campaignId ?? ""),
+    name: typeof campaign.name === "string" ? campaign.name : null,
+    campaignType: typeof campaign.campaignType === "string" ? campaign.campaignType : "sponsoredProducts",
+    targetingType: typeof campaign.targetingType === "string" ? campaign.targetingType : null,
+    state: typeof campaign.state === "string" ? campaign.state : typeof campaign.status === "string" ? campaign.status : null,
+    status: typeof campaign.status === "string" ? campaign.status : typeof campaign.state === "string" ? campaign.state : null,
+    dailyBudget:
+      typeof budget === "number" || typeof budget === "string"
+        ? budget
+        : null,
+    startDate: typeof campaign.startDate === "string" ? campaign.startDate : null,
+    endDate: typeof campaign.endDate === "string" ? campaign.endDate : null
+  };
 }
 
 export function logSafeAmazonAdsSupabaseError(context: string, error: SupabaseErrorDetails): void {
@@ -113,5 +138,65 @@ export async function getAmazonAdsProfiles(
     });
 
     throw new Error(`Amazon Ads Profiles API request failed: ${errorMessage}`);
+  }
+}
+
+export async function getSponsoredProductsCampaigns(input: {
+  accessToken: string;
+  region: AmazonAdsRegion;
+  profileId: string;
+  connectionId: string;
+}): Promise<SafeAmazonAdsCampaign[]> {
+  const startedAt = Date.now();
+  const endpoint = "/sp/campaigns";
+
+  try {
+    const response = await retry(() =>
+      axios.get<unknown>(`${AMAZON_ADS_API_ENDPOINTS[input.region]}${endpoint}`, {
+        headers: {
+          Authorization: `Bearer ${input.accessToken}`,
+          "Amazon-Advertising-API-ClientId": process.env.AMAZON_ADS_CLIENT_ID ?? "",
+          "Amazon-Advertising-API-Scope": input.profileId
+        }
+      })
+    );
+
+    await logAmazonAdsApiCall({
+      connectionId: input.connectionId,
+      endpoint,
+      method: "GET",
+      statusCode: response.status,
+      success: true,
+      durationMs: Date.now() - startedAt
+    });
+
+    const responseData = response.data;
+    const rawCampaigns = Array.isArray(responseData)
+      ? responseData
+      : responseData && typeof responseData === "object" && Array.isArray((responseData as Record<string, unknown>).campaigns)
+        ? ((responseData as Record<string, unknown>).campaigns as unknown[])
+        : [];
+
+    return rawCampaigns
+      .filter((campaign): campaign is Record<string, unknown> => Boolean(campaign) && typeof campaign === "object")
+      .map(toSafeCampaign)
+      .filter((campaign) => campaign.campaignId.length > 0);
+  } catch (error) {
+    const statusCode = axios.isAxiosError(error) ? error.response?.status : undefined;
+    const errorMessage = axios.isAxiosError(error)
+      ? error.response?.data?.message ?? error.message
+      : "Unknown Amazon Ads campaigns API error.";
+
+    await logAmazonAdsApiCall({
+      connectionId: input.connectionId,
+      endpoint,
+      method: "GET",
+      statusCode,
+      success: false,
+      errorMessage: sanitizeAmazonAdsLogValue(String(errorMessage)),
+      durationMs: Date.now() - startedAt
+    });
+
+    throw new Error(`Amazon Ads campaigns request failed: ${sanitizeAmazonAdsLogValue(String(errorMessage))}`);
   }
 }

@@ -9,8 +9,16 @@ import {
   getAmazonAdsConfigCheck as readAmazonAdsConfigCheck,
   parseAmazonAdsState
 } from "./amazon-ads-auth.service";
-import { getAmazonAdsProfiles, logSafeAmazonAdsSupabaseError } from "./amazon-ads-client.service";
-import { listAmazonAdsProfiles, saveAmazonAdsProfiles } from "./amazon-ads-profile.service";
+import {
+  getAmazonAdsProfiles,
+  getSponsoredProductsCampaigns,
+  logSafeAmazonAdsSupabaseError
+} from "./amazon-ads-client.service";
+import {
+  getFirstAmazonAdsProfile,
+  listAmazonAdsProfiles,
+  saveAmazonAdsProfiles
+} from "./amazon-ads-profile.service";
 import {
   deleteAmazonAdsTokens,
   getAmazonAdsAccessToken,
@@ -96,6 +104,38 @@ async function findAmazonAdsConnectionBySellerId(
     logger.warn("Could not reach Supabase for Amazon Ads connection lookup.", {
       sellerId,
       message: error instanceof Error ? error.message : "Unknown database error"
+    });
+    return { ok: false };
+  }
+}
+
+async function findAmazonAdsConnectionForCampaigns(
+  sellerId: string
+): Promise<{ ok: true; connection: AmazonAdsConnection | null } | { ok: false }> {
+  try {
+    let query = supabase
+      .from("amazon_ads_connections")
+      .select("*")
+      .eq("status", "connected")
+      .order("connected_at", { ascending: false })
+      .limit(1);
+
+    if (sellerId !== "default") {
+      query = query.eq("seller_id", sellerId);
+    }
+
+    const { data, error } = await query.maybeSingle<AmazonAdsConnection>();
+
+    if (error) {
+      logSafeAmazonAdsSupabaseError("Could not load Amazon Ads connection for campaigns.", error);
+      return { ok: false };
+    }
+
+    return { ok: true, connection: data };
+  } catch (error) {
+    logger.warn("Could not reach Supabase for Amazon Ads campaigns connection lookup.", {
+      sellerId,
+      message: getSafeAmazonAdsUnknownErrorMessage(error)
     });
     return { ok: false };
   }
@@ -265,6 +305,59 @@ export async function getAmazonAdsProfilesController(req: Request, res: Response
     ok: true,
     profiles
   });
+}
+
+export async function getAmazonAdsCampaigns(req: Request, res: Response): Promise<void> {
+  const sellerId = typeof req.query.sellerId === "string" && req.query.sellerId.trim()
+    ? req.query.sellerId.trim()
+    : "default";
+
+  try {
+    const lookup = await findAmazonAdsConnectionForCampaigns(sellerId);
+
+    if (!lookup.ok) {
+      sendDatabaseFailure(res, "Could not load Amazon Ads connection for campaigns.");
+      return;
+    }
+
+    if (!lookup.connection) {
+      sendBeginnerError(res, 404, "No connected Amazon Ads account found. Connect Amazon Ads first.");
+      return;
+    }
+
+    const profile = await getFirstAmazonAdsProfile(lookup.connection.id);
+
+    if (!profile) {
+      sendBeginnerError(res, 404, "No Amazon Ads profile found. Reconnect Amazon Ads to sync profiles.");
+      return;
+    }
+
+    const accessToken = await getAmazonAdsAccessToken(lookup.connection.id);
+    const campaigns = await getSponsoredProductsCampaigns({
+      accessToken,
+      region: lookup.connection.region,
+      profileId: profile.profile_id,
+      connectionId: lookup.connection.id
+    });
+
+    res.json({
+      ok: true,
+      sellerId,
+      profileId: profile.profile_id,
+      campaigns
+    });
+  } catch (error) {
+    logger.warn("Amazon Ads campaigns request failed safely.", {
+      sellerId,
+      message: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+
+    res.status(400).json({
+      ok: false,
+      message: "Could not load Amazon Ads campaigns.",
+      details: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+  }
 }
 
 export async function postAmazonAdsTestConnection(req: Request, res: Response): Promise<void> {

@@ -1,5 +1,5 @@
 import { supabase } from "../../db/supabase";
-import { AmazonAdsProfile } from "./amazon-ads.types";
+import { AmazonAdsProfile, AmazonAdsStoredProfile } from "./amazon-ads.types";
 import { logSafeAmazonAdsSupabaseError } from "./amazon-ads-client.service";
 
 export async function saveAmazonAdsProfiles(
@@ -42,4 +42,21 @@ export async function listAmazonAdsProfiles(connectionId: string): Promise<unkno
   }
 
   return data ?? [];
+}
+
+export async function getFirstAmazonAdsProfile(connectionId: string): Promise<AmazonAdsStoredProfile | null> {
+  const { data, error } = await supabase
+    .from("amazon_ads_profiles")
+    .select("profile_id, country_code, currency_code, timezone, account_info")
+    .eq("connection_id", connectionId)
+    .order("created_at", { ascending: true })
+    .limit(1)
+    .maybeSingle<AmazonAdsStoredProfile>();
+
+  if (error) {
+    logSafeAmazonAdsSupabaseError("Could not load Amazon Ads profile for campaigns.", error);
+    throw new Error("Could not load Amazon Ads profile. Please reconnect Amazon Ads.");
+  }
+
+  return data;
 }
