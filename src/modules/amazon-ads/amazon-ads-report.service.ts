@@ -1,0 +1,438 @@
+import axios from "axios";
+import zlib from "zlib";
+import { supabase } from "../../db/supabase";
+import { retry } from "../../utils/retry";
+import { logAmazonAdsApiCall, logSafeAmazonAdsSupabaseError } from "./amazon-ads-client.service";
+import {
+  AmazonAdsConnection,
+  AmazonAdsRegion,
+  AmazonAdsReportJob,
+  SafeAmazonAdsCampaignDailyMetric
+} from "./amazon-ads.types";
+
+const AMAZON_ADS_API_ENDPOINTS: Record<AmazonAdsRegion, string> = {
+  NA: "https://advertising-api.amazon.com",
+  EU: "https://advertising-api-eu.amazon.com",
+  FE: "https://advertising-api-fe.amazon.com"
+};
+
+type CreateReportResponse = {
+  reportId?: string;
+  report_id?: string;
+  status?: string;
+};
+
+type ReportStatusResponse = {
+  reportId?: string;
+  report_id?: string;
+  status?: string;
+  url?: string;
+  location?: string;
+  failureReason?: string;
+  failure_reason?: string;
+};
+
+type RawCampaignMetricRow = {
+  date?: string;
+  campaignId?: string | number;
+  campaignName?: string;
+  impressions?: string | number;
+  clicks?: string | number;
+  cost?: string | number;
+  purchases14d?: string | number;
+  sales14d?: string | number;
+};
+
+type CampaignMetricRow = {
+  campaign_id: string;
+  campaign_name: string | null;
+  report_date: string;
+  impressions: number;
+  clicks: number;
+  cost: number;
+  sales: number;
+  orders: number;
+  acos: number | null;
+  roas: number | null;
+  cpc: number | null;
+  ctr: number | null;
+  conversion_rate: number | null;
+  last_synced_at: string | null;
+};
+
+function toNumber(value: unknown): number {
+  const numeric = Number(value ?? 0);
+  return Number.isFinite(numeric) ? numeric : 0;
+}
+
+function safeDivide(numerator: number, denominator: number, multiplier = 1): number | null {
+  if (denominator <= 0) {
+    return null;
+  }
+
+  return (numerator / denominator) * multiplier;
+}
+
+function parseGzipJsonRows(buffer: Buffer): RawCampaignMetricRow[] {
+  const decompressed = zlib.gunzipSync(buffer).toString("utf8").trim();
+
+  if (!decompressed) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(decompressed) as unknown;
+
+    if (Array.isArray(parsed)) {
+      return parsed.filter((row): row is RawCampaignMetricRow => Boolean(row) && typeof row === "object");
+    }
+
+    if (parsed && typeof parsed === "object") {
+      const rows = (parsed as Record<string, unknown>).rows ?? (parsed as Record<string, unknown>).data;
+      if (Array.isArray(rows)) {
+        return rows.filter((row): row is RawCampaignMetricRow => Boolean(row) && typeof row === "object");
+      }
+    }
+  } catch {
+    return decompressed
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as RawCampaignMetricRow);
+  }
+
+  return [];
+}
+
+function toMetricInsertRow(input: {
+  row: RawCampaignMetricRow;
+  connectionId: string;
+  profileId: string;
+  sellerId: string;
+  fallbackDate: string;
+  syncedAt: string;
+}) {
+  const reportDate = input.row.date ?? input.fallbackDate;
+  const campaignId = String(input.row.campaignId ?? "");
+  const impressions = toNumber(input.row.impressions);
+  const clicks = toNumber(input.row.clicks);
+  const cost = toNumber(input.row.cost);
+  const orders = toNumber(input.row.purchases14d);
+  const sales = toNumber(input.row.sales14d);
+
+  return {
+    connection_id: input.connectionId,
+    profile_id: input.profileId,
+    seller_id: input.sellerId,
+    campaign_id: campaignId,
+    campaign_name: input.row.campaignName ?? null,
+    report_date: reportDate,
+    impressions,
+    clicks,
+    cost,
+    sales,
+    orders,
+    acos: safeDivide(cost, sales, 100),
+    roas: safeDivide(sales, cost),
+    cpc: safeDivide(cost, clicks),
+    ctr: safeDivide(clicks, impressions, 100),
+    conversion_rate: safeDivide(orders, clicks, 100),
+    raw_data: input.row,
+    last_synced_at: input.syncedAt,
+    updated_at: input.syncedAt
+  };
+}
+
+function toSafeMetric(row: CampaignMetricRow): SafeAmazonAdsCampaignDailyMetric {
+  return {
+    campaignId: row.campaign_id,
+    campaignName: row.campaign_name,
+    reportDate: row.report_date,
+    impressions: row.impressions,
+    clicks: row.clicks,
+    cost: row.cost,
+    sales: row.sales,
+    orders: row.orders,
+    acos: row.acos,
+    roas: row.roas,
+    cpc: row.cpc,
+    ctr: row.ctr,
+    conversionRate: row.conversion_rate,
+    lastSyncedAt: row.last_synced_at
+  };
+}
+
+export async function requestSponsoredProductsCampaignReport(input: {
+  accessToken: string;
+  region: AmazonAdsRegion;
+  profileId: string;
+  connectionId: string;
+  sellerId: string;
+  date: string;
+}): Promise<{ jobId: string; reportId: string; status: string }> {
+  const endpoint = "/reporting/reports";
+  const body = {
+    name: `SP campaign daily performance ${input.date}`,
+    startDate: input.date,
+    endDate: input.date,
+    configuration: {
+      adProduct: "SPONSORED_PRODUCTS",
+      reportTypeId: "spCampaigns",
+      groupBy: ["campaign"],
+      timeUnit: "DAILY",
+      format: "GZIP_JSON",
+      columns: [
+        "date",
+        "campaignId",
+        "campaignName",
+        "impressions",
+        "clicks",
+        "cost",
+        "purchases14d",
+        "sales14d"
+      ]
+    }
+  };
+
+  const response = await retry(() =>
+    axios.post<CreateReportResponse>(`${AMAZON_ADS_API_ENDPOINTS[input.region]}${endpoint}`, body, {
+      headers: {
+        Authorization: `Bearer ${input.accessToken}`,
+        "Amazon-Advertising-API-ClientId": process.env.AMAZON_ADS_CLIENT_ID ?? "",
+        "Amazon-Advertising-API-Scope": input.profileId,
+        "Content-Type": "application/vnd.createasyncreportrequest.v3+json",
+        Accept: "application/vnd.createasyncreportresponse.v3+json"
+      }
+    })
+  );
+
+  await logAmazonAdsApiCall({
+    connectionId: input.connectionId,
+    endpoint,
+    method: "POST",
+    statusCode: response.status,
+    success: true
+  });
+
+  const reportId = response.data.reportId ?? response.data.report_id;
+
+  if (!reportId) {
+    throw new Error("Amazon Ads did not return a reportId.");
+  }
+
+  const status = response.data.status ?? "PENDING";
+  const { data, error } = await supabase
+    .from("amazon_ads_report_jobs")
+    .insert({
+      connection_id: input.connectionId,
+      profile_id: input.profileId,
+      seller_id: input.sellerId,
+      report_id: reportId,
+      report_type: "spCampaigns",
+      ad_product: "SPONSORED_PRODUCTS",
+      start_date: input.date,
+      end_date: input.date,
+      status,
+      requested_at: new Date().toISOString()
+    })
+    .select("id")
+    .single<{ id: string }>();
+
+  if (error || !data) {
+    if (error) {
+      logSafeAmazonAdsSupabaseError("Could not save Amazon Ads report job.", error);
+    }
+    throw new Error("Could not save Amazon Ads report job.");
+  }
+
+  return {
+    jobId: data.id,
+    reportId,
+    status
+  };
+}
+
+export async function loadAmazonAdsReportJob(jobId: string): Promise<AmazonAdsReportJob> {
+  const { data, error } = await supabase
+    .from("amazon_ads_report_jobs")
+    .select(
+      "id, connection_id, profile_id, seller_id, report_id, report_type, ad_product, start_date, end_date, status, report_url, failure_reason, requested_at, completed_at"
+    )
+    .eq("id", jobId)
+    .single<AmazonAdsReportJob>();
+
+  if (error || !data) {
+    if (error) {
+      logSafeAmazonAdsSupabaseError("Could not load Amazon Ads report job.", error);
+    }
+    throw new Error("Amazon Ads report job was not found.");
+  }
+
+  return data;
+}
+
+export async function loadAmazonAdsConnectionById(connectionId: string): Promise<AmazonAdsConnection> {
+  const { data, error } = await supabase
+    .from("amazon_ads_connections")
+    .select("*")
+    .eq("id", connectionId)
+    .single<AmazonAdsConnection>();
+
+  if (error || !data) {
+    if (error) {
+      logSafeAmazonAdsSupabaseError("Could not load Amazon Ads connection for report job.", error);
+    }
+    throw new Error("Amazon Ads connection was not found.");
+  }
+
+  return data;
+}
+
+export async function refreshAmazonAdsReportJobStatus(input: {
+  accessToken: string;
+  region: AmazonAdsRegion;
+  job: AmazonAdsReportJob;
+}): Promise<AmazonAdsReportJob> {
+  const endpoint = `/reporting/reports/${input.job.report_id}`;
+  const response = await retry(() =>
+    axios.get<ReportStatusResponse>(`${AMAZON_ADS_API_ENDPOINTS[input.region]}${endpoint}`, {
+      headers: {
+        Authorization: `Bearer ${input.accessToken}`,
+        "Amazon-Advertising-API-ClientId": process.env.AMAZON_ADS_CLIENT_ID ?? "",
+        "Amazon-Advertising-API-Scope": input.job.profile_id,
+        Accept: "application/vnd.getasyncreportresponse.v3+json"
+      }
+    })
+  );
+
+  await logAmazonAdsApiCall({
+    connectionId: input.job.connection_id,
+    endpoint,
+    method: "GET",
+    statusCode: response.status,
+    success: true
+  });
+
+  const status = response.data.status ?? input.job.status;
+  const reportUrl = response.data.url ?? response.data.location ?? input.job.report_url;
+  const failureReason = response.data.failureReason ?? response.data.failure_reason ?? input.job.failure_reason;
+  const completedAt =
+    status.toUpperCase() === "COMPLETED" && !input.job.completed_at
+      ? new Date().toISOString()
+      : input.job.completed_at;
+
+  const { data, error } = await supabase
+    .from("amazon_ads_report_jobs")
+    .update({
+      status,
+      report_url: reportUrl ?? null,
+      failure_reason: failureReason ?? null,
+      completed_at: completedAt
+    })
+    .eq("id", input.job.id)
+    .select(
+      "id, connection_id, profile_id, seller_id, report_id, report_type, ad_product, start_date, end_date, status, report_url, failure_reason, requested_at, completed_at"
+    )
+    .single<AmazonAdsReportJob>();
+
+  if (error || !data) {
+    if (error) {
+      logSafeAmazonAdsSupabaseError("Could not update Amazon Ads report job.", error);
+    }
+    throw new Error("Could not update Amazon Ads report job.");
+  }
+
+  return data;
+}
+
+export async function downloadAndSaveCampaignReport(job: AmazonAdsReportJob): Promise<number> {
+  if (job.status.toUpperCase() !== "COMPLETED" || !job.report_url) {
+    return 0;
+  }
+
+  const response = await axios.get<ArrayBuffer>(job.report_url, {
+    responseType: "arraybuffer"
+  });
+  const rows = parseGzipJsonRows(Buffer.from(response.data));
+  const syncedAt = new Date().toISOString();
+  const insertRows = rows
+    .map((row) =>
+      toMetricInsertRow({
+        row,
+        connectionId: job.connection_id,
+        profileId: job.profile_id,
+        sellerId: job.seller_id ?? "default",
+        fallbackDate: job.start_date,
+        syncedAt
+      })
+    )
+    .filter((row) => row.campaign_id.length > 0);
+
+  if (insertRows.length === 0) {
+    return 0;
+  }
+
+  const { error } = await supabase.from("amazon_ads_campaign_daily_metrics").upsert(insertRows, {
+    onConflict: "profile_id,campaign_id,report_date"
+  });
+
+  if (error) {
+    logSafeAmazonAdsSupabaseError("Could not save Amazon Ads campaign daily metrics.", error);
+    throw new Error("Could not save Amazon Ads campaign daily metrics.");
+  }
+
+  return insertRows.length;
+}
+
+export async function listCampaignDailyMetrics(input: {
+  connectionId: string;
+  profileId: string;
+  date?: string;
+}): Promise<{ date: string | null; metrics: SafeAmazonAdsCampaignDailyMetric[] }> {
+  let reportDate = input.date;
+
+  if (!reportDate) {
+    const { data: latest, error: latestError } = await supabase
+      .from("amazon_ads_campaign_daily_metrics")
+      .select("report_date")
+      .eq("connection_id", input.connectionId)
+      .eq("profile_id", input.profileId)
+      .order("report_date", { ascending: false })
+      .limit(1)
+      .maybeSingle<{ report_date: string }>();
+
+    if (latestError) {
+      logSafeAmazonAdsSupabaseError("Could not find latest Amazon Ads campaign metrics date.", latestError);
+      throw new Error("Could not load Amazon Ads campaign daily metrics.");
+    }
+
+    reportDate = latest?.report_date;
+  }
+
+  if (!reportDate) {
+    return {
+      date: null,
+      metrics: []
+    };
+  }
+
+  const { data, error } = await supabase
+    .from("amazon_ads_campaign_daily_metrics")
+    .select(
+      "campaign_id, campaign_name, report_date, impressions, clicks, cost, sales, orders, acos, roas, cpc, ctr, conversion_rate, last_synced_at"
+    )
+    .eq("connection_id", input.connectionId)
+    .eq("profile_id", input.profileId)
+    .eq("report_date", reportDate)
+    .order("campaign_name", { ascending: true });
+
+  if (error) {
+    logSafeAmazonAdsSupabaseError("Could not load Amazon Ads campaign daily metrics.", error);
+    throw new Error("Could not load Amazon Ads campaign daily metrics.");
+  }
+
+  return {
+    date: reportDate,
+    metrics: ((data ?? []) as CampaignMetricRow[]).map(toSafeMetric)
+  };
+}

@@ -4,12 +4,16 @@ import {
   getAmazonAdsConfigCheck,
   getAmazonAdsConnectUrl,
   getAmazonAdsCampaigns,
+  getAmazonAdsCampaignDailyMetrics,
   getAmazonAdsDbHealth,
   getAmazonAdsProfilesController,
+  getAmazonAdsReportJob,
   getAmazonAdsSavedCampaigns,
   getAmazonAdsStatus,
   handleAmazonAdsCallback,
+  postAmazonAdsDownloadCampaignReport,
   postAmazonAdsDisconnect,
+  postAmazonAdsRequestCampaignReport,
   postAmazonAdsSyncCampaigns,
   postAmazonAdsTestConnection
 } from "./amazon-ads.controller";
@@ -24,6 +28,10 @@ amazonAdsRouter.get("/status", asyncHandler(getAmazonAdsStatus));
 amazonAdsRouter.get("/profiles", asyncHandler(getAmazonAdsProfilesController));
 amazonAdsRouter.get("/campaigns", asyncHandler(getAmazonAdsCampaigns));
 amazonAdsRouter.get("/saved-campaigns", asyncHandler(getAmazonAdsSavedCampaigns));
+amazonAdsRouter.get("/campaign-daily-metrics", asyncHandler(getAmazonAdsCampaignDailyMetrics));
+amazonAdsRouter.get("/report-job/:jobId", asyncHandler(getAmazonAdsReportJob));
+amazonAdsRouter.post("/request-campaign-report", asyncHandler(postAmazonAdsRequestCampaignReport));
+amazonAdsRouter.post("/download-campaign-report/:jobId", asyncHandler(postAmazonAdsDownloadCampaignReport));
 amazonAdsRouter.post("/sync-campaigns", asyncHandler(postAmazonAdsSyncCampaigns));
 amazonAdsRouter.post("/test-connection", asyncHandler(postAmazonAdsTestConnection));
 amazonAdsRouter.post("/disconnect", asyncHandler(postAmazonAdsDisconnect));

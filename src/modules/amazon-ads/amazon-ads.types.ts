@@ -57,6 +57,40 @@ export type AmazonAdsCampaignWithRaw = SafeAmazonAdsCampaign & {
   rawData: Record<string, unknown>;
 };
 
+export type AmazonAdsReportJob = {
+  id: string;
+  connection_id: string;
+  profile_id: string;
+  seller_id: string | null;
+  report_id: string;
+  report_type: string;
+  ad_product: string;
+  start_date: string;
+  end_date: string;
+  status: string;
+  report_url: string | null;
+  failure_reason: string | null;
+  requested_at: string | null;
+  completed_at: string | null;
+};
+
+export type SafeAmazonAdsCampaignDailyMetric = {
+  campaignId: string;
+  campaignName: string | null;
+  reportDate: string;
+  impressions: number;
+  clicks: number;
+  cost: number;
+  sales: number;
+  orders: number;
+  acos: number | null;
+  roas: number | null;
+  cpc: number | null;
+  ctr: number | null;
+  conversionRate: number | null;
+  lastSyncedAt: string | null;
+};
+
 export type AmazonAdsConfigCheck = {
   adsClientIdPresent: boolean;
   adsClientSecretPresent: boolean;

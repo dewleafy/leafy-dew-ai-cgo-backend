@@ -25,6 +25,14 @@ import {
   saveAmazonAdsProfiles
 } from "./amazon-ads-profile.service";
 import {
+  downloadAndSaveCampaignReport,
+  listCampaignDailyMetrics,
+  loadAmazonAdsConnectionById,
+  loadAmazonAdsReportJob,
+  refreshAmazonAdsReportJobStatus,
+  requestSponsoredProductsCampaignReport
+} from "./amazon-ads-report.service";
+import {
   deleteAmazonAdsTokens,
   getAmazonAdsAccessToken,
   saveAmazonAdsRefreshToken
@@ -44,6 +52,10 @@ const callbackQuerySchema = z.object({
   state: z.string().min(1).optional()
 });
 
+const dateQuerySchema = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, "date must use YYYY-MM-DD format");
+
 function sendDatabaseFailure(res: Response, message = "Could not reach Supabase. Check your database settings."): void {
   res.status(503).json({
     ok: false,
@@ -51,6 +63,26 @@ function sendDatabaseFailure(res: Response, message = "Could not reach Supabase.
     message,
     safeHint: "Check amazon_ads table schema and service role key."
   });
+}
+
+function getSellerIdFromQuery(req: Request): string {
+  return typeof req.query.sellerId === "string" && req.query.sellerId.trim()
+    ? req.query.sellerId.trim()
+    : "default";
+}
+
+function getYesterdayDate(): string {
+  return new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+function getDateFromQuery(req: Request): string {
+  const rawDate = typeof req.query.date === "string" ? req.query.date.trim() : "";
+
+  if (!rawDate) {
+    return getYesterdayDate();
+  }
+
+  return dateQuerySchema.parse(rawDate);
 }
 
 function sendBeginnerError(res: Response, status: number, message: string): void {
@@ -355,9 +387,7 @@ export async function getAmazonAdsProfilesController(req: Request, res: Response
 }
 
 export async function getAmazonAdsCampaigns(req: Request, res: Response): Promise<void> {
-  const sellerId = typeof req.query.sellerId === "string" && req.query.sellerId.trim()
-    ? req.query.sellerId.trim()
-    : "default";
+  const sellerId = getSellerIdFromQuery(req);
 
   try {
     const context = await loadAmazonAdsCampaignContext(sellerId);
@@ -400,9 +430,7 @@ export async function getAmazonAdsCampaigns(req: Request, res: Response): Promis
 }
 
 export async function postAmazonAdsSyncCampaigns(req: Request, res: Response): Promise<void> {
-  const sellerId = typeof req.query.sellerId === "string" && req.query.sellerId.trim()
-    ? req.query.sellerId.trim()
-    : "default";
+  const sellerId = getSellerIdFromQuery(req);
 
   try {
     const context = await loadAmazonAdsCampaignContext(sellerId);
@@ -452,9 +480,7 @@ export async function postAmazonAdsSyncCampaigns(req: Request, res: Response): P
 }
 
 export async function getAmazonAdsSavedCampaigns(req: Request, res: Response): Promise<void> {
-  const sellerId = typeof req.query.sellerId === "string" && req.query.sellerId.trim()
-    ? req.query.sellerId.trim()
-    : "default";
+  const sellerId = getSellerIdFromQuery(req);
 
   try {
     const context = await loadAmazonAdsCampaignContext(sellerId);
@@ -488,6 +514,177 @@ export async function getAmazonAdsSavedCampaigns(req: Request, res: Response): P
     res.status(400).json({
       ok: false,
       message: "Could not load saved Amazon Ads campaigns.",
+      details: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+  }
+}
+
+export async function postAmazonAdsRequestCampaignReport(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+
+  try {
+    const date = getDateFromQuery(req);
+    const context = await loadAmazonAdsCampaignContext(sellerId);
+
+    if (!context.ok) {
+      if (context.database) {
+        sendDatabaseFailure(res, context.message);
+        return;
+      }
+      sendBeginnerError(res, context.status, context.message);
+      return;
+    }
+
+    const accessToken = await getAmazonAdsAccessToken(context.connection.id);
+    const job = await requestSponsoredProductsCampaignReport({
+      accessToken,
+      region: context.connection.region,
+      profileId: context.profile.profile_id,
+      connectionId: context.connection.id,
+      sellerId: context.connection.seller_id ?? sellerId,
+      date
+    });
+
+    res.json({
+      ok: true,
+      jobId: job.jobId,
+      reportId: job.reportId,
+      status: job.status,
+      date
+    });
+  } catch (error) {
+    logger.warn("Amazon Ads campaign report request failed safely.", {
+      sellerId,
+      message: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+
+    res.status(400).json({
+      ok: false,
+      message: "Could not request Amazon Ads campaign report.",
+      details: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+  }
+}
+
+export async function getAmazonAdsReportJob(req: Request, res: Response): Promise<void> {
+  const jobId = req.params.jobId;
+
+  try {
+    const job = await loadAmazonAdsReportJob(jobId);
+    const connection = await loadAmazonAdsConnectionById(job.connection_id);
+    const accessToken = await getAmazonAdsAccessToken(job.connection_id);
+    const updatedJob = await refreshAmazonAdsReportJobStatus({
+      accessToken,
+      region: connection.region,
+      job
+    });
+
+    res.json({
+      ok: true,
+      job: {
+        jobId: updatedJob.id,
+        reportId: updatedJob.report_id,
+        reportType: updatedJob.report_type,
+        adProduct: updatedJob.ad_product,
+        status: updatedJob.status,
+        startDate: updatedJob.start_date,
+        endDate: updatedJob.end_date,
+        failureReason: updatedJob.failure_reason,
+        requestedAt: updatedJob.requested_at,
+        completedAt: updatedJob.completed_at
+      }
+    });
+  } catch (error) {
+    logger.warn("Amazon Ads report job status failed safely.", {
+      jobId,
+      message: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+
+    res.status(400).json({
+      ok: false,
+      message: "Could not load Amazon Ads report job.",
+      details: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+  }
+}
+
+export async function postAmazonAdsDownloadCampaignReport(req: Request, res: Response): Promise<void> {
+  const jobId = req.params.jobId;
+
+  try {
+    const job = await loadAmazonAdsReportJob(jobId);
+
+    if (job.status.toUpperCase() !== "COMPLETED" || !job.report_url) {
+      res.json({
+        ok: false,
+        message: "Amazon Ads report is not ready yet.",
+        jobId,
+        status: job.status
+      });
+      return;
+    }
+
+    const syncedCount = await downloadAndSaveCampaignReport(job);
+
+    res.json({
+      ok: true,
+      jobId,
+      syncedCount
+    });
+  } catch (error) {
+    logger.warn("Amazon Ads campaign report download failed safely.", {
+      jobId,
+      message: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+
+    res.status(400).json({
+      ok: false,
+      message: "Could not download Amazon Ads campaign report.",
+      details: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+  }
+}
+
+export async function getAmazonAdsCampaignDailyMetrics(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+
+  try {
+    const date = typeof req.query.date === "string" && req.query.date.trim()
+      ? dateQuerySchema.parse(req.query.date.trim())
+      : undefined;
+    const context = await loadAmazonAdsCampaignContext(sellerId);
+
+    if (!context.ok) {
+      if (context.database) {
+        sendDatabaseFailure(res, context.message);
+        return;
+      }
+      sendBeginnerError(res, context.status, context.message);
+      return;
+    }
+
+    const result = await listCampaignDailyMetrics({
+      connectionId: context.connection.id,
+      profileId: context.profile.profile_id,
+      date
+    });
+
+    res.json({
+      ok: true,
+      sellerId,
+      profileId: context.profile.profile_id,
+      date: result.date,
+      metrics: result.metrics
+    });
+  } catch (error) {
+    logger.warn("Amazon Ads campaign daily metrics request failed safely.", {
+      sellerId,
+      message: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+
+    res.status(400).json({
+      ok: false,
+      message: "Could not load Amazon Ads campaign daily metrics.",
       details: getSafeAmazonAdsUnknownErrorMessage(error)
     });
   }
