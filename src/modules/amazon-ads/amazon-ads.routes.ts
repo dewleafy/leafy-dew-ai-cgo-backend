@@ -13,6 +13,7 @@ import {
   getAmazonAdsStatus,
   handleAmazonAdsCallback,
   postAmazonAdsBackfillCampaignReports,
+  postAmazonAdsDailyCampaignSync,
   postAmazonAdsDownloadCampaignReport,
   postAmazonAdsDisconnect,
   postAmazonAdsProcessCampaignReportJobs,
@@ -38,6 +39,7 @@ amazonAdsRouter.post("/request-campaign-report", asyncHandler(postAmazonAdsReque
 amazonAdsRouter.post("/download-campaign-report/:jobId", asyncHandler(postAmazonAdsDownloadCampaignReport));
 amazonAdsRouter.post("/backfill-campaign-reports", asyncHandler(postAmazonAdsBackfillCampaignReports));
 amazonAdsRouter.post("/process-campaign-report-jobs", asyncHandler(postAmazonAdsProcessCampaignReportJobs));
+amazonAdsRouter.post("/daily-campaign-sync", asyncHandler(postAmazonAdsDailyCampaignSync));
 amazonAdsRouter.post("/sync-campaigns", asyncHandler(postAmazonAdsSyncCampaigns));
 amazonAdsRouter.post("/test-connection", asyncHandler(postAmazonAdsTestConnection));
 amazonAdsRouter.post("/disconnect", asyncHandler(postAmazonAdsDisconnect));

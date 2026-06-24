@@ -1,5 +1,6 @@
 import { Request, Response } from "express";
 import { z } from "zod";
+import crypto from "crypto";
 import { env } from "../../config/env";
 import { supabase } from "../../db/supabase";
 import { logger } from "../../utils/logger";
@@ -29,6 +30,7 @@ import {
   getCampaignDashboardSummary,
   hasActiveCampaignReportJobForDate,
   hasCampaignMetricsForDate,
+  hasCampaignReportJobForDate,
   listCampaignDailyMetrics,
   listProcessableCampaignReportJobs,
   loadAmazonAdsConnectionById,
@@ -108,6 +110,23 @@ function getBackfillDate(offsetDaysFromToday: number): string {
   return new Date(Date.now() - offsetDaysFromToday * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 }
 
+function hasValidCronSecret(req: Request): boolean {
+  const configuredSecret = env.CRON_SECRET;
+  const providedSecret = req.header("x-cron-secret");
+
+  if (!configuredSecret || !providedSecret) {
+    return false;
+  }
+
+  const configuredBuffer = Buffer.from(configuredSecret);
+  const providedBuffer = Buffer.from(providedSecret);
+
+  return (
+    configuredBuffer.length === providedBuffer.length &&
+    crypto.timingSafeEqual(configuredBuffer, providedBuffer)
+  );
+}
+
 function sendBeginnerError(res: Response, status: number, message: string): void {
   res.status(status).json({
     ok: false,
@@ -124,7 +143,8 @@ function getSafeAmazonAdsErrorMessage(error: unknown): string {
     env.AMAZON_ADS_CLIENT_SECRET,
     env.AMAZON_ADS_CLIENT_ID,
     env.ENCRYPTION_KEY,
-    env.SUPABASE_SERVICE_ROLE_KEY
+    env.SUPABASE_SERVICE_ROLE_KEY,
+    env.CRON_SECRET
   ].filter((value): value is string => Boolean(value));
 
   return secretValues.reduce(
@@ -240,6 +260,75 @@ async function loadAmazonAdsCampaignContext(
     ok: true,
     connection: lookup.connection,
     profile
+  };
+}
+
+async function processAmazonAdsCampaignReportJobsForContext(input: {
+  context: { connection: AmazonAdsConnection; profile: AmazonAdsStoredProfile };
+  sellerId: string;
+  limit: number;
+}): Promise<{
+  checkedCount: number;
+  syncedCount: number;
+  pendingCount: number;
+  failedCount: number;
+  results: Array<{ jobId: string; date: string; status: string; syncedCount: number }>;
+}> {
+  const reportSellerId = input.context.connection.seller_id ?? input.sellerId;
+  const accessToken = await getAmazonAdsAccessToken(input.context.connection.id);
+  const jobs = await listProcessableCampaignReportJobs({
+    connectionId: input.context.connection.id,
+    profileId: input.context.profile.profile_id,
+    sellerId: reportSellerId,
+    limit: input.limit
+  });
+  const results: Array<{ jobId: string; date: string; status: string; syncedCount: number }> = [];
+  let syncedCount = 0;
+  let pendingCount = 0;
+  let failedCount = 0;
+
+  for (const job of jobs) {
+    const refreshedJob = await refreshAmazonAdsReportJobStatus({
+      accessToken,
+      region: input.context.connection.region,
+      job
+    });
+    const status = refreshedJob.status.toUpperCase();
+    let jobSyncedCount = 0;
+
+    if (status === "COMPLETED" && refreshedJob.report_url) {
+      jobSyncedCount = await downloadAndSaveCampaignReport(refreshedJob);
+      await markAmazonAdsReportJobSynced(refreshedJob.id);
+      syncedCount += 1;
+      results.push({
+        jobId: refreshedJob.id,
+        date: refreshedJob.start_date,
+        status: "SYNCED",
+        syncedCount: jobSyncedCount
+      });
+      continue;
+    }
+
+    if (["FAILED", "FAILURE", "CANCELLED", "CANCELED"].includes(status)) {
+      failedCount += 1;
+    } else {
+      pendingCount += 1;
+    }
+
+    results.push({
+      jobId: refreshedJob.id,
+      date: refreshedJob.start_date,
+      status: refreshedJob.status,
+      syncedCount: 0
+    });
+  }
+
+  return {
+    checkedCount: jobs.length,
+    syncedCount,
+    pendingCount,
+    failedCount,
+    results
   };
 }
 
@@ -814,63 +903,16 @@ export async function postAmazonAdsProcessCampaignReportJobs(req: Request, res: 
       return;
     }
 
-    const reportSellerId = context.connection.seller_id ?? sellerId;
-    const accessToken = await getAmazonAdsAccessToken(context.connection.id);
-    const jobs = await listProcessableCampaignReportJobs({
-      connectionId: context.connection.id,
-      profileId: context.profile.profile_id,
-      sellerId: reportSellerId,
+    const processed = await processAmazonAdsCampaignReportJobsForContext({
+      context,
+      sellerId,
       limit
     });
-    const results: Array<{ jobId: string; date: string; status: string; syncedCount: number }> = [];
-    let syncedCount = 0;
-    let pendingCount = 0;
-    let failedCount = 0;
-
-    for (const job of jobs) {
-      const refreshedJob = await refreshAmazonAdsReportJobStatus({
-        accessToken,
-        region: context.connection.region,
-        job
-      });
-      const status = refreshedJob.status.toUpperCase();
-      let jobSyncedCount = 0;
-
-      if (status === "COMPLETED" && refreshedJob.report_url) {
-        jobSyncedCount = await downloadAndSaveCampaignReport(refreshedJob);
-        await markAmazonAdsReportJobSynced(refreshedJob.id);
-        syncedCount += 1;
-        results.push({
-          jobId: refreshedJob.id,
-          date: refreshedJob.start_date,
-          status: "SYNCED",
-          syncedCount: jobSyncedCount
-        });
-        continue;
-      }
-
-      if (["FAILED", "FAILURE", "CANCELLED", "CANCELED"].includes(status)) {
-        failedCount += 1;
-      } else {
-        pendingCount += 1;
-      }
-
-      results.push({
-        jobId: refreshedJob.id,
-        date: refreshedJob.start_date,
-        status: refreshedJob.status,
-        syncedCount: 0
-      });
-    }
 
     res.json({
       ok: true,
       sellerId,
-      checkedCount: jobs.length,
-      syncedCount,
-      pendingCount,
-      failedCount,
-      results
+      ...processed
     });
   } catch (error) {
     logger.warn("Amazon Ads report job processing failed safely.", {
@@ -881,6 +923,115 @@ export async function postAmazonAdsProcessCampaignReportJobs(req: Request, res: 
     res.status(400).json({
       ok: false,
       message: "Could not process Amazon Ads campaign report jobs.",
+      details: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+  }
+}
+
+export async function postAmazonAdsDailyCampaignSync(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+
+  if (!env.CRON_SECRET) {
+    res.status(500).json({
+      ok: false,
+      message: "Daily campaign sync is not configured."
+    });
+    return;
+  }
+
+  if (!hasValidCronSecret(req)) {
+    res.status(401).json({
+      ok: false,
+      message: "Unauthorized."
+    });
+    return;
+  }
+
+  try {
+    const yesterday = getYesterdayDate();
+    const context = await loadAmazonAdsCampaignContext(sellerId);
+
+    if (!context.ok) {
+      if (context.database) {
+        sendDatabaseFailure(res, context.message);
+        return;
+      }
+      sendBeginnerError(res, context.status, context.message);
+      return;
+    }
+
+    const processed = await processAmazonAdsCampaignReportJobsForContext({
+      context,
+      sellerId,
+      limit: 3
+    });
+    const reportSellerId = context.connection.seller_id ?? sellerId;
+    const alreadyHadMetrics = await hasCampaignMetricsForDate({
+      connectionId: context.connection.id,
+      profileId: context.profile.profile_id,
+      sellerId: reportSellerId,
+      date: yesterday
+    });
+    const alreadyHadJob = await hasCampaignReportJobForDate({
+      connectionId: context.connection.id,
+      profileId: context.profile.profile_id,
+      sellerId: reportSellerId,
+      date: yesterday
+    });
+    const yesterdayReport: {
+      alreadyHadMetrics: boolean;
+      alreadyHadJob: boolean;
+      requested: boolean;
+      jobId: string | null;
+      reportId: string | null;
+      status: string | null;
+    } = {
+      alreadyHadMetrics,
+      alreadyHadJob,
+      requested: false,
+      jobId: null,
+      reportId: null,
+      status: null
+    };
+
+    if (!alreadyHadMetrics && !alreadyHadJob) {
+      const accessToken = await getAmazonAdsAccessToken(context.connection.id);
+      const job = await requestSponsoredProductsCampaignReport({
+        accessToken,
+        region: context.connection.region,
+        profileId: context.profile.profile_id,
+        connectionId: context.connection.id,
+        sellerId: reportSellerId,
+        date: yesterday
+      });
+
+      yesterdayReport.requested = true;
+      yesterdayReport.jobId = job.jobId;
+      yesterdayReport.reportId = job.reportId;
+      yesterdayReport.status = job.status;
+    }
+
+    res.json({
+      ok: true,
+      sellerId,
+      yesterday,
+      processed: {
+        checkedCount: processed.checkedCount,
+        syncedCount: processed.syncedCount,
+        pendingCount: processed.pendingCount,
+        failedCount: processed.failedCount
+      },
+      yesterdayReport
+    });
+  } catch (error) {
+    logger.warn("Amazon Ads daily campaign sync failed safely.", {
+      sellerId,
+      message: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+
+    res.status(400).json({
+      ok: false,
+      message: "Could not run Amazon Ads daily campaign sync.",
       details: getSafeAmazonAdsUnknownErrorMessage(error)
     });
   }

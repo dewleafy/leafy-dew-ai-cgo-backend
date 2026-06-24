@@ -366,6 +366,32 @@ export async function hasActiveCampaignReportJobForDate(input: {
   return (data ?? []).some((job) => ACTIVE_REPORT_STATUSES.includes(String(job.status).toUpperCase()));
 }
 
+export async function hasCampaignReportJobForDate(input: {
+  connectionId: string;
+  profileId: string;
+  sellerId: string;
+  date: string;
+}): Promise<boolean> {
+  const { data, error } = await supabase
+    .from("amazon_ads_report_jobs")
+    .select("id")
+    .eq("connection_id", input.connectionId)
+    .eq("profile_id", input.profileId)
+    .eq("seller_id", input.sellerId)
+    .eq("report_type", "spCampaigns")
+    .eq("start_date", input.date)
+    .eq("end_date", input.date)
+    .limit(1)
+    .maybeSingle<{ id: string }>();
+
+  if (error) {
+    logSafeAmazonAdsSupabaseError("Could not check Amazon Ads report job for date.", error);
+    throw new Error("Could not check existing Amazon Ads report jobs.");
+  }
+
+  return Boolean(data);
+}
+
 export async function loadAmazonAdsReportJob(jobId: string): Promise<AmazonAdsReportJob> {
   const { data, error } = await supabase
     .from("amazon_ads_report_jobs")

@@ -20,7 +20,8 @@ const envSchema = z.object({
   AMAZON_ADS_CLIENT_ID: z.string().optional(),
   AMAZON_ADS_CLIENT_SECRET: z.string().optional(),
   AMAZON_ADS_REDIRECT_URI: z.string().optional(),
-  AMAZON_ADS_REGION: z.enum(["NA", "EU", "FE"]).default("NA")
+  AMAZON_ADS_REGION: z.enum(["NA", "EU", "FE"]).default("NA"),
+  CRON_SECRET: z.string().optional()
 });
 
 const parsedEnv = envSchema.safeParse(process.env);
