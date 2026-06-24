@@ -60,6 +60,9 @@ type CampaignMetricRow = {
   last_synced_at: string | null;
 };
 
+const ACTIVE_REPORT_STATUSES = ["REQUESTED", "PENDING", "PROCESSING", "IN_PROGRESS", "COMPLETED"];
+const FINISHED_REPORT_STATUSES = ["DOWNLOADED", "SYNCED", "FAILED", "FAILURE", "CANCELLED", "CANCELED"];
+
 function toNumber(value: unknown): number {
   const numeric = Number(value ?? 0);
   return Number.isFinite(numeric) ? numeric : 0;
@@ -252,6 +255,54 @@ export async function requestSponsoredProductsCampaignReport(input: {
   };
 }
 
+export async function hasCampaignMetricsForDate(input: {
+  connectionId: string;
+  profileId: string;
+  sellerId: string;
+  date: string;
+}): Promise<boolean> {
+  const { data, error } = await supabase
+    .from("amazon_ads_campaign_daily_metrics")
+    .select("campaign_id")
+    .eq("connection_id", input.connectionId)
+    .eq("profile_id", input.profileId)
+    .eq("seller_id", input.sellerId)
+    .eq("report_date", input.date)
+    .limit(1)
+    .maybeSingle<{ campaign_id: string }>();
+
+  if (error) {
+    logSafeAmazonAdsSupabaseError("Could not check existing Amazon Ads campaign metrics.", error);
+    throw new Error("Could not check existing Amazon Ads campaign metrics.");
+  }
+
+  return Boolean(data);
+}
+
+export async function hasActiveCampaignReportJobForDate(input: {
+  connectionId: string;
+  profileId: string;
+  sellerId: string;
+  date: string;
+}): Promise<boolean> {
+  const { data, error } = await supabase
+    .from("amazon_ads_report_jobs")
+    .select("id, status")
+    .eq("connection_id", input.connectionId)
+    .eq("profile_id", input.profileId)
+    .eq("seller_id", input.sellerId)
+    .eq("report_type", "spCampaigns")
+    .eq("start_date", input.date)
+    .eq("end_date", input.date);
+
+  if (error) {
+    logSafeAmazonAdsSupabaseError("Could not check existing Amazon Ads report jobs.", error);
+    throw new Error("Could not check existing Amazon Ads report jobs.");
+  }
+
+  return (data ?? []).some((job) => ACTIVE_REPORT_STATUSES.includes(String(job.status).toUpperCase()));
+}
+
 export async function loadAmazonAdsReportJob(jobId: string): Promise<AmazonAdsReportJob> {
   const { data, error } = await supabase
     .from("amazon_ads_report_jobs")
@@ -269,6 +320,34 @@ export async function loadAmazonAdsReportJob(jobId: string): Promise<AmazonAdsRe
   }
 
   return data;
+}
+
+export async function listProcessableCampaignReportJobs(input: {
+  connectionId: string;
+  profileId: string;
+  sellerId: string;
+  limit: number;
+}): Promise<AmazonAdsReportJob[]> {
+  const { data, error } = await supabase
+    .from("amazon_ads_report_jobs")
+    .select(
+      "id, connection_id, profile_id, seller_id, report_id, report_type, ad_product, start_date, end_date, status, report_url, failure_reason, requested_at, completed_at"
+    )
+    .eq("connection_id", input.connectionId)
+    .eq("profile_id", input.profileId)
+    .eq("seller_id", input.sellerId)
+    .eq("report_type", "spCampaigns")
+    .order("requested_at", { ascending: false })
+    .limit(Math.max(input.limit * 3, input.limit));
+
+  if (error) {
+    logSafeAmazonAdsSupabaseError("Could not list Amazon Ads report jobs.", error);
+    throw new Error("Could not list Amazon Ads report jobs.");
+  }
+
+  return ((data ?? []) as AmazonAdsReportJob[])
+    .filter((job) => !FINISHED_REPORT_STATUSES.includes(job.status.toUpperCase()))
+    .slice(0, input.limit);
 }
 
 export async function loadAmazonAdsConnectionById(connectionId: string): Promise<AmazonAdsConnection> {
@@ -382,6 +461,21 @@ export async function downloadAndSaveCampaignReport(job: AmazonAdsReportJob): Pr
   }
 
   return insertRows.length;
+}
+
+export async function markAmazonAdsReportJobSynced(jobId: string): Promise<void> {
+  const { error } = await supabase
+    .from("amazon_ads_report_jobs")
+    .update({
+      status: "SYNCED",
+      completed_at: new Date().toISOString()
+    })
+    .eq("id", jobId);
+
+  if (error) {
+    logSafeAmazonAdsSupabaseError("Could not mark Amazon Ads report job as synced.", error);
+    throw new Error("Could not mark Amazon Ads report job as synced.");
+  }
 }
 
 export async function listCampaignDailyMetrics(input: {

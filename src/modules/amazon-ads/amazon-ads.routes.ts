@@ -11,8 +11,10 @@ import {
   getAmazonAdsSavedCampaigns,
   getAmazonAdsStatus,
   handleAmazonAdsCallback,
+  postAmazonAdsBackfillCampaignReports,
   postAmazonAdsDownloadCampaignReport,
   postAmazonAdsDisconnect,
+  postAmazonAdsProcessCampaignReportJobs,
   postAmazonAdsRequestCampaignReport,
   postAmazonAdsSyncCampaigns,
   postAmazonAdsTestConnection
@@ -32,6 +34,8 @@ amazonAdsRouter.get("/campaign-daily-metrics", asyncHandler(getAmazonAdsCampaign
 amazonAdsRouter.get("/report-job/:jobId", asyncHandler(getAmazonAdsReportJob));
 amazonAdsRouter.post("/request-campaign-report", asyncHandler(postAmazonAdsRequestCampaignReport));
 amazonAdsRouter.post("/download-campaign-report/:jobId", asyncHandler(postAmazonAdsDownloadCampaignReport));
+amazonAdsRouter.post("/backfill-campaign-reports", asyncHandler(postAmazonAdsBackfillCampaignReports));
+amazonAdsRouter.post("/process-campaign-report-jobs", asyncHandler(postAmazonAdsProcessCampaignReportJobs));
 amazonAdsRouter.post("/sync-campaigns", asyncHandler(postAmazonAdsSyncCampaigns));
 amazonAdsRouter.post("/test-connection", asyncHandler(postAmazonAdsTestConnection));
 amazonAdsRouter.post("/disconnect", asyncHandler(postAmazonAdsDisconnect));
