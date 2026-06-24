@@ -3,6 +3,7 @@ import { asyncHandler } from "../../utils/async-handler";
 import {
   getAmazonAdsConfigCheck,
   getAmazonAdsConnectUrl,
+  getAmazonAdsDbHealth,
   getAmazonAdsProfilesController,
   getAmazonAdsStatus,
   handleAmazonAdsCallback,
@@ -13,6 +14,7 @@ import {
 export const amazonAdsRouter = Router();
 
 amazonAdsRouter.get("/config-check", asyncHandler(getAmazonAdsConfigCheck));
+amazonAdsRouter.get("/db-health", asyncHandler(getAmazonAdsDbHealth));
 amazonAdsRouter.get("/connect-url", asyncHandler(getAmazonAdsConnectUrl));
 amazonAdsRouter.get("/callback", asyncHandler(handleAmazonAdsCallback));
 amazonAdsRouter.get("/status", asyncHandler(getAmazonAdsStatus));

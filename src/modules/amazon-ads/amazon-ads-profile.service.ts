@@ -1,5 +1,6 @@
 import { supabase } from "../../db/supabase";
 import { AmazonAdsProfile } from "./amazon-ads.types";
+import { logSafeAmazonAdsSupabaseError } from "./amazon-ads-client.service";
 
 export async function saveAmazonAdsProfiles(
   connectionId: string,
@@ -15,8 +16,7 @@ export async function saveAmazonAdsProfiles(
     country_code: profile.countryCode ?? null,
     currency_code: profile.currencyCode ?? null,
     timezone: profile.timezone ?? null,
-    account_info: profile.accountInfo ?? null,
-    updated_at: new Date().toISOString()
+    account_info: profile.accountInfo ?? null
   }));
 
   const { error } = await supabase.from("amazon_ads_profiles").upsert(rows, {
@@ -24,6 +24,7 @@ export async function saveAmazonAdsProfiles(
   });
 
   if (error) {
+    logSafeAmazonAdsSupabaseError("Could not save Amazon Ads profiles.", error);
     throw new Error(`Could not save Amazon Ads profiles: ${error.message}`);
   }
 }
@@ -36,6 +37,7 @@ export async function listAmazonAdsProfiles(connectionId: string): Promise<unkno
     .order("created_at", { ascending: true });
 
   if (error) {
+    logSafeAmazonAdsSupabaseError("Could not load Amazon Ads profiles.", error);
     throw new Error(`Could not load Amazon Ads profiles: ${error.message}`);
   }
 

@@ -9,7 +9,7 @@ import {
   getAmazonAdsConfigCheck as readAmazonAdsConfigCheck,
   parseAmazonAdsState
 } from "./amazon-ads-auth.service";
-import { getAmazonAdsProfiles } from "./amazon-ads-client.service";
+import { getAmazonAdsProfiles, logSafeAmazonAdsSupabaseError } from "./amazon-ads-client.service";
 import { listAmazonAdsProfiles, saveAmazonAdsProfiles } from "./amazon-ads-profile.service";
 import {
   deleteAmazonAdsTokens,
@@ -35,7 +35,8 @@ function sendDatabaseFailure(res: Response, message = "Could not reach Supabase.
   res.status(503).json({
     ok: false,
     error: "Database connection failed",
-    message
+    message,
+    safeHint: "Check amazon_ads table schema and service role key."
   });
 }
 
@@ -62,6 +63,14 @@ function getSafeAmazonAdsErrorMessage(error: unknown): string {
     (message, secretValue) => message.replaceAll(secretValue, "[REDACTED]"),
     error.message
   );
+}
+
+function getSafeAmazonAdsUnknownErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return getSafeAmazonAdsErrorMessage(error);
+  }
+
+  return "Amazon Ads request failed. Please check your configuration and try again.";
 }
 
 async function findAmazonAdsConnectionBySellerId(
@@ -143,28 +152,44 @@ export async function handleAmazonAdsCallback(req: Request, res: Response): Prom
         region: state.region,
         status: "connected",
         state_nonce: state.nonce,
-        connected_at: new Date().toISOString(),
-        disconnected_at: null,
-        updated_at: new Date().toISOString()
+        connected_at: new Date().toISOString()
       })
       .select("*")
       .single<AmazonAdsConnection>();
 
     if (error || !connection) {
+      if (error) {
+        logSafeAmazonAdsSupabaseError("Could not save Amazon Ads connection.", error);
+      }
       sendDatabaseFailure(res, "Could not save Amazon Ads connection in Supabase.");
       return;
     }
 
     await saveAmazonAdsRefreshToken(connection.id, tokenResponse);
 
-    const profiles = await getAmazonAdsProfiles(tokenResponse.access_token, connection.region, connection.id);
-    await saveAmazonAdsProfiles(connection.id, profiles);
+    try {
+      const profiles = await getAmazonAdsProfiles(tokenResponse.access_token, connection.region, connection.id);
+      await saveAmazonAdsProfiles(connection.id, profiles);
 
-    res.json({
-      ok: true,
-      message: "Amazon Ads account connected successfully",
-      profilesCount: profiles.length
-    });
+      res.json({
+        ok: true,
+        message: "Amazon Ads account connected successfully",
+        profilesCount: profiles.length
+      });
+      return;
+    } catch (profileError) {
+      logger.warn("Amazon Ads connected, but profile sync failed safely.", {
+        connectionId: connection.id,
+        message: getSafeAmazonAdsUnknownErrorMessage(profileError)
+      });
+
+      res.json({
+        ok: true,
+        message: "Amazon Ads account connected successfully, but profiles could not be synced yet.",
+        profilesCount: 0
+      });
+      return;
+    }
   } catch (error) {
     logger.warn("Amazon Ads callback failed safely.", {
       message: getSafeAmazonAdsErrorMessage(error)
@@ -305,6 +330,7 @@ export async function postAmazonAdsDisconnect(req: Request, res: Response): Prom
     .eq("id", lookup.connection.id);
 
   if (error) {
+    logSafeAmazonAdsSupabaseError("Could not disconnect Amazon Ads.", error);
     sendDatabaseFailure(res, "Could not disconnect Amazon Ads in Supabase.");
     return;
   }
@@ -312,5 +338,50 @@ export async function postAmazonAdsDisconnect(req: Request, res: Response): Prom
   res.json({
     ok: true,
     message: "Amazon Ads account disconnected."
+  });
+}
+
+export async function getAmazonAdsDbHealth(_req: Request, res: Response): Promise<void> {
+  const tableNames = [
+    "amazon_ads_connections",
+    "amazon_ads_tokens",
+    "amazon_ads_profiles",
+    "amazon_ads_api_logs"
+  ] as const;
+
+  const tables: Record<(typeof tableNames)[number], boolean> = {
+    amazon_ads_connections: false,
+    amazon_ads_tokens: false,
+    amazon_ads_profiles: false,
+    amazon_ads_api_logs: false
+  };
+
+  for (const tableName of tableNames) {
+    try {
+      const { error } = await supabase.from(tableName).select("id", {
+        count: "exact",
+        head: true
+      });
+
+      if (error) {
+        logSafeAmazonAdsSupabaseError(`Amazon Ads db-health failed for ${tableName}.`, error);
+        tables[tableName] = false;
+        continue;
+      }
+
+      tables[tableName] = true;
+    } catch (error) {
+      logger.warn(`Amazon Ads db-health could not reach ${tableName}.`, {
+        message: getSafeAmazonAdsUnknownErrorMessage(error)
+      });
+      tables[tableName] = false;
+    }
+  }
+
+  const ok = Object.values(tables).every(Boolean);
+
+  res.status(ok ? 200 : 503).json({
+    ok,
+    tables
   });
 }

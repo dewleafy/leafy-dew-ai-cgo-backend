@@ -2,6 +2,7 @@ import { supabase } from "../../db/supabase";
 import { decryptText, encryptText } from "../../utils/encryption";
 import { AmazonAdsTokenResponse } from "./amazon-ads.types";
 import { refreshAmazonAdsAccessToken } from "./amazon-ads-auth.service";
+import { logSafeAmazonAdsSupabaseError } from "./amazon-ads-client.service";
 
 type AmazonAdsTokenRow = {
   encrypted_refresh_token: string;
@@ -20,13 +21,13 @@ export async function saveAmazonAdsRefreshToken(
       connection_id: connectionId,
       encrypted_refresh_token: encryptText(tokenResponse.refresh_token),
       token_type: tokenResponse.token_type,
-      scopes: ["advertising::campaign_management"],
-      updated_at: new Date().toISOString()
+      scopes: ["advertising::campaign_management"]
     },
     { onConflict: "connection_id" }
   );
 
   if (error) {
+    logSafeAmazonAdsSupabaseError("Could not save Amazon Ads token.", error);
     throw new Error(`Could not save Amazon Ads token: ${error.message}`);
   }
 }
@@ -39,6 +40,9 @@ export async function getAmazonAdsAccessToken(connectionId: string): Promise<str
     .single<AmazonAdsTokenRow>();
 
   if (error || !data) {
+    if (error) {
+      logSafeAmazonAdsSupabaseError("Could not load Amazon Ads token.", error);
+    }
     throw new Error("No Amazon Ads token found. Please reconnect Amazon Ads.");
   }
 
@@ -52,6 +56,7 @@ export async function deleteAmazonAdsTokens(connectionId: string): Promise<void>
   const { error } = await supabase.from("amazon_ads_tokens").delete().eq("connection_id", connectionId);
 
   if (error) {
+    logSafeAmazonAdsSupabaseError("Could not delete Amazon Ads token.", error);
     throw new Error(`Could not delete Amazon Ads token: ${error.message}`);
   }
 }

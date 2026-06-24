@@ -10,6 +10,40 @@ const AMAZON_ADS_API_ENDPOINTS: Record<AmazonAdsRegion, string> = {
   FE: "https://advertising-api-fe.amazon.com"
 };
 
+type SupabaseErrorDetails = {
+  message?: string;
+  code?: string;
+  details?: string;
+  hint?: string;
+};
+
+function sanitizeAmazonAdsLogValue(value: string | undefined): string | undefined {
+  if (!value) {
+    return value;
+  }
+
+  const secretValues = [
+    process.env.AMAZON_ADS_CLIENT_SECRET,
+    process.env.AMAZON_ADS_CLIENT_ID,
+    process.env.SUPABASE_SERVICE_ROLE_KEY,
+    process.env.ENCRYPTION_KEY
+  ].filter((secret): secret is string => Boolean(secret));
+
+  return secretValues.reduce(
+    (safeValue, secretValue) => safeValue.replaceAll(secretValue, "[REDACTED]"),
+    value
+  );
+}
+
+export function logSafeAmazonAdsSupabaseError(context: string, error: SupabaseErrorDetails): void {
+  logger.warn(context, {
+    message: sanitizeAmazonAdsLogValue(error.message),
+    code: sanitizeAmazonAdsLogValue(error.code),
+    details: sanitizeAmazonAdsLogValue(error.details),
+    hint: sanitizeAmazonAdsLogValue(error.hint)
+  });
+}
+
 export async function logAmazonAdsApiCall(input: {
   connectionId?: string;
   endpoint: string;
@@ -30,10 +64,7 @@ export async function logAmazonAdsApiCall(input: {
   });
 
   if (error) {
-    logger.warn("Failed to write Amazon Ads API log.", {
-      message: error.message,
-      endpoint: input.endpoint
-    });
+    logSafeAmazonAdsSupabaseError("Failed to write Amazon Ads API log.", error);
   }
 }
 
