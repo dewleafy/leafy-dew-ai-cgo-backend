@@ -53,6 +53,10 @@ export type SafeAmazonAdsCampaign = {
   endDate: string | null;
 };
 
+export type AmazonAdsCampaignWithRaw = SafeAmazonAdsCampaign & {
+  rawData: Record<string, unknown>;
+};
+
 export type AmazonAdsConfigCheck = {
   adsClientIdPresent: boolean;
   adsClientSecretPresent: boolean;

@@ -6,9 +6,11 @@ import {
   getAmazonAdsCampaigns,
   getAmazonAdsDbHealth,
   getAmazonAdsProfilesController,
+  getAmazonAdsSavedCampaigns,
   getAmazonAdsStatus,
   handleAmazonAdsCallback,
   postAmazonAdsDisconnect,
+  postAmazonAdsSyncCampaigns,
   postAmazonAdsTestConnection
 } from "./amazon-ads.controller";
 
@@ -21,5 +23,7 @@ amazonAdsRouter.get("/callback", asyncHandler(handleAmazonAdsCallback));
 amazonAdsRouter.get("/status", asyncHandler(getAmazonAdsStatus));
 amazonAdsRouter.get("/profiles", asyncHandler(getAmazonAdsProfilesController));
 amazonAdsRouter.get("/campaigns", asyncHandler(getAmazonAdsCampaigns));
+amazonAdsRouter.get("/saved-campaigns", asyncHandler(getAmazonAdsSavedCampaigns));
+amazonAdsRouter.post("/sync-campaigns", asyncHandler(postAmazonAdsSyncCampaigns));
 amazonAdsRouter.post("/test-connection", asyncHandler(postAmazonAdsTestConnection));
 amazonAdsRouter.post("/disconnect", asyncHandler(postAmazonAdsDisconnect));

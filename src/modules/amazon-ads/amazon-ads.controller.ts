@@ -12,8 +12,13 @@ import {
 import {
   getAmazonAdsProfiles,
   getSponsoredProductsCampaigns,
+  getSponsoredProductsCampaignsWithRaw,
   logSafeAmazonAdsSupabaseError
 } from "./amazon-ads-client.service";
+import {
+  listSavedAmazonAdsCampaigns,
+  saveAmazonAdsCampaigns
+} from "./amazon-ads-campaign.service";
 import {
   getFirstAmazonAdsProfile,
   listAmazonAdsProfiles,
@@ -24,7 +29,7 @@ import {
   getAmazonAdsAccessToken,
   saveAmazonAdsRefreshToken
 } from "./amazon-ads-token.service";
-import { AmazonAdsConnection } from "./amazon-ads.types";
+import { AmazonAdsConnection, AmazonAdsStoredProfile } from "./amazon-ads.types";
 
 const sellerQuerySchema = z.object({
   sellerId: z.string().min(1)
@@ -139,6 +144,48 @@ async function findAmazonAdsConnectionForCampaigns(
     });
     return { ok: false };
   }
+}
+
+async function loadAmazonAdsCampaignContext(
+  sellerId: string
+): Promise<
+  | { ok: true; connection: AmazonAdsConnection; profile: AmazonAdsStoredProfile }
+  | { ok: false; status: number; message: string; database?: boolean }
+> {
+  const lookup = await findAmazonAdsConnectionForCampaigns(sellerId);
+
+  if (!lookup.ok) {
+    return {
+      ok: false,
+      status: 503,
+      database: true,
+      message: "Could not load Amazon Ads connection for campaigns."
+    };
+  }
+
+  if (!lookup.connection) {
+    return {
+      ok: false,
+      status: 404,
+      message: "No connected Amazon Ads account found. Connect Amazon Ads first."
+    };
+  }
+
+  const profile = await getFirstAmazonAdsProfile(lookup.connection.id);
+
+  if (!profile) {
+    return {
+      ok: false,
+      status: 404,
+      message: "No Amazon Ads profile found. Reconnect Amazon Ads to sync profiles."
+    };
+  }
+
+  return {
+    ok: true,
+    connection: lookup.connection,
+    profile
+  };
 }
 
 export async function getAmazonAdsConfigCheck(_req: Request, res: Response): Promise<void> {
@@ -313,37 +360,29 @@ export async function getAmazonAdsCampaigns(req: Request, res: Response): Promis
     : "default";
 
   try {
-    const lookup = await findAmazonAdsConnectionForCampaigns(sellerId);
+    const context = await loadAmazonAdsCampaignContext(sellerId);
 
-    if (!lookup.ok) {
-      sendDatabaseFailure(res, "Could not load Amazon Ads connection for campaigns.");
+    if (!context.ok) {
+      if (context.database) {
+        sendDatabaseFailure(res, context.message);
+        return;
+      }
+      sendBeginnerError(res, context.status, context.message);
       return;
     }
 
-    if (!lookup.connection) {
-      sendBeginnerError(res, 404, "No connected Amazon Ads account found. Connect Amazon Ads first.");
-      return;
-    }
-
-    const profile = await getFirstAmazonAdsProfile(lookup.connection.id);
-
-    if (!profile) {
-      sendBeginnerError(res, 404, "No Amazon Ads profile found. Reconnect Amazon Ads to sync profiles.");
-      return;
-    }
-
-    const accessToken = await getAmazonAdsAccessToken(lookup.connection.id);
+    const accessToken = await getAmazonAdsAccessToken(context.connection.id);
     const campaigns = await getSponsoredProductsCampaigns({
       accessToken,
-      region: lookup.connection.region,
-      profileId: profile.profile_id,
-      connectionId: lookup.connection.id
+      region: context.connection.region,
+      profileId: context.profile.profile_id,
+      connectionId: context.connection.id
     });
 
     res.json({
       ok: true,
       sellerId,
-      profileId: profile.profile_id,
+      profileId: context.profile.profile_id,
       campaigns
     });
   } catch (error) {
@@ -355,6 +394,100 @@ export async function getAmazonAdsCampaigns(req: Request, res: Response): Promis
     res.status(400).json({
       ok: false,
       message: "Could not load Amazon Ads campaigns.",
+      details: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+  }
+}
+
+export async function postAmazonAdsSyncCampaigns(req: Request, res: Response): Promise<void> {
+  const sellerId = typeof req.query.sellerId === "string" && req.query.sellerId.trim()
+    ? req.query.sellerId.trim()
+    : "default";
+
+  try {
+    const context = await loadAmazonAdsCampaignContext(sellerId);
+
+    if (!context.ok) {
+      if (context.database) {
+        sendDatabaseFailure(res, context.message);
+        return;
+      }
+      sendBeginnerError(res, context.status, context.message);
+      return;
+    }
+
+    const accessToken = await getAmazonAdsAccessToken(context.connection.id);
+    const campaigns = await getSponsoredProductsCampaignsWithRaw({
+      accessToken,
+      region: context.connection.region,
+      profileId: context.profile.profile_id,
+      connectionId: context.connection.id
+    });
+
+    const syncedCount = await saveAmazonAdsCampaigns({
+      connectionId: context.connection.id,
+      profileId: context.profile.profile_id,
+      sellerId: context.connection.seller_id ?? sellerId,
+      campaigns
+    });
+
+    res.json({
+      ok: true,
+      sellerId,
+      profileId: context.profile.profile_id,
+      syncedCount
+    });
+  } catch (error) {
+    logger.warn("Amazon Ads campaign sync failed safely.", {
+      sellerId,
+      message: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+
+    res.status(400).json({
+      ok: false,
+      message: "Could not sync Amazon Ads campaigns.",
+      details: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+  }
+}
+
+export async function getAmazonAdsSavedCampaigns(req: Request, res: Response): Promise<void> {
+  const sellerId = typeof req.query.sellerId === "string" && req.query.sellerId.trim()
+    ? req.query.sellerId.trim()
+    : "default";
+
+  try {
+    const context = await loadAmazonAdsCampaignContext(sellerId);
+
+    if (!context.ok) {
+      if (context.database) {
+        sendDatabaseFailure(res, context.message);
+        return;
+      }
+      sendBeginnerError(res, context.status, context.message);
+      return;
+    }
+
+    const campaigns = await listSavedAmazonAdsCampaigns({
+      connectionId: context.connection.id,
+      profileId: context.profile.profile_id
+    });
+
+    res.json({
+      ok: true,
+      sellerId,
+      profileId: context.profile.profile_id,
+      campaigns
+    });
+  } catch (error) {
+    logger.warn("Saved Amazon Ads campaigns request failed safely.", {
+      sellerId,
+      message: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+
+    res.status(400).json({
+      ok: false,
+      message: "Could not load saved Amazon Ads campaigns.",
       details: getSafeAmazonAdsUnknownErrorMessage(error)
     });
   }

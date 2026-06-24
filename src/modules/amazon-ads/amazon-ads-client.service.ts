@@ -2,7 +2,12 @@ import axios from "axios";
 import { supabase } from "../../db/supabase";
 import { logger } from "../../utils/logger";
 import { retry } from "../../utils/retry";
-import { AmazonAdsProfile, AmazonAdsRegion, SafeAmazonAdsCampaign } from "./amazon-ads.types";
+import {
+  AmazonAdsCampaignWithRaw,
+  AmazonAdsProfile,
+  AmazonAdsRegion,
+  SafeAmazonAdsCampaign
+} from "./amazon-ads.types";
 
 const AMAZON_ADS_API_ENDPOINTS: Record<AmazonAdsRegion, string> = {
   NA: "https://advertising-api.amazon.com",
@@ -147,32 +152,43 @@ export async function getSponsoredProductsCampaigns(input: {
   profileId: string;
   connectionId: string;
 }): Promise<SafeAmazonAdsCampaign[]> {
+  const campaigns = await getSponsoredProductsCampaignsWithRaw(input);
+
+  return campaigns.map(({ rawData: _rawData, ...campaign }) => campaign);
+}
+
+export async function getSponsoredProductsCampaignsWithRaw(input: {
+  accessToken: string;
+  region: AmazonAdsRegion;
+  profileId: string;
+  connectionId: string;
+}): Promise<AmazonAdsCampaignWithRaw[]> {
   const startedAt = Date.now();
   const endpoint = "/sp/campaigns/list";
 
   try {
     const response = await retry(() =>
-  axios.post<unknown>(
-    `${AMAZON_ADS_API_ENDPOINTS[input.region]}${endpoint}`,
-    {
-      maxResults: 100
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${input.accessToken}`,
-        "Amazon-Advertising-API-ClientId": process.env.AMAZON_ADS_CLIENT_ID ?? "",
-        "Amazon-Advertising-API-Scope": input.profileId,
-        "Content-Type": "application/vnd.spCampaign.v3+json",
-        Accept: "application/vnd.spCampaign.v3+json"
-      }
-    }
-  )
-);
+      axios.post<unknown>(
+        `${AMAZON_ADS_API_ENDPOINTS[input.region]}${endpoint}`,
+        {
+          maxResults: 100
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${input.accessToken}`,
+            "Amazon-Advertising-API-ClientId": process.env.AMAZON_ADS_CLIENT_ID ?? "",
+            "Amazon-Advertising-API-Scope": input.profileId,
+            "Content-Type": "application/vnd.spCampaign.v3+json",
+            Accept: "application/vnd.spCampaign.v3+json"
+          }
+        }
+      )
+    );
 
     await logAmazonAdsApiCall({
       connectionId: input.connectionId,
       endpoint,
-      method: "GET",
+      method: "POST",
       statusCode: response.status,
       success: true,
       durationMs: Date.now() - startedAt
@@ -187,7 +203,10 @@ export async function getSponsoredProductsCampaigns(input: {
 
     return rawCampaigns
       .filter((campaign): campaign is Record<string, unknown> => Boolean(campaign) && typeof campaign === "object")
-      .map(toSafeCampaign)
+      .map((campaign) => ({
+        ...toSafeCampaign(campaign),
+        rawData: campaign
+      }))
       .filter((campaign) => campaign.campaignId.length > 0);
   } catch (error) {
     const statusCode = axios.isAxiosError(error) ? error.response?.status : undefined;
