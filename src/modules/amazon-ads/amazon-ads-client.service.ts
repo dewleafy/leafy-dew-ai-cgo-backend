@@ -148,18 +148,26 @@ export async function getSponsoredProductsCampaigns(input: {
   connectionId: string;
 }): Promise<SafeAmazonAdsCampaign[]> {
   const startedAt = Date.now();
-  const endpoint = "/sp/campaigns";
+  const endpoint = "/sp/campaigns/list";
 
   try {
     const response = await retry(() =>
-      axios.get<unknown>(`${AMAZON_ADS_API_ENDPOINTS[input.region]}${endpoint}`, {
-        headers: {
-          Authorization: `Bearer ${input.accessToken}`,
-          "Amazon-Advertising-API-ClientId": process.env.AMAZON_ADS_CLIENT_ID ?? "",
-          "Amazon-Advertising-API-Scope": input.profileId
-        }
-      })
-    );
+  axios.post<unknown>(
+    `${AMAZON_ADS_API_ENDPOINTS[input.region]}${endpoint}`,
+    {
+      maxResults: 100
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${input.accessToken}`,
+        "Amazon-Advertising-API-ClientId": process.env.AMAZON_ADS_CLIENT_ID ?? "",
+        "Amazon-Advertising-API-Scope": input.profileId,
+        "Content-Type": "application/vnd.spCampaign.v3+json",
+        Accept: "application/vnd.spCampaign.v3+json"
+      }
+    }
+  )
+);
 
     await logAmazonAdsApiCall({
       connectionId: input.connectionId,
@@ -190,7 +198,7 @@ export async function getSponsoredProductsCampaigns(input: {
     await logAmazonAdsApiCall({
       connectionId: input.connectionId,
       endpoint,
-      method: "GET",
+      method: "POST",
       statusCode,
       success: false,
       errorMessage: sanitizeAmazonAdsLogValue(String(errorMessage)),
