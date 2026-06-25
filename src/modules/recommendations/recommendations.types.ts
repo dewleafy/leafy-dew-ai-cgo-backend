@@ -1,3 +1,11 @@
+export type AiRecommendationStatus =
+  | "NEW"
+  | "APPROVED"
+  | "REJECTED"
+  | "MONITORING"
+  | "COMPLETED_MANUALLY"
+  | "EXPIRED";
+
 export type AiRecommendationRow = {
   id: string;
   seller_id: string;
@@ -23,7 +31,7 @@ export type AiRecommendationRow = {
   reason: string;
   evidence: Record<string, unknown> | null;
   profit_evidence: Record<string, unknown> | null;
-  status: string | null;
+  status: AiRecommendationStatus | null;
   user_note: string | null;
   rule_version: string | null;
   strategy_version: string | null;
@@ -58,7 +66,7 @@ export type SafeAiRecommendationRow = {
   reason: string;
   evidence: Record<string, unknown>;
   profitEvidence: Record<string, unknown>;
-  status: string;
+  status: AiRecommendationStatus;
   userNote: string | null;
   ruleVersion: string;
   strategyVersion: string;

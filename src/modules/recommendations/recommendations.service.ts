@@ -1,7 +1,20 @@
 import { supabase } from "../../db/supabase";
 import { env } from "../../config/env";
 import { logger } from "../../utils/logger";
-import { AiRecommendationRow, SafeAiRecommendationRow } from "./recommendations.types";
+import {
+  AiRecommendationRow,
+  AiRecommendationStatus,
+  SafeAiRecommendationRow
+} from "./recommendations.types";
+
+const ALLOWED_RECOMMENDATION_STATUSES: AiRecommendationStatus[] = [
+  "NEW",
+  "APPROVED",
+  "REJECTED",
+  "MONITORING",
+  "COMPLETED_MANUALLY",
+  "EXPIRED"
+];
 
 function toNumber(value: unknown): number {
   const numeric = Number(value ?? 0);
@@ -49,7 +62,7 @@ function toSafeRecommendation(row: AiRecommendationRow): SafeAiRecommendationRow
     reason: row.reason,
     evidence: row.evidence ?? {},
     profitEvidence: row.profit_evidence ?? {},
-    status: row.status ?? "NEW",
+    status: ALLOWED_RECOMMENDATION_STATUSES.includes(row.status ?? "NEW") ? row.status ?? "NEW" : "NEW",
     userNote: row.user_note,
     ruleVersion: row.rule_version ?? "profit_ppc_v1",
     strategyVersion: row.strategy_version ?? "ai_cgo_v2_2_shadow_mode",
@@ -62,7 +75,7 @@ function toSafeRecommendation(row: AiRecommendationRow): SafeAiRecommendationRow
 
 export async function listAiRecommendations(input: {
   sellerId: string;
-  status?: string;
+  status?: AiRecommendationStatus;
   limit: number;
 }): Promise<SafeAiRecommendationRow[]> {
   let query = supabase
@@ -87,4 +100,68 @@ export async function listAiRecommendations(input: {
   }
 
   return ((data ?? []) as AiRecommendationRow[]).map(toSafeRecommendation);
+}
+
+export function isAllowedRecommendationStatus(status: string): status is AiRecommendationStatus {
+  return ALLOWED_RECOMMENDATION_STATUSES.includes(status as AiRecommendationStatus);
+}
+
+export async function getAiRecommendationById(id: string): Promise<SafeAiRecommendationRow | null> {
+  const { data, error } = await supabase
+    .from("ai_recommendations")
+    .select("*")
+    .eq("id", id)
+    .maybeSingle<AiRecommendationRow>();
+
+  if (error) {
+    logger.warn("Could not load AI recommendation.", {
+      message: sanitizeErrorMessage(error.message),
+      code: sanitizeErrorMessage(error.code)
+    });
+    throw new Error("Could not load recommendation from Supabase.");
+  }
+
+  return data ? toSafeRecommendation(data) : null;
+}
+
+export async function updateAiRecommendationStatus(input: {
+  id: string;
+  status: AiRecommendationStatus;
+  userNote?: string | null;
+}): Promise<SafeAiRecommendationRow | null> {
+  const existing = await getAiRecommendationById(input.id);
+
+  if (!existing) {
+    return null;
+  }
+
+  const updateRow: {
+    status: AiRecommendationStatus;
+    updated_at: string;
+    user_note?: string | null;
+  } = {
+    status: input.status,
+    updated_at: new Date().toISOString()
+  };
+
+  if (input.userNote !== undefined) {
+    updateRow.user_note = input.userNote;
+  }
+
+  const { data, error } = await supabase
+    .from("ai_recommendations")
+    .update(updateRow)
+    .eq("id", input.id)
+    .select("*")
+    .single<AiRecommendationRow>();
+
+  if (error || !data) {
+    logger.warn("Could not update AI recommendation status.", {
+      message: error?.message ? sanitizeErrorMessage(error.message) : "No row returned",
+      code: error?.code ? sanitizeErrorMessage(error.code) : undefined
+    });
+    throw new Error("Could not update recommendation in Supabase.");
+  }
+
+  return toSafeRecommendation(data);
 }
