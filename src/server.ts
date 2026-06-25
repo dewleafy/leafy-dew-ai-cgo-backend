@@ -4,6 +4,7 @@ import { env } from "./config/env";
 import { supabase } from "./db/supabase";
 import { amazonAdsRouter } from "./modules/amazon-ads/amazon-ads.routes";
 import { amazonRouter } from "./modules/amazon/amazon.routes";
+import { productEconomicsRouter } from "./modules/product-economics/product-economics.routes";
 import { logger } from "./utils/logger";
 
 const app = express();
@@ -114,6 +115,7 @@ app.get("/api/system/db-health", async (_req: Request, res: Response) => {
 
 app.use("/api/amazon", amazonRouter);
 app.use("/api/amazon-ads", amazonAdsRouter);
+app.use("/api/product-economics", productEconomicsRouter);
 
 app.use((_req: Request, res: Response) => {
   res.status(404).json({ message: "Route not found." });
