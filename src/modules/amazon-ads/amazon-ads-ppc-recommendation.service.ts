@@ -2,7 +2,7 @@ import { supabase } from "../../db/supabase";
 import { ProductEconomicsRow, ProductProfitStatus } from "../product-economics/product-economics.types";
 import { logSafeAmazonAdsSupabaseError } from "./amazon-ads-client.service";
 
-type RecommendationCategory =
+export type RecommendationCategory =
   | "exactMatchOpportunities"
   | "productTargetingOpportunities"
   | "watchlistWasteTerms"
@@ -13,7 +13,7 @@ type RecommendationCategory =
   | "profitRiskWarnings"
   | "monitorOnlyTerms";
 
-type RecommendationAction =
+export type RecommendationAction =
   | "ADD_EXACT_KEYWORD_AFTER_APPROVAL"
   | "ADD_PRODUCT_TARGET_AFTER_APPROVAL"
   | "ADD_NEGATIVE_AFTER_APPROVAL"
@@ -71,7 +71,7 @@ type ProfitEvidence = {
   profitStatus: ProductProfitStatus | null;
 };
 
-type RecommendationItem = {
+export type RecommendationItem = {
   searchTerm: string;
   campaignId: string;
   campaignName: string | null;
@@ -93,7 +93,7 @@ type RecommendationItem = {
   strategyVersion: "ai_cgo_v2_2_shadow_mode";
 };
 
-type PpcRecommendationResponse = {
+export type PpcRecommendationResponse = {
   ok: true;
   sellerId: string;
   days: number;
@@ -112,7 +112,20 @@ type PpcRecommendationResponse = {
   profitRiskWarnings: RecommendationItem[];
   monitorOnlyTerms: RecommendationItem[];
   warnings: string[];
+  savedCount?: number;
+  skippedDuplicateCount?: number;
 };
+
+const SAVEABLE_RECOMMENDATION_CATEGORIES: RecommendationCategory[] = [
+  "exactMatchOpportunities",
+  "productTargetingOpportunities",
+  "watchlistWasteTerms",
+  "negativeKeywordCandidates",
+  "negativeProductTargetCandidates",
+  "bidDownCandidates",
+  "productPageCheckWarnings",
+  "profitRiskWarnings"
+];
 
 function toNumber(value: unknown): number {
   const numeric = Number(value ?? 0);
@@ -129,6 +142,13 @@ function clamp(value: number, min: number, max: number): number {
 
 function getDateDaysAgo(daysAgo: number): string {
   return new Date(Date.now() - daysAgo * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+export function getAmazonAdsPpcRecommendationDateRange(days: number): { startDate: string; endDate: string } {
+  return {
+    startDate: getDateDaysAgo(days),
+    endDate: getDateDaysAgo(1)
+  };
 }
 
 function isAsinLikeSearchTerm(searchTerm: string): boolean {
@@ -337,10 +357,20 @@ function getRecommendationType(category: RecommendationCategory): string {
   return category.replace(/[A-Z]/g, (letter) => `_${letter}`).toUpperCase();
 }
 
-function getApprovalTier(category: RecommendationCategory): RecommendationItem["approvalTier"] {
-  return ["negativeKeywordCandidates", "negativeProductTargetCandidates", "bidDownCandidates", "profitRiskWarnings"].includes(category)
-    ? "TIER_2"
-    : "TIER_1";
+function getApprovalTier(action: RecommendationAction): RecommendationItem["approvalTier"] {
+  if (
+    [
+      "ADD_EXACT_KEYWORD_AFTER_APPROVAL",
+      "ADD_PRODUCT_TARGET_AFTER_APPROVAL",
+      "ADD_NEGATIVE_AFTER_APPROVAL",
+      "LOWER_BID_AFTER_APPROVAL",
+      "DO_NOT_SCALE_FIX_PRICE_COST_OR_BUNDLE"
+    ].includes(action)
+  ) {
+    return "TIER_2";
+  }
+
+  return "TIER_1";
 }
 
 function getRiskLevel(category: RecommendationCategory): RecommendationItem["riskLevel"] {
@@ -398,8 +428,7 @@ export async function getAmazonAdsPpcRecommendations(input: {
   days: number;
   targetAcos: number;
 }): Promise<PpcRecommendationResponse> {
-  const endDate = getDateDaysAgo(1);
-  const startDate = getDateDaysAgo(input.days);
+  const { startDate, endDate } = getAmazonAdsPpcRecommendationDateRange(input.days);
   const [productEconomics, metricRows] = await Promise.all([
     getLatestProductEconomics(input.sellerId),
     listSearchTermMetrics({
@@ -499,7 +528,7 @@ export async function getAmazonAdsPpcRecommendations(input: {
       priorityLabel: getPriorityLabel(priorityScore),
       confidenceScore,
       confidenceLabel: getConfidenceLabel(confidenceScore),
-      approvalTier: getApprovalTier(details.category),
+      approvalTier: getApprovalTier(details.recommendedAction),
       requiresApproval: true,
       riskLevel: getRiskLevel(details.category),
       reason: details.reason,
@@ -538,5 +567,114 @@ export async function getAmazonAdsPpcRecommendations(input: {
     profitDataStatus,
     ...categories,
     warnings
+  };
+}
+
+function getRecommendationEntityType(item: RecommendationItem): string {
+  return isAsinLikeSearchTerm(item.searchTerm) ? "ASIN" : "SEARCH_TERM";
+}
+
+function getRecommendationAsin(item: RecommendationItem): string | null {
+  return isAsinLikeSearchTerm(item.searchTerm) ? item.searchTerm.toUpperCase() : null;
+}
+
+async function recommendationAlreadyExists(input: {
+  sellerId: string;
+  item: RecommendationItem;
+  dataStartDate: string;
+  dataEndDate: string;
+}): Promise<boolean> {
+  const { data, error } = await supabase
+    .from("ai_recommendations")
+    .select("id")
+    .eq("seller_id", input.sellerId)
+    .eq("entity_value", input.item.searchTerm)
+    .eq("recommended_action", input.item.recommendedAction)
+    .eq("rule_version", input.item.ruleVersion)
+    .eq("data_start_date", input.dataStartDate)
+    .eq("data_end_date", input.dataEndDate)
+    .limit(1)
+    .maybeSingle<{ id: string }>();
+
+  if (error) {
+    logSafeAmazonAdsSupabaseError("Could not check existing AI recommendation duplicate.", error);
+    throw new Error("Could not check existing AI recommendation duplicate.");
+  }
+
+  return Boolean(data);
+}
+
+export async function saveAmazonAdsPpcRecommendations(input: {
+  sellerId: string;
+  recommendations: PpcRecommendationResponse;
+  dataStartDate: string;
+  dataEndDate: string;
+}): Promise<{ savedCount: number; skippedDuplicateCount: number }> {
+  let savedCount = 0;
+  let skippedDuplicateCount = 0;
+
+  for (const category of SAVEABLE_RECOMMENDATION_CATEGORIES) {
+    for (const item of input.recommendations[category]) {
+      const exists = await recommendationAlreadyExists({
+        sellerId: input.sellerId,
+        item,
+        dataStartDate: input.dataStartDate,
+        dataEndDate: input.dataEndDate
+      });
+
+      if (exists) {
+        skippedDuplicateCount += 1;
+        continue;
+      }
+
+      const { error } = await supabase.from("ai_recommendations").insert({
+        seller_id: input.sellerId,
+        source: "PPC_RECOMMENDATION_BRAIN",
+        recommendation_type: item.recommendationType,
+        recommended_action: item.recommendedAction,
+        entity_type: getRecommendationEntityType(item),
+        entity_value: item.searchTerm,
+        campaign_id: item.campaignId,
+        campaign_name: item.campaignName,
+        ad_group_id: item.adGroupId,
+        ad_group_name: item.adGroupName,
+        sku: null,
+        asin: getRecommendationAsin(item),
+        priority_score: item.priorityScore,
+        priority_label: item.priorityLabel,
+        confidence_score: item.confidenceScore,
+        confidence_label: item.confidenceLabel,
+        approval_tier: item.approvalTier,
+        requires_approval: item.requiresApproval,
+        risk_level: item.riskLevel,
+        expected_profit_impact: null,
+        reason: item.reason,
+        evidence: item.evidence,
+        profit_evidence: item.profitEvidence,
+        status: "NEW",
+        rule_version: item.ruleVersion,
+        strategy_version: item.strategyVersion,
+        data_start_date: input.dataStartDate,
+        data_end_date: input.dataEndDate,
+        updated_at: new Date().toISOString()
+      });
+
+      if (error) {
+        if (error.code === "23505") {
+          skippedDuplicateCount += 1;
+          continue;
+        }
+
+        logSafeAmazonAdsSupabaseError("Could not save AI recommendation.", error);
+        throw new Error("Could not save AI recommendations in Supabase.");
+      }
+
+      savedCount += 1;
+    }
+  }
+
+  return {
+    savedCount,
+    skippedDuplicateCount
   };
 }

@@ -25,7 +25,11 @@ import {
   listAmazonAdsProfiles,
   saveAmazonAdsProfiles
 } from "./amazon-ads-profile.service";
-import { getAmazonAdsPpcRecommendations as buildAmazonAdsPpcRecommendations } from "./amazon-ads-ppc-recommendation.service";
+import {
+  getAmazonAdsPpcRecommendationDateRange,
+  getAmazonAdsPpcRecommendations as buildAmazonAdsPpcRecommendations,
+  saveAmazonAdsPpcRecommendations
+} from "./amazon-ads-ppc-recommendation.service";
 import {
   downloadAndSaveCampaignReport,
   downloadAndSaveSearchTermReport,
@@ -119,6 +123,10 @@ function getTargetAcosFromQuery(req: Request): number {
   const targetAcos = Number.isFinite(rawTargetAcos) && rawTargetAcos > 0 ? rawTargetAcos : 35;
 
   return Math.round(targetAcos * 100) / 100;
+}
+
+function shouldSaveRecommendations(req: Request): boolean {
+  return typeof req.query.save === "string" && req.query.save.toLowerCase() === "true";
 }
 
 function getLimitFromQuery(req: Request): number {
@@ -1195,6 +1203,23 @@ export async function getAmazonAdsPpcRecommendations(req: Request, res: Response
       days,
       targetAcos
     });
+
+    if (shouldSaveRecommendations(req)) {
+      const dateRange = getAmazonAdsPpcRecommendationDateRange(days);
+      const saveResult = await saveAmazonAdsPpcRecommendations({
+        sellerId,
+        recommendations,
+        dataStartDate: dateRange.startDate,
+        dataEndDate: dateRange.endDate
+      });
+
+      res.json({
+        ...recommendations,
+        savedCount: saveResult.savedCount,
+        skippedDuplicateCount: saveResult.skippedDuplicateCount
+      });
+      return;
+    }
 
     res.json(recommendations);
   } catch (error) {
