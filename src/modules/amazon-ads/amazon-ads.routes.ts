@@ -8,6 +8,7 @@ import {
   getAmazonAdsDashboardSummary,
   getAmazonAdsDbHealth,
   getAmazonAdsProfilesController,
+  getAmazonAdsPpcRecommendations,
   getAmazonAdsReportJob,
   getAmazonAdsSavedCampaigns,
   getAmazonAdsSearchTermDailyMetrics,
@@ -41,6 +42,7 @@ amazonAdsRouter.get("/saved-campaigns", asyncHandler(getAmazonAdsSavedCampaigns)
 amazonAdsRouter.get("/campaign-daily-metrics", asyncHandler(getAmazonAdsCampaignDailyMetrics));
 amazonAdsRouter.get("/search-term-daily-metrics", asyncHandler(getAmazonAdsSearchTermDailyMetrics));
 amazonAdsRouter.get("/search-term-summary", asyncHandler(getAmazonAdsSearchTermSummary));
+amazonAdsRouter.get("/ppc-recommendations", asyncHandler(getAmazonAdsPpcRecommendations));
 amazonAdsRouter.get("/dashboard-summary", asyncHandler(getAmazonAdsDashboardSummary));
 amazonAdsRouter.get("/report-job/:jobId", asyncHandler(getAmazonAdsReportJob));
 amazonAdsRouter.post("/request-campaign-report", asyncHandler(postAmazonAdsRequestCampaignReport));

@@ -25,6 +25,7 @@ import {
   listAmazonAdsProfiles,
   saveAmazonAdsProfiles
 } from "./amazon-ads-profile.service";
+import { getAmazonAdsPpcRecommendations as buildAmazonAdsPpcRecommendations } from "./amazon-ads-ppc-recommendation.service";
 import {
   downloadAndSaveCampaignReport,
   downloadAndSaveSearchTermReport,
@@ -111,6 +112,13 @@ function getSummaryDaysFromQuery(req: Request): number {
   const days = Number.isFinite(rawDays) ? Math.floor(rawDays) : 30;
 
   return Math.min(Math.max(days, 1), 30);
+}
+
+function getTargetAcosFromQuery(req: Request): number {
+  const rawTargetAcos = typeof req.query.targetAcos === "string" ? Number(req.query.targetAcos) : 35;
+  const targetAcos = Number.isFinite(rawTargetAcos) && rawTargetAcos > 0 ? rawTargetAcos : 35;
+
+  return Math.round(targetAcos * 100) / 100;
 }
 
 function getLimitFromQuery(req: Request): number {
@@ -1171,6 +1179,33 @@ export async function getAmazonAdsSearchTermSummary(req: Request, res: Response)
     res.status(400).json({
       ok: false,
       message: "Could not load Amazon Ads search term summary.",
+      details: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+  }
+}
+
+export async function getAmazonAdsPpcRecommendations(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+
+  try {
+    const days = getSummaryDaysFromQuery(req);
+    const targetAcos = getTargetAcosFromQuery(req);
+    const recommendations = await buildAmazonAdsPpcRecommendations({
+      sellerId,
+      days,
+      targetAcos
+    });
+
+    res.json(recommendations);
+  } catch (error) {
+    logger.warn("Amazon Ads PPC recommendations request failed safely.", {
+      sellerId,
+      message: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+
+    res.status(400).json({
+      ok: false,
+      message: "Could not load Amazon Ads PPC recommendations.",
       details: getSafeAmazonAdsUnknownErrorMessage(error)
     });
   }
