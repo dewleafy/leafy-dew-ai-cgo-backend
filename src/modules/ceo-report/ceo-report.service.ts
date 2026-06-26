@@ -66,6 +66,15 @@ type RecommendationListItem = {
   reason: string;
 };
 
+type ProfitRiskAlert = {
+  type: string;
+  severity: "MEDIUM" | "HIGH";
+  title: string;
+  message: string;
+  currentAcos?: number;
+  targetAcos?: number;
+};
+
 type RecommendationSummary = {
   newCount: number;
   approvedCount: number;
@@ -212,29 +221,45 @@ function buildExecutiveSummary(input: {
   ppcSnapshot: MetricSummary;
 }) {
   const profitStatus = input.productEconomics?.profit_status ?? "UNKNOWN";
+  const targetAcos = toNumber(input.productEconomics?.target_acos);
   let businessStatus: BusinessStatus = "WATCH";
   let oneLineAdvice = "Keep monitoring until more data is available.";
+  let headline = "WATCH: Keep monitoring until more data is available.";
 
   if (!input.productEconomics) {
     businessStatus = "WATCH";
     oneLineAdvice = "Add product economics before scaling ads.";
+    headline = "WATCH: Product economics are missing.";
   } else if (profitStatus === "FAIL") {
     businessStatus = "RISK";
     oneLineAdvice = "Do not scale ads until price, cost, bundle, or charges are fixed.";
+    headline = "RISK: Product economics fail the profit guardrail.";
   } else if (
     input.ppcSnapshot.sales > 0 &&
     input.ppcSnapshot.acos !== null &&
-    input.ppcSnapshot.acos <= toNumber(input.productEconomics.target_acos)
+    targetAcos > 0 &&
+    input.ppcSnapshot.acos <= targetAcos
   ) {
     businessStatus = "GOOD";
     oneLineAdvice = "There are profit-safe PPC opportunities, but keep approval-first shadow mode.";
+    headline = "GOOD: PPC is within profit-safe target ACOS.";
+  } else if (
+    input.ppcSnapshot.sales > 0 &&
+    input.ppcSnapshot.acos !== null &&
+    targetAcos > 0 &&
+    input.ppcSnapshot.acos > targetAcos
+  ) {
+    businessStatus = "WATCH";
+    oneLineAdvice = "PPC has sales, but overall ACOS is above the profit-safe target. Review only low-ACOS scale opportunities and check wasted spend.";
+    headline = "WATCH: PPC sales exist, but overall ACOS is above the profit-safe target.";
   } else if (input.ppcSnapshot.cost > 0 && input.ppcSnapshot.sales === 0) {
     businessStatus = "WATCH";
     oneLineAdvice = "PPC is spending without sales. Monitor terms and check listing quality.";
+    headline = "WATCH: PPC is spending without sales.";
   }
 
   return {
-    headline: `${businessStatus}: ${oneLineAdvice}`,
+    headline,
     businessStatus,
     profitStatus,
     oneLineAdvice
@@ -258,8 +283,58 @@ function sortByPriority(rows: AiRecommendationRow[]): AiRecommendationRow[] {
   return [...rows].sort((a, b) => toNumber(b.priority_score) - toNumber(a.priority_score));
 }
 
+function sortScaleOpportunities(rows: AiRecommendationRow[]): AiRecommendationRow[] {
+  const statusRank: Record<string, number> = {
+    APPROVED: 0,
+    NEW: 1
+  };
+
+  return [...rows].sort((a, b) => {
+    const rankDifference = (statusRank[a.status ?? ""] ?? 99) - (statusRank[b.status ?? ""] ?? 99);
+
+    if (rankDifference !== 0) {
+      return rankDifference;
+    }
+
+    return toNumber(b.priority_score) - toNumber(a.priority_score);
+  });
+}
+
 function sortByCreatedAt(rows: AiRecommendationRow[]): AiRecommendationRow[] {
   return [...rows].sort((a, b) => String(b.created_at ?? "").localeCompare(String(a.created_at ?? "")));
+}
+
+function buildMetricProfitRiskAlerts(input: {
+  ppcSnapshot: MetricSummary;
+  targetAcos: number;
+}): ProfitRiskAlert[] {
+  const alerts: ProfitRiskAlert[] = [];
+
+  if (
+    input.ppcSnapshot.acos !== null &&
+    input.targetAcos > 0 &&
+    input.ppcSnapshot.acos > input.targetAcos
+  ) {
+    alerts.push({
+      type: "PPC_ACOS_ABOVE_TARGET",
+      severity: "MEDIUM",
+      title: "Overall PPC ACOS is above target",
+      message: `Overall PPC ACOS is ${input.ppcSnapshot.acos}%, while profit-safe target ACOS is ${input.targetAcos}%. Do not scale broadly; only review proven low-ACOS terms.`,
+      currentAcos: input.ppcSnapshot.acos,
+      targetAcos: input.targetAcos
+    });
+  }
+
+  if (input.ppcSnapshot.cost > 0 && input.ppcSnapshot.sales === 0) {
+    alerts.push({
+      type: "SPEND_WITHOUT_SALES",
+      severity: "HIGH",
+      title: "PPC spend without sales",
+      message: "Ads spent money without sales in this period. Review search terms and listing quality."
+    });
+  }
+
+  return alerts;
 }
 
 function getRecommendationSummary(rows: AiRecommendationRow[]): RecommendationSummary {
@@ -434,7 +509,7 @@ export async function getDailyCeoReport(input: { sellerId: string; days: number 
   const approvedRecommendations = recommendations.filter((row) => row.status === "APPROVED");
   const monitoringRecommendations = recommendations.filter((row) => row.status === "MONITORING");
   const todayTopActions = sortByPriority(newRecommendations).slice(0, 5).map(toRecommendationItem);
-  const scaleOpportunities = sortByPriority(
+  const scaleOpportunities = sortScaleOpportunities(
     recommendations.filter(
       (row) =>
         ["NEW", "APPROVED"].includes(row.status ?? "") &&
@@ -456,10 +531,14 @@ export async function getDailyCeoReport(input: { sellerId: string; days: number 
   const profitRiskAlerts = sortByPriority(
     recommendations.filter((row) => row.recommendation_type === "PROFIT_RISK_WARNINGS")
   ).slice(0, 5).map(toRecommendationItem);
-  const pendingApprovals = sortByCreatedAt(newRecommendations).slice(0, 10).map(toRecommendationItem);
+  const pendingApprovals = sortByPriority(newRecommendations).slice(0, 10).map(toRecommendationItem);
   const approvedShadowActions = sortByCreatedAt(approvedRecommendations).slice(0, 10).map(toRecommendationItem);
   const monitoringItems = sortByCreatedAt(monitoringRecommendations).slice(0, 10).map(toRecommendationItem);
   const profitGuardrail = buildProfitGuardrail(productEconomics);
+  const metricProfitRiskAlerts = buildMetricProfitRiskAlerts({
+    ppcSnapshot,
+    targetAcos: profitGuardrail.targetAcos
+  });
 
   return {
     ok: true,
@@ -496,7 +575,7 @@ export async function getDailyCeoReport(input: { sellerId: string; days: number 
     scaleOpportunities,
     watchlistRisks,
     listingCheckWarnings,
-    profitRiskAlerts,
+    profitRiskAlerts: [...metricProfitRiskAlerts, ...profitRiskAlerts],
     pendingApprovals,
     approvedShadowActions,
     monitoringItems,
