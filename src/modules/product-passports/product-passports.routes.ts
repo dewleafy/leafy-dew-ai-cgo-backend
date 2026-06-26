@@ -3,6 +3,8 @@ import { asyncHandler } from "../../utils/async-handler";
 import {
   deleteProductPassport,
   getProductPassport,
+  getProductPassportReadiness,
+  getProductPassportReadinessSummaryController,
   getProductPassports,
   postProductPassport,
   putProductPassport
@@ -11,6 +13,8 @@ import {
 export const productPassportRoutes = Router();
 
 productPassportRoutes.get("/", asyncHandler(getProductPassports));
+productPassportRoutes.get("/readiness/summary", asyncHandler(getProductPassportReadinessSummaryController));
+productPassportRoutes.get("/:id/readiness", asyncHandler(getProductPassportReadiness));
 productPassportRoutes.get("/:id", asyncHandler(getProductPassport));
 productPassportRoutes.post("/", asyncHandler(postProductPassport));
 productPassportRoutes.put("/:id", asyncHandler(putProductPassport));

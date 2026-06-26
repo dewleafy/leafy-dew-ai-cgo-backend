@@ -8,6 +8,10 @@ import {
   listProductPassports,
   updateProductPassport
 } from "./product-passports.service";
+import {
+  getProductPassportReadinessById,
+  getProductPassportReadinessSummary
+} from "./product-passports-readiness.service";
 import { ProductPassportStatus } from "./product-passports.types";
 
 const nullableTextSchema = z
@@ -152,6 +156,36 @@ export async function getProductPassport(req: Request, res: Response): Promise<v
     });
   } catch {
     sendDatabaseError(res, "Could not load product passport from Supabase.");
+  }
+}
+
+export async function getProductPassportReadiness(req: Request, res: Response): Promise<void> {
+  try {
+    const readiness = await getProductPassportReadinessById(req.params.id);
+
+    if (!readiness) {
+      res.status(404).json({
+        ok: false,
+        message: "Product passport was not found."
+      });
+      return;
+    }
+
+    res.json(readiness);
+  } catch {
+    sendDatabaseError(res, "Could not load product passport readiness from Supabase.");
+  }
+}
+
+export async function getProductPassportReadinessSummaryController(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+
+  try {
+    const summary = await getProductPassportReadinessSummary(sellerId);
+
+    res.json(summary);
+  } catch {
+    sendDatabaseError(res, "Could not load product passport readiness summary from Supabase.");
   }
 }
 
