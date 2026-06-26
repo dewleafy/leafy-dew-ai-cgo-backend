@@ -7,5 +7,5 @@ import {
 
 export const listingReadinessRoutes = Router();
 
-listingReadinessRoutes.get("/", asyncHandler(getListingReadiness));
+listingReadinessRoutes.get(["", "/"], asyncHandler(getListingReadiness));
 listingReadinessRoutes.get("/:productPassportId", asyncHandler(getListingReadinessDetail));
