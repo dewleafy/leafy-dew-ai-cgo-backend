@@ -4,6 +4,7 @@ import { env } from "./config/env";
 import { supabase } from "./db/supabase";
 import { amazonAdsRouter } from "./modules/amazon-ads/amazon-ads.routes";
 import { amazonRouter } from "./modules/amazon/amazon.routes";
+import { brandReadinessRoutes } from "./modules/brand-readiness/brand-readiness.routes";
 import { ceoReportRouter } from "./modules/ceo-report/ceo-report.routes";
 import { listingReadinessRoutes } from "./modules/listing-readiness/listing-readiness.routes";
 import { productEconomicsRouter } from "./modules/product-economics/product-economics.routes";
@@ -120,6 +121,7 @@ app.get("/api/system/db-health", async (_req: Request, res: Response) => {
 
 app.use("/api/amazon", amazonRouter);
 app.use("/api/amazon-ads", amazonAdsRouter);
+app.use("/api/brand-readiness", brandReadinessRoutes);
 app.use("/api/ceo-report", ceoReportRouter);
 app.use("/api/listing-readiness", listingReadinessRoutes);
 app.use("/api/product-economics", productEconomicsRouter);
