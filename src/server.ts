@@ -6,6 +6,7 @@ import { amazonAdsRouter } from "./modules/amazon-ads/amazon-ads.routes";
 import { amazonRouter } from "./modules/amazon/amazon.routes";
 import { ceoReportRouter } from "./modules/ceo-report/ceo-report.routes";
 import { productEconomicsRouter } from "./modules/product-economics/product-economics.routes";
+import { productPassportRoutes } from "./modules/product-passports/product-passports.routes";
 import { recommendationsRouter } from "./modules/recommendations/recommendations.routes";
 import { logger } from "./utils/logger";
 
@@ -120,6 +121,7 @@ app.use("/api/amazon", amazonRouter);
 app.use("/api/amazon-ads", amazonAdsRouter);
 app.use("/api/ceo-report", ceoReportRouter);
 app.use("/api/product-economics", productEconomicsRouter);
+app.use("/api/product-passports", productPassportRoutes);
 app.use("/api/recommendations", recommendationsRouter);
 
 app.use((_req: Request, res: Response) => {
