@@ -5,6 +5,7 @@ import { supabase } from "./db/supabase";
 import { amazonAdsRouter } from "./modules/amazon-ads/amazon-ads.routes";
 import { amazonRouter } from "./modules/amazon/amazon.routes";
 import { ceoReportRouter } from "./modules/ceo-report/ceo-report.routes";
+import { listingReadinessRoutes } from "./modules/listing-readiness/listing-readiness.routes";
 import { productEconomicsRouter } from "./modules/product-economics/product-economics.routes";
 import { productPassportRoutes } from "./modules/product-passports/product-passports.routes";
 import { recommendationsRouter } from "./modules/recommendations/recommendations.routes";
@@ -120,6 +121,7 @@ app.get("/api/system/db-health", async (_req: Request, res: Response) => {
 app.use("/api/amazon", amazonRouter);
 app.use("/api/amazon-ads", amazonAdsRouter);
 app.use("/api/ceo-report", ceoReportRouter);
+app.use("/api/listing-readiness", listingReadinessRoutes);
 app.use("/api/product-economics", productEconomicsRouter);
 app.use("/api/product-passports", productPassportRoutes);
 app.use("/api/recommendations", recommendationsRouter);
