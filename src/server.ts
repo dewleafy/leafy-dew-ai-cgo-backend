@@ -4,6 +4,7 @@ import { env } from "./config/env";
 import { supabase } from "./db/supabase";
 import { amazonAdsRouter } from "./modules/amazon-ads/amazon-ads.routes";
 import { amazonRouter } from "./modules/amazon/amazon.routes";
+import { automationSettingsRoutes } from "./modules/automation-settings/automation-settings.routes";
 import { brandReadinessRoutes } from "./modules/brand-readiness/brand-readiness.routes";
 import { ceoReportRouter } from "./modules/ceo-report/ceo-report.routes";
 import { experimentRoutes } from "./modules/experiments/experiments.routes";
@@ -124,6 +125,7 @@ app.get("/api/system/db-health", async (_req: Request, res: Response) => {
 
 app.use("/api/amazon", amazonRouter);
 app.use("/api/amazon-ads", amazonAdsRouter);
+app.use("/api/automation-settings", automationSettingsRoutes);
 app.use("/api/brand-readiness", brandReadinessRoutes);
 app.use("/api/ceo-report", ceoReportRouter);
 app.use("/api/experiments", experimentRoutes);
