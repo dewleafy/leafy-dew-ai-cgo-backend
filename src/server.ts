@@ -10,6 +10,7 @@ import { experimentRoutes } from "./modules/experiments/experiments.routes";
 import { listingReadinessRoutes } from "./modules/listing-readiness/listing-readiness.routes";
 import { productEconomicsRouter } from "./modules/product-economics/product-economics.routes";
 import { productPassportRoutes } from "./modules/product-passports/product-passports.routes";
+import { recommendationOutcomeRoutes } from "./modules/recommendation-outcomes/recommendation-outcomes.routes";
 import { recommendationsRouter } from "./modules/recommendations/recommendations.routes";
 import { logger } from "./utils/logger";
 
@@ -128,6 +129,7 @@ app.use("/api/experiments", experimentRoutes);
 app.use("/api/listing-readiness", listingReadinessRoutes);
 app.use("/api/product-economics", productEconomicsRouter);
 app.use("/api/product-passports", productPassportRoutes);
+app.use("/api/recommendation-outcomes", recommendationOutcomeRoutes);
 app.use("/api/recommendations", recommendationsRouter);
 
 app.use((_req: Request, res: Response) => {
