@@ -10,7 +10,7 @@ import {
   syncAmazonSpListings,
   syncAmazonSpOrders
 } from "./amazon-sp.service";
-import { safeErrorMessage } from "./amazon-sp-utils";
+import { safeErrorDetails, safeErrorMessage } from "./amazon-sp-utils";
 
 function getSellerId(req: Request): string {
   return typeof req.query.sellerId === "string" && req.query.sellerId.trim()
@@ -34,7 +34,7 @@ function sendSafeError(res: Response, message: string, error: unknown): void {
   res.status(503).json({
     ok: false,
     message,
-    details: safeErrorMessage(error)
+    details: safeErrorDetails(error)
   });
 }
 

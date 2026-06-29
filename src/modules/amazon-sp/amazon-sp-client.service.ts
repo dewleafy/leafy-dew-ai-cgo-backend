@@ -1,7 +1,38 @@
 import axios from "axios";
 import { getAmazonSpEndpoint } from "./amazon-sp-auth.service";
 import { AmazonSpRegion } from "./amazon-sp.types";
-import { safeErrorMessage, smallDelay } from "./amazon-sp-utils";
+import { AmazonSpHttpError, safeErrorMessage, sanitizeAmazonSpValue, smallDelay } from "./amazon-sp-utils";
+
+function firstAmazonError(data: unknown): Record<string, unknown> {
+  if (!data || typeof data !== "object") {
+    return {};
+  }
+
+  const errors = (data as Record<string, unknown>).errors;
+  if (Array.isArray(errors) && errors[0] && typeof errors[0] === "object") {
+    return errors[0] as Record<string, unknown>;
+  }
+
+  return {};
+}
+
+function responseHeader(headers: unknown, keys: string[]): string | undefined {
+  if (!headers || typeof headers !== "object") {
+    return undefined;
+  }
+
+  const record = headers as Record<string, unknown>;
+  for (const key of keys) {
+    const exact = record[key];
+    const lower = record[key.toLowerCase()];
+    const value = exact ?? lower;
+    if (typeof value === "string") {
+      return value;
+    }
+  }
+
+  return undefined;
+}
 
 export async function amazonSpGet<T>(input: {
   path: string;
@@ -33,6 +64,33 @@ export async function amazonSpGet<T>(input: {
         await smallDelay(700 * attempt);
         continue;
       }
+
+      if (axios.isAxiosError(error) && error.response?.status) {
+        const amazonError = firstAmazonError(error.response.data);
+        const requestId = responseHeader(error.response.headers, [
+          "x-amzn-RequestId",
+          "x-amzn-requestid",
+          "x-amzn-request-id",
+          "x-amz-request-id"
+        ]);
+
+        throw new AmazonSpHttpError({
+          httpStatus: error.response.status,
+          amazonErrorCode: sanitizeAmazonSpValue(
+            typeof amazonError.code === "string" ? amazonError.code : undefined
+          ),
+          amazonErrorMessage: sanitizeAmazonSpValue(
+            typeof amazonError.message === "string" ? amazonError.message : undefined
+          ),
+          amazonErrorDetails: sanitizeAmazonSpValue(
+            typeof amazonError.details === "string" ? amazonError.details : undefined
+          ),
+          requestId: sanitizeAmazonSpValue(requestId),
+          method: "GET",
+          path: url.pathname
+        });
+      }
+
       throw new Error(safeErrorMessage(error));
     }
   }

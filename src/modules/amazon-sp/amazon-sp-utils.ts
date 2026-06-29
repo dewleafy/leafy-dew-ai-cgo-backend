@@ -1,6 +1,26 @@
 import { env } from "../../config/env";
 import { logger } from "../../utils/logger";
 
+export type SafeAmazonSpHttpErrorDetails = {
+  httpStatus: number;
+  amazonErrorCode?: string;
+  amazonErrorMessage?: string;
+  amazonErrorDetails?: string;
+  requestId?: string;
+  method: string;
+  path: string;
+};
+
+export class AmazonSpHttpError extends Error {
+  safeDetails: SafeAmazonSpHttpErrorDetails;
+
+  constructor(details: SafeAmazonSpHttpErrorDetails) {
+    super(`Amazon SP-API request failed with status ${details.httpStatus}.`);
+    this.name = "AmazonSpHttpError";
+    this.safeDetails = details;
+  }
+}
+
 export function cleanText(value: string | null | undefined): string | null {
   const trimmed = value?.trim();
   return trimmed ? trimmed : null;
@@ -51,11 +71,29 @@ export function logSafeAmazonSpError(context: string, error: { message?: string;
 }
 
 export function safeErrorMessage(error: unknown): string {
+  if (error instanceof AmazonSpHttpError) {
+    return error.message;
+  }
+
   if (error instanceof Error) {
     return sanitizeAmazonSpValue(error.message) ?? "Amazon SP-API request failed.";
   }
 
   return "Amazon SP-API request failed.";
+}
+
+export function safeErrorDetails(error: unknown): SafeAmazonSpHttpErrorDetails | string {
+  if (error instanceof AmazonSpHttpError) {
+    return {
+      ...error.safeDetails,
+      amazonErrorCode: sanitizeAmazonSpValue(error.safeDetails.amazonErrorCode),
+      amazonErrorMessage: sanitizeAmazonSpValue(error.safeDetails.amazonErrorMessage),
+      amazonErrorDetails: sanitizeAmazonSpValue(error.safeDetails.amazonErrorDetails),
+      requestId: sanitizeAmazonSpValue(error.safeDetails.requestId)
+    };
+  }
+
+  return safeErrorMessage(error);
 }
 
 export async function smallDelay(ms: number): Promise<void> {
