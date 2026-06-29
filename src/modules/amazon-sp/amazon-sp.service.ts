@@ -1,3 +1,4 @@
+import { env } from "../../config/env";
 import { supabase } from "../../db/supabase";
 import { createActivityLog } from "../activity-logs/activity-logs.service";
 import {
@@ -9,7 +10,11 @@ import {
   parseAmazonSpState
 } from "./amazon-sp-auth.service";
 import { amazonSpGet } from "./amazon-sp-client.service";
-import { encryptAmazonSpRefreshToken, getAmazonSpAccessToken } from "./amazon-sp-token.service";
+import {
+  AMAZON_SP_ENV_CONNECTION_ID,
+  encryptAmazonSpRefreshToken,
+  getAmazonSpAccessToken
+} from "./amazon-sp-token.service";
 import {
   AmazonSpConnectionRow,
   AmazonSpListingRow,
@@ -211,6 +216,8 @@ async function getConnection(sellerIdInput: string): Promise<AmazonSpConnectionR
 export async function getAmazonSpStatus(sellerIdInput: string) {
   const sellerId = sellerIdOrDefault(sellerIdInput);
   const connection = await getConnection(sellerId);
+  const hasDbToken = Boolean(connection?.refresh_token_encrypted);
+  const hasEnvToken = Boolean(env.SP_API_REFRESH_TOKEN);
   const [listingStats, orderStats] = await Promise.all([
     getTableStats("amazon_sp_listings", sellerId),
     getTableStats("amazon_sp_orders", sellerId)
@@ -218,8 +225,8 @@ export async function getAmazonSpStatus(sellerIdInput: string) {
 
   return {
     sellerId,
-    connected: connection?.token_status === "CONNECTED",
-    tokenStatus: connection?.token_status ?? "DISCONNECTED",
+    connected: connection?.token_status === "CONNECTED" || (!hasDbToken && hasEnvToken),
+    tokenStatus: !hasDbToken && hasEnvToken ? "CONNECTED_ENV" : connection?.token_status ?? "DISCONNECTED",
     marketplaceId: connection?.marketplace_id ?? getAmazonSpMarketplaceId(),
     region: connection?.region ?? getAmazonSpRegion(),
     lastConnectedAt: connection?.last_connected_at ?? null,
@@ -445,13 +452,37 @@ async function upsertProductPassportsFromListings(sellerId: string, listings: Li
 
 async function requireConnectedConnection(sellerId: string): Promise<AmazonSpConnectionRow> {
   const connection = await getConnection(sellerId);
-  if (!connection || connection.token_status !== "CONNECTED" || !connection.refresh_token_encrypted) {
-    throw new Error("Amazon SP-API is not connected. Please connect Seller Central first.");
+
+  if (connection && (connection.token_status === "CONNECTED" || env.SP_API_REFRESH_TOKEN)) {
+    return connection;
   }
-  return connection;
+
+  if (env.SP_API_REFRESH_TOKEN) {
+    const now = new Date().toISOString();
+
+    return {
+      id: AMAZON_SP_ENV_CONNECTION_ID,
+      seller_id: sellerId,
+      amazon_seller_id: cleanText(env.SP_API_AMAZON_SELLER_ID),
+      marketplace_id: getAmazonSpMarketplaceId(),
+      region: getAmazonSpRegion(),
+      refresh_token_encrypted: null,
+      token_status: "CONNECTED_ENV",
+      last_connected_at: null,
+      last_error: null,
+      created_at: now,
+      updated_at: now
+    };
+  }
+
+  throw new Error("SP-API refresh token is not configured.");
 }
 
 async function updateConnectionError(connectionId: string, lastError: string | null): Promise<void> {
+  if (connectionId === AMAZON_SP_ENV_CONNECTION_ID) {
+    return;
+  }
+
   const { error } = await supabase
     .from("amazon_sp_connections")
     .update({

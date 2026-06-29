@@ -27,6 +27,8 @@ const envSchema = z.object({
   SP_API_REGION: z.enum(["NA", "EU", "FE"]).optional(),
   SP_API_MARKETPLACE_ID: z.string().default("A21TJRUUN4KGV"),
   SP_API_REDIRECT_URI: z.string().optional(),
+  SP_API_REFRESH_TOKEN: z.string().optional(),
+  SP_API_AMAZON_SELLER_ID: z.string().optional(),
   SP_API_TOKEN_ENCRYPTION_KEY: z.string().optional(),
   SP_API_AWS_ACCESS_KEY_ID: z.string().optional(),
   SP_API_AWS_SECRET_ACCESS_KEY: z.string().optional(),

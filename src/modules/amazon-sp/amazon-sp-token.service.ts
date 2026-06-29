@@ -8,6 +8,8 @@ type TokenRow = {
   refresh_token_encrypted: string | null;
 };
 
+export const AMAZON_SP_ENV_CONNECTION_ID = "__SP_API_REFRESH_TOKEN_ENV__";
+
 const ALGORITHM = "aes-256-gcm";
 const IV_LENGTH = 12;
 const AUTH_TAG_LENGTH = 16;
@@ -53,6 +55,15 @@ function decryptSpToken(encryptedText: string): string {
 }
 
 export async function getAmazonSpAccessToken(connectionId: string): Promise<string> {
+  if (connectionId === AMAZON_SP_ENV_CONNECTION_ID) {
+    if (!env.SP_API_REFRESH_TOKEN) {
+      throw new Error("SP-API refresh token is not configured.");
+    }
+
+    const refreshed = await refreshAmazonSpAccessToken(env.SP_API_REFRESH_TOKEN);
+    return refreshed.access_token;
+  }
+
   const { data, error } = await supabase
     .from("amazon_sp_connections")
     .select("refresh_token_encrypted")
@@ -61,7 +72,13 @@ export async function getAmazonSpAccessToken(connectionId: string): Promise<stri
 
   if (error || !data?.refresh_token_encrypted) {
     if (error) logSafeAmazonSpError("Could not load Amazon SP-API refresh token.", error);
-    throw new Error("Amazon SP-API is not connected. Please reconnect Seller Central.");
+
+    if (!env.SP_API_REFRESH_TOKEN) {
+      throw new Error("SP-API refresh token is not configured.");
+    }
+
+    const refreshed = await refreshAmazonSpAccessToken(env.SP_API_REFRESH_TOKEN);
+    return refreshed.access_token;
   }
 
   const refreshToken = decryptSpToken(data.refresh_token_encrypted);

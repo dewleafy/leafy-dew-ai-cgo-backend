@@ -55,6 +55,7 @@ export function getAmazonSpConfigCheck() {
     hasMarketplaceId: Boolean(getAmazonSpMarketplaceId()),
     hasRedirectUri: Boolean(getAmazonSpRedirectUri()),
     hasEncryptionKey: Boolean(env.SP_API_TOKEN_ENCRYPTION_KEY || env.ENCRYPTION_KEY),
+    hasRefreshToken: Boolean(env.SP_API_REFRESH_TOKEN),
     region: getAmazonSpRegion(),
     marketplaceId: getAmazonSpMarketplaceId()
   };

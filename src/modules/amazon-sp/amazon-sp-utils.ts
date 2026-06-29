@@ -26,6 +26,7 @@ export function sanitizeAmazonSpValue(value: string | undefined): string | undef
     env.SP_API_TOKEN_ENCRYPTION_KEY,
     env.SP_API_LWA_CLIENT_ID,
     env.SP_API_LWA_CLIENT_SECRET,
+    env.SP_API_REFRESH_TOKEN,
     env.SP_API_AWS_ACCESS_KEY_ID,
     env.SP_API_AWS_SECRET_ACCESS_KEY,
     env.SP_API_AWS_SESSION_TOKEN,
