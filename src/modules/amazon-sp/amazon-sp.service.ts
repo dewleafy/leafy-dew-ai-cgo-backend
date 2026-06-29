@@ -37,6 +37,7 @@ import {
 
 const LISTINGS_REPORT_TYPE = "GET_MERCHANT_LISTINGS_ALL_DATA";
 const ORDERS_REPORT_TYPE = "GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL";
+const ORDERS_REPORT_LAST_UPDATE_TYPE = "GET_FLAT_FILE_ALL_ORDERS_DATA_BY_LAST_UPDATE_GENERAL";
 const LISTINGS_REPORT_PROCESSING_STATUSES = new Set(["IN_QUEUE", "IN_PROGRESS"]);
 const LISTINGS_REPORT_STOP_STATUSES = new Set(["DONE", "DONE_NO_DATA", "CANCELLED", "FATAL"]);
 const ORDER_REPORT_PROCESSING_STATUSES = new Set(["IN_QUEUE", "IN_PROGRESS"]);
@@ -104,6 +105,14 @@ type OrderReportParsedResult = {
   totalSales: number;
   totalUnits: number;
 };
+
+type OrderReportDiagnosis =
+  | "REPORT_HAS_NO_DATA_ROWS"
+  | "REPORT_HAS_ROWS_BUT_MAPPING_FAILED"
+  | "REPORT_HAS_ROWS_AND_MAPPING_WORKS"
+  | "REPORT_PROCESSING"
+  | "REPORT_FAILED"
+  | "UNKNOWN";
 
 type DoctorDiagnosis =
   | "CONFIG_MISSING"
@@ -1081,6 +1090,7 @@ async function createOrderReport(input: {
   region: AmazonSpConnectionRow["region"];
   marketplaceId: string;
   days: number;
+  reportType: string;
 }): Promise<string> {
   const now = Date.now();
   const response = await amazonSpPost<AmazonSpReportResponse>({
@@ -1089,7 +1099,7 @@ async function createOrderReport(input: {
     region: input.region,
     stage: "CREATE_ORDER_REPORT",
     body: {
-      reportType: ORDERS_REPORT_TYPE,
+      reportType: input.reportType,
       marketplaceIds: [input.marketplaceId],
       dataStartTime: new Date(now - input.days * 24 * 60 * 60 * 1000).toISOString(),
       dataEndTime: new Date(now - 2 * 60 * 1000).toISOString()
@@ -1108,13 +1118,15 @@ async function waitForOrderReport(input: {
   region: AmazonSpConnectionRow["region"];
   marketplaceId: string;
   days: number;
+  reportType: string;
   reportId?: string;
 }): Promise<{ reportId: string; report: AmazonSpReportResponse }> {
   const reportId = input.reportId ?? await createOrderReport({
     accessToken: input.accessToken,
     region: input.region,
     marketplaceId: input.marketplaceId,
-    days: input.days
+    days: input.days,
+    reportType: input.reportType
   });
 
   if (input.reportId) {
@@ -1268,6 +1280,273 @@ function parseOrderReportText(text: string): OrderReportParsedResult {
   };
 }
 
+function isPiiReportHeader(header: string): boolean {
+  const normalized = header.toLowerCase();
+  return (
+    normalized.includes("buyer") ||
+    normalized.includes("email") ||
+    normalized.includes("phone") ||
+    normalized.includes("address") ||
+    normalized.includes("recipient") ||
+    normalized.includes("billing") ||
+    normalized.includes("ship-to")
+  );
+}
+
+function safeReportHeaders(headers: string[]): string[] {
+  return headers.map((header) => isPiiReportHeader(header) ? "[PII_HEADER_REDACTED]" : header);
+}
+
+function hasNumericParseIssue(row: Record<string, string>): boolean {
+  const checks: Array<[string[], (value: unknown) => number | null]> = [
+    [["quantity-purchased"], toIntegerOrNull],
+    [["item-price"], (value) => reportNumber({ value: String(value ?? "") }, ["value"])],
+    [["item-tax"], (value) => reportNumber({ value: String(value ?? "") }, ["value"])],
+    [["promotion-discount"], (value) => reportNumber({ value: String(value ?? "") }, ["value"])]
+  ];
+
+  return checks.some(([names, parser]) => {
+    const rawValue = reportValue(row, names);
+    return rawValue !== null && parser(rawValue) === null;
+  });
+}
+
+function debugOrderReportText(text: string) {
+  const withoutBom = text.replace(/^\uFEFF/, "");
+  const rawLines = withoutBom.split(/\r?\n/);
+  const lines = rawLines.length > 0 && rawLines[rawLines.length - 1]?.trim() === ""
+    ? rawLines.slice(0, -1)
+    : rawLines;
+  const headerLine = lines[0] ?? "";
+  const headers = headerLine ? splitTabDelimitedLine(headerLine).map((header) => header.trim().toLowerCase()) : [];
+  const firstSafeRows: Array<{
+    hasOrderId: boolean;
+    hasOrderItemId: boolean;
+    sku: string | null;
+    asin: string | null;
+    titlePresent: boolean;
+    quantity: number | null;
+    itemPrice: number | null;
+    purchaseDatePresent: boolean;
+    fulfillmentChannel: string | null;
+    orderStatus: string | null;
+  }> = [];
+  const orderIds = new Set<string>();
+  let blankRowCount = 0;
+  let dataRowCount = 0;
+  let mappedOrderItemRows = 0;
+  let missingOrderIdRows = 0;
+  let missingOrderItemIdRows = 0;
+  let missingSkuRows = 0;
+  let numericParseIssueRows = 0;
+
+  for (const line of lines.slice(1)) {
+    if (line.trim().length === 0) {
+      blankRowCount += 1;
+      continue;
+    }
+
+    dataRowCount += 1;
+    const cells = splitTabDelimitedLine(line);
+    const row: Record<string, string> = {};
+    headers.forEach((header, index) => {
+      row[header] = (cells[index] ?? "").trim();
+    });
+
+    const amazonOrderId = reportValue(row, ["order-id"]);
+    const orderItemId = reportValue(row, ["order-item-id"]);
+    const sku = reportValue(row, ["sku"]);
+    const asin = reportValue(row, ["asin"]);
+    const title = reportValue(row, ["product-name"]);
+    const quantity = toIntegerOrNull(reportValue(row, ["quantity-purchased"]));
+    const itemPrice = reportNumber(row, ["item-price"]);
+    const purchaseDate = reportValue(row, ["purchase-date"]);
+    const fulfillmentChannel = reportValue(row, ["fulfillment-channel"]);
+    const orderStatus = reportValue(row, ["order-status"]);
+
+    if (!amazonOrderId) missingOrderIdRows += 1;
+    else orderIds.add(amazonOrderId);
+
+    if (!orderItemId) missingOrderItemIdRows += 1;
+    if (!sku) missingSkuRows += 1;
+    if (amazonOrderId && orderItemId) mappedOrderItemRows += 1;
+    if (hasNumericParseIssue(row)) numericParseIssueRows += 1;
+
+    if (firstSafeRows.length < 3) {
+      firstSafeRows.push({
+        hasOrderId: Boolean(amazonOrderId),
+        hasOrderItemId: Boolean(orderItemId),
+        sku,
+        asin,
+        titlePresent: Boolean(title),
+        quantity,
+        itemPrice,
+        purchaseDatePresent: Boolean(purchaseDate),
+        fulfillmentChannel,
+        orderStatus
+      });
+    }
+  }
+
+  const mappedOrderRows = orderIds.size;
+  const diagnosis: OrderReportDiagnosis = dataRowCount === 0
+    ? "REPORT_HAS_NO_DATA_ROWS"
+    : mappedOrderRows > 0 && mappedOrderItemRows > 0
+      ? "REPORT_HAS_ROWS_AND_MAPPING_WORKS"
+      : "REPORT_HAS_ROWS_BUT_MAPPING_FAILED";
+
+  return {
+    rawTextLength: text.length,
+    lineCount: lines.length,
+    headerCount: headers.length,
+    headers: safeReportHeaders(headers),
+    dataRowCount,
+    blankRowCount,
+    mappedOrderRows,
+    mappedOrderItemRows,
+    missingOrderIdRows,
+    missingOrderItemIdRows,
+    missingSkuRows,
+    numericParseIssueRows,
+    firstSafeRows,
+    diagnosis
+  };
+}
+
+function orderReportTypeFromDebugMode(mode?: string): string {
+  return mode === "LAST_UPDATE" ? ORDERS_REPORT_LAST_UPDATE_TYPE : ORDERS_REPORT_TYPE;
+}
+
+export async function debugAmazonSpOrderReport(input: {
+  sellerId: string;
+  days: number;
+  reportId?: string;
+  reportTypeMode?: string;
+}) {
+  const sellerId = sellerIdOrDefault(input.sellerId);
+  const days = Math.min(Math.max(Math.floor(input.days), 1), 90);
+  const requestedReportId = cleanText(input.reportId) ?? undefined;
+  const reportType = orderReportTypeFromDebugMode(input.reportTypeMode);
+  const connection = await requireConnectedConnection(sellerId);
+  const accessToken = await getAmazonSpAccessToken(connection.id);
+  const { reportId, report } = await waitForOrderReport({
+    accessToken,
+    region: connection.region,
+    marketplaceId: connection.marketplace_id,
+    days,
+    reportType,
+    reportId: requestedReportId
+  });
+  const processingStatus = report.processingStatus ?? "UNKNOWN";
+
+  if (ORDER_REPORT_PROCESSING_STATUSES.has(processingStatus)) {
+    return {
+      ok: true,
+      reportId,
+      processingStatus,
+      reportType,
+      rawTextLength: 0,
+      lineCount: 0,
+      headerCount: 0,
+      headers: [],
+      dataRowCount: 0,
+      blankRowCount: 0,
+      mappedOrderRows: 0,
+      mappedOrderItemRows: 0,
+      missingOrderIdRows: 0,
+      missingOrderItemIdRows: 0,
+      missingSkuRows: 0,
+      numericParseIssueRows: 0,
+      firstSafeRows: [],
+      diagnosis: "REPORT_PROCESSING" satisfies OrderReportDiagnosis
+    };
+  }
+
+  if (processingStatus === "CANCELLED" || processingStatus === "FATAL") {
+    return {
+      ok: true,
+      reportId,
+      processingStatus,
+      reportType,
+      rawTextLength: 0,
+      lineCount: 0,
+      headerCount: 0,
+      headers: [],
+      dataRowCount: 0,
+      blankRowCount: 0,
+      mappedOrderRows: 0,
+      mappedOrderItemRows: 0,
+      missingOrderIdRows: 0,
+      missingOrderItemIdRows: 0,
+      missingSkuRows: 0,
+      numericParseIssueRows: 0,
+      firstSafeRows: [],
+      diagnosis: "REPORT_FAILED" satisfies OrderReportDiagnosis
+    };
+  }
+
+  if (processingStatus === "DONE_NO_DATA") {
+    return {
+      ok: true,
+      reportId,
+      processingStatus,
+      reportType,
+      rawTextLength: 0,
+      lineCount: 0,
+      headerCount: 0,
+      headers: [],
+      dataRowCount: 0,
+      blankRowCount: 0,
+      mappedOrderRows: 0,
+      mappedOrderItemRows: 0,
+      missingOrderIdRows: 0,
+      missingOrderItemIdRows: 0,
+      missingSkuRows: 0,
+      numericParseIssueRows: 0,
+      firstSafeRows: [],
+      diagnosis: "REPORT_HAS_NO_DATA_ROWS" satisfies OrderReportDiagnosis
+    };
+  }
+
+  if (processingStatus !== "DONE" || !report.reportDocumentId) {
+    return {
+      ok: true,
+      reportId,
+      processingStatus,
+      reportType,
+      rawTextLength: 0,
+      lineCount: 0,
+      headerCount: 0,
+      headers: [],
+      dataRowCount: 0,
+      blankRowCount: 0,
+      mappedOrderRows: 0,
+      mappedOrderItemRows: 0,
+      missingOrderIdRows: 0,
+      missingOrderItemIdRows: 0,
+      missingSkuRows: 0,
+      numericParseIssueRows: 0,
+      firstSafeRows: [],
+      diagnosis: "UNKNOWN" satisfies OrderReportDiagnosis
+    };
+  }
+
+  const reportText = await loadAmazonSpReportDocument({
+    accessToken,
+    region: connection.region,
+    reportDocumentId: report.reportDocumentId,
+    stage: "GET_DEBUG_ORDER_REPORT_DOCUMENT"
+  });
+
+  return {
+    ok: true,
+    reportId,
+    processingStatus,
+    reportType,
+    ...debugOrderReportText(reportText)
+  };
+}
+
 export async function syncAmazonSpOrderReport(input: { sellerId: string; days: number; reportId?: string }) {
   const sellerId = sellerIdOrDefault(input.sellerId);
   const days = Math.min(Math.max(Math.floor(input.days), 1), 90);
@@ -1290,6 +1569,7 @@ export async function syncAmazonSpOrderReport(input: { sellerId: string; days: n
       region: connection.region,
       marketplaceId: connection.marketplace_id,
       days,
+      reportType: ORDERS_REPORT_TYPE,
       reportId: requestedReportId
     });
     const status = report.processingStatus ?? "UNKNOWN";

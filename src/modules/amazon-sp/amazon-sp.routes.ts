@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { asyncHandler } from "../../utils/async-handler";
 import {
+  debugAmazonSpOrderReportController,
   getAmazonSpCallbackController,
   getAmazonSpConfigCheckController,
   getAmazonSpConnectUrlController,
@@ -27,5 +28,6 @@ amazonSpRouter.get("/listings", asyncHandler(listAmazonSpListingsController));
 amazonSpRouter.get("/sync-orders", asyncHandler(syncAmazonSpOrdersController));
 amazonSpRouter.post("/sync-orders", asyncHandler(syncAmazonSpOrdersController));
 amazonSpRouter.get("/sync-order-report", asyncHandler(syncAmazonSpOrderReportController));
+amazonSpRouter.get("/debug-order-report", asyncHandler(debugAmazonSpOrderReportController));
 amazonSpRouter.get("/orders", asyncHandler(listAmazonSpOrdersController));
 amazonSpRouter.get("/sales-summary", asyncHandler(getAmazonSpSalesSummaryController));

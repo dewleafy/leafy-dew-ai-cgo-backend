@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import {
   buildAmazonSpConnectUrl,
+  debugAmazonSpOrderReport,
   getAmazonSpConfigCheck,
   getAmazonSpSalesSummary,
   getAmazonSpStatus,
@@ -35,6 +36,12 @@ function getDays(req: Request, defaultDays = 7, maxDays = 90): number {
 function getReportId(req: Request): string | undefined {
   return typeof req.query.reportId === "string" && req.query.reportId.trim()
     ? req.query.reportId.trim()
+    : undefined;
+}
+
+function getReportTypeMode(req: Request): string | undefined {
+  return typeof req.query.reportType === "string" && req.query.reportType.trim()
+    ? req.query.reportType.trim().toUpperCase()
     : undefined;
 }
 
@@ -148,6 +155,19 @@ export async function syncAmazonSpOrderReportController(req: Request, res: Respo
     }));
   } catch (error) {
     sendSafeError(res, "Could not sync Amazon SP-API order report.", error);
+  }
+}
+
+export async function debugAmazonSpOrderReportController(req: Request, res: Response): Promise<void> {
+  try {
+    res.json(await debugAmazonSpOrderReport({
+      sellerId: getSellerId(req),
+      days: getDays(req, 30, 90),
+      reportId: getReportId(req),
+      reportTypeMode: getReportTypeMode(req)
+    }));
+  } catch (error) {
+    sendSafeError(res, "Could not debug Amazon SP-API order report.", error);
   }
 }
 
