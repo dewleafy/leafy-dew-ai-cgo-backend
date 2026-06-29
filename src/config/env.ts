@@ -24,7 +24,7 @@ const envSchema = z.object({
   SP_API_LWA_CLIENT_ID: z.string().optional(),
   SP_API_LWA_CLIENT_SECRET: z.string().optional(),
   SP_API_APPLICATION_ID: z.string().optional(),
-  SP_API_REGION: z.enum(["NA", "EU", "FE"]).default("FE"),
+  SP_API_REGION: z.enum(["NA", "EU", "FE"]).optional(),
   SP_API_MARKETPLACE_ID: z.string().default("A21TJRUUN4KGV"),
   SP_API_REDIRECT_URI: z.string().optional(),
   SP_API_TOKEN_ENCRYPTION_KEY: z.string().optional(),

@@ -13,11 +13,31 @@ const SELLER_CENTRAL_AUTH_BASE: Record<AmazonSpRegion, string> = {
 };
 
 export function getAmazonSpRegion(): AmazonSpRegion {
-  return env.SP_API_REGION;
+  return env.SP_API_REGION ?? env.AMAZON_SP_API_REGION ?? "FE";
 }
 
 export function getAmazonSpMarketplaceId(): string {
   return env.SP_API_MARKETPLACE_ID || "A21TJRUUN4KGV";
+}
+
+function getAmazonSpClientId(): string | undefined {
+  return env.SP_API_LWA_CLIENT_ID ?? env.AMAZON_LWA_CLIENT_ID ?? env.AMAZON_ADS_CLIENT_ID;
+}
+
+function getAmazonSpClientSecret(): string | undefined {
+  return env.SP_API_LWA_CLIENT_SECRET ?? env.AMAZON_LWA_CLIENT_SECRET ?? env.AMAZON_ADS_CLIENT_SECRET;
+}
+
+function getAmazonSpApplicationId(): string | undefined {
+  return env.SP_API_APPLICATION_ID ?? env.AMAZON_APP_ID;
+}
+
+function getAmazonSpRedirectUri(): string | undefined {
+  if (env.SP_API_REDIRECT_URI) {
+    return env.SP_API_REDIRECT_URI;
+  }
+
+  return new URL("/api/amazon-sp/callback", env.APP_BASE_URL).toString();
 }
 
 export function getAmazonSpEndpoint(region: AmazonSpRegion = getAmazonSpRegion()): string {
@@ -29,11 +49,11 @@ export function getAmazonSpEndpoint(region: AmazonSpRegion = getAmazonSpRegion()
 export function getAmazonSpConfigCheck() {
   return {
     ok: true,
-    hasClientId: Boolean(env.SP_API_LWA_CLIENT_ID),
-    hasClientSecret: Boolean(env.SP_API_LWA_CLIENT_SECRET),
-    hasApplicationId: Boolean(env.SP_API_APPLICATION_ID),
+    hasClientId: Boolean(getAmazonSpClientId()),
+    hasClientSecret: Boolean(getAmazonSpClientSecret()),
+    hasApplicationId: Boolean(getAmazonSpApplicationId()),
     hasMarketplaceId: Boolean(getAmazonSpMarketplaceId()),
-    hasRedirectUri: Boolean(env.SP_API_REDIRECT_URI),
+    hasRedirectUri: Boolean(getAmazonSpRedirectUri()),
     hasEncryptionKey: Boolean(env.SP_API_TOKEN_ENCRYPTION_KEY || env.ENCRYPTION_KEY),
     region: getAmazonSpRegion(),
     marketplaceId: getAmazonSpMarketplaceId()
@@ -42,10 +62,10 @@ export function getAmazonSpConfigCheck() {
 
 export function assertAmazonSpOAuthConfig(): void {
   const missing: string[] = [];
-  if (!env.SP_API_LWA_CLIENT_ID) missing.push("SP_API_LWA_CLIENT_ID");
-  if (!env.SP_API_LWA_CLIENT_SECRET) missing.push("SP_API_LWA_CLIENT_SECRET");
-  if (!env.SP_API_APPLICATION_ID) missing.push("SP_API_APPLICATION_ID");
-  if (!env.SP_API_REDIRECT_URI) missing.push("SP_API_REDIRECT_URI");
+  if (!getAmazonSpClientId()) missing.push("SP_API_LWA_CLIENT_ID or AMAZON_LWA_CLIENT_ID");
+  if (!getAmazonSpClientSecret()) missing.push("SP_API_LWA_CLIENT_SECRET or AMAZON_LWA_CLIENT_SECRET");
+  if (!getAmazonSpApplicationId()) missing.push("SP_API_APPLICATION_ID or AMAZON_APP_ID");
+  if (!getAmazonSpRedirectUri()) missing.push("SP_API_REDIRECT_URI or APP_BASE_URL");
   if (missing.length > 0) {
     throw new Error(`Missing Amazon SP-API environment variables: ${missing.join(", ")}`);
   }
@@ -63,9 +83,9 @@ export function buildAmazonSpConnectUrl(sellerId: string): { connectUrl: string;
   } satisfies AmazonSpOAuthState);
 
   const url = new URL("/apps/authorize/consent", SELLER_CENTRAL_AUTH_BASE[getAmazonSpRegion()]);
-  url.searchParams.set("application_id", env.SP_API_APPLICATION_ID as string);
+  url.searchParams.set("application_id", getAmazonSpApplicationId() as string);
   url.searchParams.set("state", state);
-  url.searchParams.set("redirect_uri", env.SP_API_REDIRECT_URI as string);
+  url.searchParams.set("redirect_uri", getAmazonSpRedirectUri() as string);
 
   return {
     connectUrl: url.toString(),
@@ -96,9 +116,9 @@ export async function exchangeAmazonSpAuthorizationCode(code: string): Promise<A
     new URLSearchParams({
       grant_type: "authorization_code",
       code,
-      client_id: env.SP_API_LWA_CLIENT_ID as string,
-      client_secret: env.SP_API_LWA_CLIENT_SECRET as string,
-      redirect_uri: env.SP_API_REDIRECT_URI as string
+      client_id: getAmazonSpClientId() as string,
+      client_secret: getAmazonSpClientSecret() as string,
+      redirect_uri: getAmazonSpRedirectUri() as string
     }).toString(),
     {
       headers: {
@@ -118,8 +138,8 @@ export async function refreshAmazonSpAccessToken(refreshToken: string): Promise<
     new URLSearchParams({
       grant_type: "refresh_token",
       refresh_token: refreshToken,
-      client_id: env.SP_API_LWA_CLIENT_ID as string,
-      client_secret: env.SP_API_LWA_CLIENT_SECRET as string
+      client_id: getAmazonSpClientId() as string,
+      client_secret: getAmazonSpClientSecret() as string
     }).toString(),
     {
       headers: {
