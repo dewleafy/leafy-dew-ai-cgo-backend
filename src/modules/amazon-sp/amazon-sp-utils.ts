@@ -9,6 +9,7 @@ export type SafeAmazonSpHttpErrorDetails = {
   requestId?: string;
   method: string;
   path: string;
+  safeQuery?: Record<string, string | number>;
 };
 
 export class AmazonSpHttpError extends Error {

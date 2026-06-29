@@ -323,9 +323,9 @@ export async function syncAmazonSpListings(sellerIdInput: string) {
         region: connection.region,
         query: {
           marketplaceIds: connection.marketplace_id,
-          includedData: "summaries,offers,fulfillmentAvailability",
+          includedData: "summaries",
           pageSize: 20,
-          pageToken
+          ...(pageToken ? { pageToken } : {})
         }
       });
       const parsed = extractListings(response);

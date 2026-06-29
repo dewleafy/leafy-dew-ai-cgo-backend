@@ -36,15 +36,31 @@ function responseHeader(headers: unknown, keys: string[]): string | undefined {
 
 export async function amazonSpGet<T>(input: {
   path: string;
-  query?: Record<string, string | number | undefined>;
+  query?: Record<string, string | number | Array<string | number> | null | undefined>;
   accessToken: string;
   region: AmazonSpRegion;
 }): Promise<T> {
   const url = new URL(input.path, getAmazonSpEndpoint(input.region));
+  const safeQuery: Record<string, string | number> = {};
+
   Object.entries(input.query ?? {}).forEach(([key, value]) => {
-    if (value !== undefined && value !== "") {
-      url.searchParams.set(key, String(value));
+    if (value === undefined || value === null || value === "") {
+      return;
     }
+
+    if (Array.isArray(value)) {
+      if (value.length === 0) {
+        return;
+      }
+
+      const serialized = value.join(",");
+      url.searchParams.set(key, serialized);
+      safeQuery[key] = serialized;
+      return;
+    }
+
+    url.searchParams.set(key, String(value));
+    safeQuery[key] = value;
   });
 
   const headers = {
@@ -87,7 +103,8 @@ export async function amazonSpGet<T>(input: {
           ),
           requestId: sanitizeAmazonSpValue(requestId),
           method: "GET",
-          path: url.pathname
+          path: url.pathname,
+          safeQuery
         });
       }
 
