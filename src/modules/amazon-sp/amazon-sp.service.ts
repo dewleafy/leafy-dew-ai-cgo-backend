@@ -36,8 +36,11 @@ import {
 } from "./amazon-sp-utils";
 
 const LISTINGS_REPORT_TYPE = "GET_MERCHANT_LISTINGS_ALL_DATA";
+const ORDERS_REPORT_TYPE = "GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL";
 const LISTINGS_REPORT_PROCESSING_STATUSES = new Set(["IN_QUEUE", "IN_PROGRESS"]);
 const LISTINGS_REPORT_STOP_STATUSES = new Set(["DONE", "DONE_NO_DATA", "CANCELLED", "FATAL"]);
+const ORDER_REPORT_PROCESSING_STATUSES = new Set(["IN_QUEUE", "IN_PROGRESS"]);
+const ORDER_REPORT_STOP_STATUSES = new Set(["DONE", "DONE_NO_DATA", "CANCELLED", "FATAL"]);
 
 type ListingSyncItem = {
   sku: string;
@@ -92,6 +95,14 @@ type AmazonSpReportDocumentResponse = {
   reportDocumentId?: string;
   url?: string;
   compressionAlgorithm?: string;
+};
+
+type OrderReportParsedResult = {
+  orders: OrderSyncItem[];
+  orderItems: OrderItemSyncItem[];
+  skippedCount: number;
+  totalSales: number;
+  totalUnits: number;
 };
 
 type DoctorDiagnosis =
@@ -507,6 +518,14 @@ function reportValue(row: Record<string, string>, names: string[]): string | nul
   return null;
 }
 
+function reportNumber(row: Record<string, string>, names: string[]): number | null {
+  const value = reportValue(row, names);
+  if (!value) return null;
+
+  const normalized = value.replace(/,/g, "").replace(/[^\d.-]/g, "");
+  return toNumberOrNull(normalized);
+}
+
 function splitTabDelimitedLine(line: string): string[] {
   const cells: string[] = [];
   let current = "";
@@ -660,16 +679,17 @@ async function waitForListingsReport(input: {
   return { reportId, report };
 }
 
-async function loadListingsReportDocument(input: {
+async function loadAmazonSpReportDocument(input: {
   accessToken: string;
   region: AmazonSpConnectionRow["region"];
   reportDocumentId: string;
+  stage: string;
 }): Promise<string> {
   const document = await amazonSpGet<AmazonSpReportDocumentResponse>({
     path: `/reports/2021-06-30/documents/${encodeURIComponent(input.reportDocumentId)}`,
     accessToken: input.accessToken,
     region: input.region,
-    stage: "GET_LISTINGS_REPORT_DOCUMENT"
+    stage: input.stage
   });
 
   if (!document.url) {
@@ -687,7 +707,7 @@ async function loadListingsReportDocument(input: {
     const decompressed = document.compressionAlgorithm?.toUpperCase() === "GZIP" ? gunzipSync(body) : body;
     return decompressed.toString("utf8");
   } catch {
-    throw new Error("Could not download Amazon listing report document.");
+    throw new Error("Could not download Amazon report document.");
   }
 }
 
@@ -797,10 +817,11 @@ export async function syncAmazonSpListings(input: { sellerId: string; reportId?:
       throw new Error("Amazon listing report did not finish with a downloadable document.");
     }
 
-    const reportText = await loadListingsReportDocument({
+    const reportText = await loadAmazonSpReportDocument({
       accessToken,
       region: connection.region,
-      reportDocumentId: report.reportDocumentId
+      reportDocumentId: report.reportDocumentId,
+      stage: "GET_LISTINGS_REPORT_DOCUMENT"
     });
     const { listings, skippedCount } = parseListingReportText(reportText);
 
@@ -1040,6 +1061,332 @@ function extractOrderItems(amazonOrderId: string, response: unknown): { items: O
       })
       .filter((item) => item.orderItemId.length > 0)
   };
+}
+
+async function getOrderReportStatus(
+  accessToken: string,
+  region: AmazonSpConnectionRow["region"],
+  reportId: string
+): Promise<AmazonSpReportResponse> {
+  return amazonSpGet<AmazonSpReportResponse>({
+    path: `/reports/2021-06-30/reports/${encodeURIComponent(reportId)}`,
+    accessToken,
+    region,
+    stage: "GET_ORDER_REPORT"
+  });
+}
+
+async function createOrderReport(input: {
+  accessToken: string;
+  region: AmazonSpConnectionRow["region"];
+  marketplaceId: string;
+  days: number;
+}): Promise<string> {
+  const now = Date.now();
+  const response = await amazonSpPost<AmazonSpReportResponse>({
+    path: "/reports/2021-06-30/reports",
+    accessToken: input.accessToken,
+    region: input.region,
+    stage: "CREATE_ORDER_REPORT",
+    body: {
+      reportType: ORDERS_REPORT_TYPE,
+      marketplaceIds: [input.marketplaceId],
+      dataStartTime: new Date(now - input.days * 24 * 60 * 60 * 1000).toISOString(),
+      dataEndTime: new Date(now - 2 * 60 * 1000).toISOString()
+    }
+  });
+
+  if (!response.reportId) {
+    throw new Error("Amazon did not return an order report id.");
+  }
+
+  return response.reportId;
+}
+
+async function waitForOrderReport(input: {
+  accessToken: string;
+  region: AmazonSpConnectionRow["region"];
+  marketplaceId: string;
+  days: number;
+  reportId?: string;
+}): Promise<{ reportId: string; report: AmazonSpReportResponse }> {
+  const reportId = input.reportId ?? await createOrderReport({
+    accessToken: input.accessToken,
+    region: input.region,
+    marketplaceId: input.marketplaceId,
+    days: input.days
+  });
+
+  if (input.reportId) {
+    return {
+      reportId,
+      report: await getOrderReportStatus(input.accessToken, input.region, reportId)
+    };
+  }
+
+  let report: AmazonSpReportResponse = { reportId, processingStatus: "IN_QUEUE" };
+
+  for (let attempt = 1; attempt <= 6; attempt += 1) {
+    report = await getOrderReportStatus(input.accessToken, input.region, reportId);
+    const status = report.processingStatus ?? "UNKNOWN";
+    if (ORDER_REPORT_STOP_STATUSES.has(status)) {
+      break;
+    }
+
+    if (attempt < 6) {
+      await smallDelay(10000);
+    }
+  }
+
+  return { reportId, report };
+}
+
+function parseOrderReportText(text: string): OrderReportParsedResult {
+  const withoutBom = text.replace(/^\uFEFF/, "");
+  const lines = withoutBom
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0);
+
+  if (lines.length === 0) {
+    return { orders: [], orderItems: [], skippedCount: 0, totalSales: 0, totalUnits: 0 };
+  }
+
+  const headers = splitTabDelimitedLine(lines[0]).map((header) => header.trim().toLowerCase());
+  const orderItems: OrderItemSyncItem[] = [];
+  const ordersById = new Map<string, OrderSyncItem>();
+  let skippedCount = 0;
+
+  for (const line of lines.slice(1)) {
+    const cells = splitTabDelimitedLine(line);
+    const row: Record<string, string> = {};
+
+    headers.forEach((header, index) => {
+      row[header] = (cells[index] ?? "").trim();
+    });
+
+    if (Object.values(row).every((value) => value.length === 0)) {
+      continue;
+    }
+
+    const amazonOrderId = reportValue(row, ["order-id"]);
+    const orderItemId = reportValue(row, ["order-item-id"]);
+
+    if (!amazonOrderId || !orderItemId) {
+      skippedCount += 1;
+      continue;
+    }
+
+    const purchaseDate = reportValue(row, ["purchase-date"]);
+    const paymentsDate = reportValue(row, ["payments-date"]);
+    const orderStatus = reportValue(row, ["order-status"]);
+    const fulfillmentChannel = reportValue(row, ["fulfillment-channel"]);
+    const salesChannel = reportValue(row, ["sales-channel"]);
+    const quantityOrdered = toIntegerOrNull(reportValue(row, ["quantity-purchased"])) ?? 0;
+    const itemPriceAmount = reportNumber(row, ["item-price"]);
+    const itemTaxAmount = reportNumber(row, ["item-tax"]);
+    const promotionDiscountAmount = reportNumber(row, ["promotion-discount"]);
+    const asin = reportValue(row, ["asin"]);
+    const sku = reportValue(row, ["sku"]);
+    const title = reportValue(row, ["product-name"]);
+
+    const sanitizedItemPayload = {
+      amazonOrderId,
+      orderItemId,
+      purchaseDate,
+      paymentsDate,
+      sku,
+      asin,
+      title,
+      quantityOrdered,
+      itemPriceAmount,
+      itemTaxAmount,
+      promotionDiscountAmount,
+      orderStatus,
+      fulfillmentChannel,
+      salesChannel
+    };
+
+    orderItems.push({
+      amazonOrderId,
+      orderItemId,
+      asin,
+      sku,
+      title,
+      quantityOrdered,
+      quantityShipped: quantityOrdered,
+      itemPriceAmount,
+      itemPriceCurrency: "INR",
+      itemTaxAmount,
+      promotionDiscountAmount,
+      rawPayload: sanitizedItemPayload
+    });
+
+    const existingOrder = ordersById.get(amazonOrderId) ?? {
+      amazonOrderId,
+      purchaseDate,
+      orderStatus,
+      fulfillmentChannel,
+      salesChannel,
+      orderTotalAmount: 0,
+      orderTotalCurrency: "INR",
+      numberOfItemsShipped: 0,
+      numberOfItemsUnshipped: null,
+      rawPayload: {
+        amazonOrderId,
+        purchaseDate,
+        paymentsDate,
+        orderStatus,
+        fulfillmentChannel,
+        salesChannel,
+        itemCount: 0
+      }
+    };
+
+    existingOrder.orderTotalAmount = (existingOrder.orderTotalAmount ?? 0) + (itemPriceAmount ?? 0);
+    existingOrder.numberOfItemsShipped = (existingOrder.numberOfItemsShipped ?? 0) + quantityOrdered;
+    existingOrder.purchaseDate = existingOrder.purchaseDate ?? purchaseDate;
+    existingOrder.orderStatus = existingOrder.orderStatus ?? orderStatus;
+    existingOrder.fulfillmentChannel = existingOrder.fulfillmentChannel ?? fulfillmentChannel;
+    existingOrder.salesChannel = existingOrder.salesChannel ?? salesChannel;
+    existingOrder.rawPayload = {
+      ...(existingOrder.rawPayload ?? {}),
+      itemCount: ((existingOrder.rawPayload as Record<string, unknown> | null)?.itemCount as number | undefined ?? 0) + 1
+    };
+    ordersById.set(amazonOrderId, existingOrder);
+  }
+
+  const totalSales = orderItems.reduce((sum, item) => sum + (item.itemPriceAmount ?? 0), 0);
+  const totalUnits = orderItems.reduce((sum, item) => sum + (item.quantityOrdered ?? 0), 0);
+
+  return {
+    orders: Array.from(ordersById.values()),
+    orderItems,
+    skippedCount,
+    totalSales,
+    totalUnits
+  };
+}
+
+export async function syncAmazonSpOrderReport(input: { sellerId: string; days: number; reportId?: string }) {
+  const sellerId = sellerIdOrDefault(input.sellerId);
+  const days = Math.min(Math.max(Math.floor(input.days), 1), 90);
+  const requestedReportId = cleanText(input.reportId) ?? undefined;
+  const connection = await requireConnectedConnection(sellerId);
+  const warnings: string[] = [];
+
+  await logSpActivity({
+    sellerId,
+    action: "SYNC_ORDER_REPORT_STARTED",
+    status: "INFO",
+    message: "Amazon SP-API order report sync started.",
+    metadata: { source: "REPORTS_API", reportType: ORDERS_REPORT_TYPE, days }
+  });
+
+  try {
+    const accessToken = await getAmazonSpAccessToken(connection.id);
+    const { reportId, report } = await waitForOrderReport({
+      accessToken,
+      region: connection.region,
+      marketplaceId: connection.marketplace_id,
+      days,
+      reportId: requestedReportId
+    });
+    const status = report.processingStatus ?? "UNKNOWN";
+
+    if (ORDER_REPORT_PROCESSING_STATUSES.has(status)) {
+      return {
+        ok: true,
+        source: "REPORTS_API",
+        status: "PROCESSING",
+        reportId,
+        reportType: ORDERS_REPORT_TYPE,
+        message: "Amazon order report is processing. Retry with this reportId in a few minutes."
+      };
+    }
+
+    if (status === "CANCELLED" || status === "FATAL" || status === "DONE_NO_DATA") {
+      await updateConnectionError(connection.id, null);
+      await logSpActivity({
+        sellerId,
+        action: "SYNC_ORDER_REPORT_COMPLETED",
+        status: status === "DONE_NO_DATA" ? "SUCCESS" : "WARNING",
+        message: `Amazon order report finished with status ${status}.`,
+        metadata: { source: "REPORTS_API", reportId, reportStatus: status, days }
+      });
+
+      return {
+        ok: true,
+        source: "REPORTS_API",
+        reportType: ORDERS_REPORT_TYPE,
+        reportId,
+        status,
+        days,
+        syncedOrders: 0,
+        syncedOrderItems: 0,
+        totalSales: 0,
+        totalUnits: 0,
+        skippedCount: 0,
+        warnings
+      };
+    }
+
+    if (status !== "DONE" || !report.reportDocumentId) {
+      throw new Error("Amazon order report did not finish with a downloadable document.");
+    }
+
+    const reportText = await loadAmazonSpReportDocument({
+      accessToken,
+      region: connection.region,
+      reportDocumentId: report.reportDocumentId,
+      stage: "GET_ORDER_REPORT_DOCUMENT"
+    });
+    const parsed = parseOrderReportText(reportText);
+
+    await upsertOrders(sellerId, connection.marketplace_id, parsed.orders);
+    await upsertOrderItems(sellerId, parsed.orderItems);
+    await updateConnectionError(connection.id, null);
+    await logSpActivity({
+      sellerId,
+      action: "SYNC_ORDER_REPORT_COMPLETED",
+      status: "SUCCESS",
+      message: "Amazon SP-API order report sync completed.",
+      metadata: {
+        source: "REPORTS_API",
+        reportType: ORDERS_REPORT_TYPE,
+        reportId,
+        days,
+        syncedOrders: parsed.orders.length,
+        syncedOrderItems: parsed.orderItems.length,
+        totalSales: parsed.totalSales,
+        totalUnits: parsed.totalUnits,
+        skippedCount: parsed.skippedCount
+      }
+    });
+
+    return {
+      ok: true,
+      source: "REPORTS_API",
+      reportType: ORDERS_REPORT_TYPE,
+      reportId,
+      days,
+      syncedOrders: parsed.orders.length,
+      syncedOrderItems: parsed.orderItems.length,
+      totalSales: parsed.totalSales,
+      totalUnits: parsed.totalUnits,
+      skippedCount: parsed.skippedCount,
+      warnings
+    };
+  } catch (error) {
+    await updateConnectionError(connection.id, safeErrorMessage(error));
+    await logSpActivity({
+      sellerId,
+      action: "SYNC_ORDER_REPORT_FAILED",
+      status: "ERROR",
+      message: safeErrorMessage(error)
+    });
+    throw error;
+  }
 }
 
 export async function syncAmazonSpOrders(sellerIdInput: string, daysInput: number) {

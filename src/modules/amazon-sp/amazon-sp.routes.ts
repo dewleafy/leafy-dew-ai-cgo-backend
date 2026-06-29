@@ -10,6 +10,7 @@ import {
   listAmazonSpListingsController,
   listAmazonSpOrdersController,
   syncAmazonSpListingsController,
+  syncAmazonSpOrderReportController,
   syncAmazonSpOrdersController
 } from "./amazon-sp.controller";
 
@@ -25,5 +26,6 @@ amazonSpRouter.post("/sync-listings", asyncHandler(syncAmazonSpListingsControlle
 amazonSpRouter.get("/listings", asyncHandler(listAmazonSpListingsController));
 amazonSpRouter.get("/sync-orders", asyncHandler(syncAmazonSpOrdersController));
 amazonSpRouter.post("/sync-orders", asyncHandler(syncAmazonSpOrdersController));
+amazonSpRouter.get("/sync-order-report", asyncHandler(syncAmazonSpOrderReportController));
 amazonSpRouter.get("/orders", asyncHandler(listAmazonSpOrdersController));
 amazonSpRouter.get("/sales-summary", asyncHandler(getAmazonSpSalesSummaryController));

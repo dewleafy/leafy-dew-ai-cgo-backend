@@ -9,6 +9,7 @@ import {
   listAmazonSpOrders,
   runAmazonSpDoctor,
   syncAmazonSpListings,
+  syncAmazonSpOrderReport,
   syncAmazonSpOrders
 } from "./amazon-sp.service";
 import { safeErrorDetails, safeErrorMessage } from "./amazon-sp-utils";
@@ -135,6 +136,18 @@ export async function syncAmazonSpOrdersController(req: Request, res: Response):
     res.json(await syncAmazonSpOrders(getSellerId(req), getDays(req, 7, 30)));
   } catch (error) {
     sendSafeError(res, "Could not sync Amazon SP-API orders.", error);
+  }
+}
+
+export async function syncAmazonSpOrderReportController(req: Request, res: Response): Promise<void> {
+  try {
+    res.json(await syncAmazonSpOrderReport({
+      sellerId: getSellerId(req),
+      days: getDays(req, 30, 90),
+      reportId: getReportId(req)
+    }));
+  } catch (error) {
+    sendSafeError(res, "Could not sync Amazon SP-API order report.", error);
   }
 }
 
