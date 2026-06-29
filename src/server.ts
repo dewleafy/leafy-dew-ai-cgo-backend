@@ -4,6 +4,7 @@ import { env } from "./config/env";
 import { supabase } from "./db/supabase";
 import { activityLogRoutes } from "./modules/activity-logs/activity-logs.routes";
 import { amazonAdsRouter } from "./modules/amazon-ads/amazon-ads.routes";
+import { amazonSpRouter } from "./modules/amazon-sp/amazon-sp.routes";
 import { amazonRouter } from "./modules/amazon/amazon.routes";
 import { automationSettingsRoutes } from "./modules/automation-settings/automation-settings.routes";
 import { brandReadinessRoutes } from "./modules/brand-readiness/brand-readiness.routes";
@@ -154,6 +155,7 @@ app.get("/api/system/db-health", async (_req: Request, res: Response) => {
 
 app.use("/api/amazon", amazonRouter);
 app.use("/api/amazon-ads", amazonAdsRouter);
+app.use("/api/amazon-sp", amazonSpRouter);
 app.use("/api/activity-logs", activityLogRoutes);
 app.use("/api/automation-settings", automationSettingsRoutes);
 app.use("/api/brand-readiness", brandReadinessRoutes);
