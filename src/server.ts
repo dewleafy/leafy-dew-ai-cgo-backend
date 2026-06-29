@@ -23,7 +23,9 @@ const allowedCorsOrigins = new Set([
   "http://localhost:5173",
   "http://localhost:5174",
   "https://leafydew.in",
-  "https://www.leafydew.in"
+  "https://www.leafydew.in",
+  "https://app.leafydew.in",
+  "https://leafy-dew-ai-cgo-frontend.vercel.app",
 ]);
 
 app.use((req: Request, res: Response, next: NextFunction) => {
