@@ -1,3 +1,5 @@
+import axios from "axios";
+import { gunzipSync } from "zlib";
 import { env } from "../../config/env";
 import { supabase } from "../../db/supabase";
 import { createActivityLog } from "../activity-logs/activity-logs.service";
@@ -28,9 +30,14 @@ import {
   logSafeAmazonSpError,
   safeErrorDetails,
   safeErrorMessage,
+  smallDelay,
   toIntegerOrNull,
   toNumberOrNull
 } from "./amazon-sp-utils";
+
+const LISTINGS_REPORT_TYPE = "GET_MERCHANT_LISTINGS_ALL_DATA";
+const LISTINGS_REPORT_PROCESSING_STATUSES = new Set(["IN_QUEUE", "IN_PROGRESS"]);
+const LISTINGS_REPORT_STOP_STATUSES = new Set(["DONE", "DONE_NO_DATA", "CANCELLED", "FATAL"]);
 
 type ListingSyncItem = {
   sku: string;
@@ -72,6 +79,19 @@ type OrderItemSyncItem = {
   itemTaxAmount: number | null;
   promotionDiscountAmount: number | null;
   rawPayload: Record<string, unknown>;
+};
+
+type AmazonSpReportResponse = {
+  reportId?: string;
+  reportType?: string;
+  processingStatus?: string;
+  reportDocumentId?: string;
+};
+
+type AmazonSpReportDocumentResponse = {
+  reportDocumentId?: string;
+  url?: string;
+  compressionAlgorithm?: string;
 };
 
 type DoctorDiagnosis =
@@ -478,71 +498,313 @@ function extractListings(response: unknown): { items: ListingSyncItem[]; nextTok
   };
 }
 
-export async function syncAmazonSpListings(sellerIdInput: string) {
+function reportValue(row: Record<string, string>, names: string[]): string | null {
+  for (const name of names) {
+    const value = cleanText(row[name]);
+    if (value) return value;
+  }
+
+  return null;
+}
+
+function splitTabDelimitedLine(line: string): string[] {
+  const cells: string[] = [];
+  let current = "";
+  let quoted = false;
+
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    const next = line[index + 1];
+
+    if (char === "\"") {
+      if (quoted && next === "\"") {
+        current += "\"";
+        index += 1;
+      } else {
+        quoted = !quoted;
+      }
+      continue;
+    }
+
+    if (char === "\t" && !quoted) {
+      cells.push(current.trim());
+      current = "";
+      continue;
+    }
+
+    current += char;
+  }
+
+  cells.push(current.trim());
+  return cells;
+}
+
+function parseListingReportText(text: string): { listings: ListingSyncItem[]; skippedCount: number } {
+  const withoutBom = text.replace(/^\uFEFF/, "");
+  const lines = withoutBom
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0);
+
+  if (lines.length === 0) {
+    return { listings: [], skippedCount: 0 };
+  }
+
+  const headers = splitTabDelimitedLine(lines[0]).map((header) => header.trim().toLowerCase());
+  const listings: ListingSyncItem[] = [];
+  let skippedCount = 0;
+
+  for (const line of lines.slice(1)) {
+    const cells = splitTabDelimitedLine(line);
+    const row: Record<string, string> = {};
+
+    headers.forEach((header, index) => {
+      row[header] = (cells[index] ?? "").trim();
+    });
+
+    if (Object.values(row).every((value) => value.length === 0)) {
+      continue;
+    }
+
+    const sku = reportValue(row, ["seller-sku", "sku"]);
+    if (!sku) {
+      skippedCount += 1;
+      continue;
+    }
+
+    const productType = reportValue(row, ["product-type", "product_type", "category"]);
+
+    listings.push({
+      sku,
+      asin: reportValue(row, ["asin1", "asin"]),
+      productName: reportValue(row, ["item-name", "title"]),
+      listingStatus: reportValue(row, ["status", "item-is-marketplace"]),
+      fulfillmentChannel: reportValue(row, ["fulfillment-channel"]),
+      price: toNumberOrNull(reportValue(row, ["price"])),
+      currency: "INR",
+      quantity: toIntegerOrNull(reportValue(row, ["quantity"])),
+      productType,
+      mainImageUrl: reportValue(row, ["image-url"]),
+      rawPayload: row
+    });
+  }
+
+  return { listings, skippedCount };
+}
+
+async function getListingsReportStatus(
+  accessToken: string,
+  region: AmazonSpConnectionRow["region"],
+  reportId: string
+): Promise<AmazonSpReportResponse> {
+  return amazonSpGet<AmazonSpReportResponse>({
+    path: `/reports/2021-06-30/reports/${encodeURIComponent(reportId)}`,
+    accessToken,
+    region,
+    stage: "GET_LISTINGS_REPORT"
+  });
+}
+
+async function createListingsReport(
+  accessToken: string,
+  region: AmazonSpConnectionRow["region"],
+  marketplaceId: string
+): Promise<string> {
+  const response = await amazonSpPost<AmazonSpReportResponse>({
+    path: "/reports/2021-06-30/reports",
+    accessToken,
+    region,
+    stage: "CREATE_LISTINGS_REPORT",
+    body: {
+      reportType: LISTINGS_REPORT_TYPE,
+      marketplaceIds: [marketplaceId]
+    }
+  });
+
+  if (!response.reportId) {
+    throw new Error("Amazon did not return a listing report id.");
+  }
+
+  return response.reportId;
+}
+
+async function waitForListingsReport(input: {
+  accessToken: string;
+  region: AmazonSpConnectionRow["region"];
+  marketplaceId: string;
+  reportId?: string;
+}): Promise<{ reportId: string; report: AmazonSpReportResponse }> {
+  const reportId = input.reportId ?? await createListingsReport(input.accessToken, input.region, input.marketplaceId);
+
+  if (input.reportId) {
+    return {
+      reportId,
+      report: await getListingsReportStatus(input.accessToken, input.region, reportId)
+    };
+  }
+
+  let report: AmazonSpReportResponse = { reportId, processingStatus: "IN_QUEUE" };
+
+  for (let attempt = 1; attempt <= 6; attempt += 1) {
+    report = await getListingsReportStatus(input.accessToken, input.region, reportId);
+    const status = report.processingStatus ?? "UNKNOWN";
+    if (LISTINGS_REPORT_STOP_STATUSES.has(status)) {
+      break;
+    }
+
+    if (attempt < 6) {
+      await smallDelay(10000);
+    }
+  }
+
+  return { reportId, report };
+}
+
+async function loadListingsReportDocument(input: {
+  accessToken: string;
+  region: AmazonSpConnectionRow["region"];
+  reportDocumentId: string;
+}): Promise<string> {
+  const document = await amazonSpGet<AmazonSpReportDocumentResponse>({
+    path: `/reports/2021-06-30/documents/${encodeURIComponent(input.reportDocumentId)}`,
+    accessToken: input.accessToken,
+    region: input.region,
+    stage: "GET_LISTINGS_REPORT_DOCUMENT"
+  });
+
+  if (!document.url) {
+    throw new Error("Amazon did not return a listing report document.");
+  }
+
+  try {
+    const response = await axios.get<ArrayBuffer>(document.url, {
+      responseType: "arraybuffer",
+      headers: {
+        "user-agent": "LeafyDew/1.0"
+      }
+    });
+    const body = Buffer.from(response.data);
+    const decompressed = document.compressionAlgorithm?.toUpperCase() === "GZIP" ? gunzipSync(body) : body;
+    return decompressed.toString("utf8");
+  } catch {
+    throw new Error("Could not download Amazon listing report document.");
+  }
+}
+
+async function upsertAmazonSpListingRows(input: {
+  sellerId: string;
+  connection: AmazonSpConnectionRow;
+  listings: ListingSyncItem[];
+}): Promise<void> {
+  if (input.listings.length === 0) return;
+
+  const now = new Date().toISOString();
+  const { error } = await supabase
+    .from("amazon_sp_listings")
+    .upsert(
+      input.listings.map((listing) => ({
+        seller_id: input.sellerId,
+        amazon_seller_id: input.connection.amazon_seller_id,
+        marketplace_id: input.connection.marketplace_id,
+        sku: listing.sku,
+        asin: listing.asin,
+        product_name: listing.productName,
+        listing_status: listing.listingStatus,
+        fulfillment_channel: listing.fulfillmentChannel,
+        price: listing.price,
+        currency: listing.currency,
+        quantity: listing.quantity,
+        product_type: listing.productType,
+        main_image_url: listing.mainImageUrl,
+        raw_payload: listing.rawPayload,
+        last_synced_at: now,
+        updated_at: now
+      })),
+      { onConflict: "seller_id,marketplace_id,sku" }
+    );
+
+  if (error) {
+    logSafeAmazonSpError("Could not upsert Amazon SP-API listings.", error);
+    throw new Error("Could not save Amazon SP-API listings in Supabase.");
+  }
+}
+
+function listingLooksActive(status: string | null): boolean {
+  const normalized = status?.toUpperCase() ?? "";
+  return (
+    normalized === "Y" ||
+    normalized === "YES" ||
+    normalized === "TRUE" ||
+    normalized.includes("ACTIVE") ||
+    normalized.includes("OPEN") ||
+    normalized.includes("BUYABLE")
+  );
+}
+
+export async function syncAmazonSpListings(input: { sellerId: string; reportId?: string } | string) {
+  const sellerIdInput = typeof input === "string" ? input : input.sellerId;
+  const requestedReportId = typeof input === "string" ? undefined : cleanText(input.reportId) ?? undefined;
   const sellerId = sellerIdOrDefault(sellerIdInput);
   const connection = await requireConnectedConnection(sellerId);
   const warnings: string[] = [];
-
-  if (!connection.amazon_seller_id) {
-    throw new Error("Amazon seller id is missing. Reconnect Seller Central so SP-API can identify the seller account.");
-  }
 
   await logSpActivity({ sellerId, action: "SYNC_LISTINGS_STARTED", status: "INFO", message: "Amazon SP-API listing sync started." });
 
   try {
     const accessToken = await getAmazonSpAccessToken(connection.id);
-    const listings: ListingSyncItem[] = [];
-    let pageToken: string | undefined;
+    const { reportId, report } = await waitForListingsReport({
+      accessToken,
+      region: connection.region,
+      marketplaceId: connection.marketplace_id,
+      reportId: requestedReportId
+    });
+    const status = report.processingStatus ?? "UNKNOWN";
 
-    for (let page = 0; page < 5; page += 1) {
-      const response = await amazonSpGet<unknown>({
-        path: `/listings/2021-08-01/items/${encodeURIComponent(connection.amazon_seller_id)}`,
-        accessToken,
-        region: connection.region,
-        query: {
-          marketplaceIds: connection.marketplace_id,
-          includedData: "summaries",
-          pageSize: 20,
-          ...(pageToken ? { pageToken } : {})
-        }
+    if (LISTINGS_REPORT_PROCESSING_STATUSES.has(status)) {
+      return {
+        ok: true,
+        source: "REPORTS_API",
+        status: "PROCESSING",
+        reportId,
+        message: "Amazon listing report is processing. Retry sync-listings with this reportId in a few minutes."
+      };
+    }
+
+    if (status === "CANCELLED" || status === "FATAL" || status === "DONE_NO_DATA") {
+      await updateConnectionError(connection.id, null);
+      await logSpActivity({
+        sellerId,
+        action: "SYNC_LISTINGS_COMPLETED",
+        status: status === "DONE_NO_DATA" ? "SUCCESS" : "WARNING",
+        message: `Amazon listing report finished with status ${status}.`,
+        metadata: { source: "REPORTS_API", reportId, reportStatus: status }
       });
-      const parsed = extractListings(response);
-      listings.push(...parsed.items);
-      if (!parsed.nextToken) break;
-      pageToken = parsed.nextToken;
+
+      return {
+        ok: true,
+        source: "REPORTS_API",
+        reportType: LISTINGS_REPORT_TYPE,
+        reportId,
+        status,
+        syncedCount: 0,
+        upsertedProductPassports: 0,
+        skippedCount: 0,
+        warnings
+      };
     }
 
-    const now = new Date().toISOString();
-    const upsertRows = listings.map((listing) => ({
-      seller_id: sellerId,
-      amazon_seller_id: connection.amazon_seller_id,
-      marketplace_id: connection.marketplace_id,
-      sku: listing.sku,
-      asin: listing.asin,
-      product_name: listing.productName,
-      listing_status: listing.listingStatus,
-      fulfillment_channel: listing.fulfillmentChannel,
-      price: listing.price,
-      currency: listing.currency,
-      quantity: listing.quantity,
-      product_type: listing.productType,
-      main_image_url: listing.mainImageUrl,
-      raw_payload: listing.rawPayload,
-      last_synced_at: now,
-      updated_at: now
-    }));
-
-    if (upsertRows.length > 0) {
-      const { error } = await supabase
-        .from("amazon_sp_listings")
-        .upsert(upsertRows, { onConflict: "seller_id,marketplace_id,sku" });
-
-      if (error) {
-        logSafeAmazonSpError("Could not upsert Amazon SP-API listings.", error);
-        throw new Error("Could not save Amazon SP-API listings in Supabase.");
-      }
+    if (status !== "DONE" || !report.reportDocumentId) {
+      throw new Error("Amazon listing report did not finish with a downloadable document.");
     }
 
+    const reportText = await loadListingsReportDocument({
+      accessToken,
+      region: connection.region,
+      reportDocumentId: report.reportDocumentId
+    });
+    const { listings, skippedCount } = parseListingReportText(reportText);
+
+    await upsertAmazonSpListingRows({ sellerId, connection, listings });
     const passportCount = await upsertProductPassportsFromListings(sellerId, listings);
     await updateConnectionError(connection.id, null);
     await logSpActivity({
@@ -550,13 +812,23 @@ export async function syncAmazonSpListings(sellerIdInput: string) {
       action: "SYNC_LISTINGS_COMPLETED",
       status: "SUCCESS",
       message: "Amazon SP-API listing sync completed.",
-      metadata: { syncedCount: listings.length, upsertedProductPassports: passportCount }
+      metadata: {
+        source: "REPORTS_API",
+        reportId,
+        syncedCount: listings.length,
+        upsertedProductPassports: passportCount,
+        skippedCount
+      }
     });
 
     return {
+      ok: true,
+      source: "REPORTS_API",
+      reportType: LISTINGS_REPORT_TYPE,
+      reportId,
       syncedCount: listings.length,
       upsertedProductPassports: passportCount,
-      skippedCount: 0,
+      skippedCount,
       warnings
     };
   } catch (error) {
@@ -571,28 +843,54 @@ export async function syncAmazonSpListings(sellerIdInput: string) {
   }
 }
 
+async function findProductPassportForListing(
+  sellerId: string,
+  listing: ListingSyncItem
+): Promise<Record<string, unknown> | undefined> {
+  const { data: skuRows, error: skuError } = await supabase
+    .from("product_passports")
+    .select("*")
+    .eq("seller_id", sellerId)
+    .eq("sku", listing.sku)
+    .limit(1);
+
+  if (skuError) {
+    logSafeAmazonSpError("Could not load product passport by SKU during listing import.", skuError);
+    return undefined;
+  }
+
+  const skuMatch = Array.isArray(skuRows) ? skuRows[0] as Record<string, unknown> | undefined : undefined;
+  if (skuMatch || !listing.asin) {
+    return skuMatch;
+  }
+
+  const { data: asinRows, error: asinError } = await supabase
+    .from("product_passports")
+    .select("*")
+    .eq("seller_id", sellerId)
+    .eq("asin", listing.asin)
+    .limit(1);
+
+  if (asinError) {
+    logSafeAmazonSpError("Could not load product passport by ASIN during listing import.", asinError);
+    return undefined;
+  }
+
+  return Array.isArray(asinRows) ? asinRows[0] as Record<string, unknown> | undefined : undefined;
+}
+
 async function upsertProductPassportsFromListings(sellerId: string, listings: ListingSyncItem[]): Promise<number> {
   let count = 0;
 
   for (const listing of listings) {
-    const { data: existingRows, error: loadError } = await supabase
-      .from("product_passports")
-      .select("*")
-      .eq("seller_id", sellerId)
-      .eq("sku", listing.sku)
-      .limit(1);
-
-    if (loadError) {
-      logSafeAmazonSpError("Could not load product passport during listing import.", loadError);
-      continue;
-    }
-
-    const existing = Array.isArray(existingRows) ? existingRows[0] as Record<string, unknown> | undefined : undefined;
-    const status = listing.listingStatus?.toUpperCase().includes("ACTIVE") ? "ACTIVE" : "NEEDS_REVIEW";
+    const existing = await findProductPassportForListing(sellerId, listing);
+    const status = listingLooksActive(listing.listingStatus) ? "ACTIVE" : "NEEDS_REVIEW";
 
     if (existing) {
       const updateRow: Record<string, unknown> = { updated_at: new Date().toISOString() };
+      if (!existing.sku && listing.sku) updateRow.sku = listing.sku;
       if (!existing.asin && listing.asin) updateRow.asin = listing.asin;
+      if (!existing.product_name && listing.productName) updateRow.product_name = listing.productName;
       if (!existing.product_type && listing.productType) updateRow.product_type = listing.productType;
       if (!existing.category && listing.productType) updateRow.category = listing.productType;
       if (!existing.selling_price && listing.price !== null) updateRow.selling_price = listing.price;

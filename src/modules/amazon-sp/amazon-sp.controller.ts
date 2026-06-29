@@ -31,6 +31,12 @@ function getDays(req: Request, defaultDays = 7, maxDays = 90): number {
   return Math.min(Math.max(days, 1), maxDays);
 }
 
+function getReportId(req: Request): string | undefined {
+  return typeof req.query.reportId === "string" && req.query.reportId.trim()
+    ? req.query.reportId.trim()
+    : undefined;
+}
+
 function sendSafeError(res: Response, message: string, error: unknown): void {
   res.status(503).json({
     ok: false,
@@ -101,7 +107,10 @@ export async function getAmazonSpDoctorController(req: Request, res: Response): 
 
 export async function syncAmazonSpListingsController(req: Request, res: Response): Promise<void> {
   try {
-    res.json(await syncAmazonSpListings(getSellerId(req)));
+    res.json(await syncAmazonSpListings({
+      sellerId: getSellerId(req),
+      reportId: getReportId(req)
+    }));
   } catch (error) {
     sendSafeError(res, "Could not sync Amazon SP-API listings.", error);
   }

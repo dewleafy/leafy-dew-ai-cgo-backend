@@ -2,6 +2,7 @@ import { env } from "../../config/env";
 import { logger } from "../../utils/logger";
 
 export type SafeAmazonSpHttpErrorDetails = {
+  stage?: string;
   httpStatus: number;
   amazonErrorCode?: string;
   amazonErrorMessage?: string;

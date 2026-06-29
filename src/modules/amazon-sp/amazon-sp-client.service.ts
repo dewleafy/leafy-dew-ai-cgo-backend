@@ -41,13 +41,15 @@ export async function amazonSpGet<T>(input: {
   query?: Record<string, AmazonSpQueryValue>;
   accessToken: string;
   region: AmazonSpRegion;
+  stage?: string;
 }): Promise<T> {
   return amazonSpRequest<T>({
     method: "GET",
     path: input.path,
     query: input.query,
     accessToken: input.accessToken,
-    region: input.region
+    region: input.region,
+    stage: input.stage
   });
 }
 
@@ -57,6 +59,7 @@ export async function amazonSpPost<T>(input: {
   body?: Record<string, unknown>;
   accessToken: string;
   region: AmazonSpRegion;
+  stage?: string;
 }): Promise<T> {
   return amazonSpRequest<T>({
     method: "POST",
@@ -64,7 +67,8 @@ export async function amazonSpPost<T>(input: {
     query: input.query,
     body: input.body,
     accessToken: input.accessToken,
-    region: input.region
+    region: input.region,
+    stage: input.stage
   });
 }
 
@@ -75,6 +79,7 @@ async function amazonSpRequest<T>(input: {
   body?: Record<string, unknown>;
   accessToken: string;
   region: AmazonSpRegion;
+  stage?: string;
 }): Promise<T> {
   const url = new URL(input.path, getAmazonSpEndpoint(input.region));
   const safeQuery: Record<string, string | number> = {};
@@ -129,6 +134,7 @@ async function amazonSpRequest<T>(input: {
         ]);
 
         throw new AmazonSpHttpError({
+          stage: input.stage,
           httpStatus: error.response.status,
           amazonErrorCode: sanitizeAmazonSpValue(
             typeof amazonError.code === "string" ? amazonError.code : undefined
