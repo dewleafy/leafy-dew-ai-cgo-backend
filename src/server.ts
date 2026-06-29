@@ -19,6 +19,32 @@ import { logger } from "./utils/logger";
 
 const app = express();
 const port = Number(process.env.PORT) || 3000;
+const allowedCorsOrigins = new Set([
+  "http://localhost:5173",
+  "http://localhost:5174",
+  "https://leafydew.in",
+  "https://www.leafydew.in"
+]);
+
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const origin = req.headers.origin;
+
+  if (origin && allowedCorsOrigins.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
+
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-cron-secret");
+  res.setHeader("Access-Control-Max-Age", "86400");
+
+  if (req.method === "OPTIONS") {
+    res.status(204).send();
+    return;
+  }
+
+  next();
+});
 
 app.use(express.json());
 
