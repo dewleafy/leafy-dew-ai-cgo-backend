@@ -535,6 +535,18 @@ function reportNumber(row: Record<string, string>, names: string[]): number | nu
   return toNumberOrNull(normalized);
 }
 
+function amazonOrderIdFromReportRow(row: Record<string, string>): string | null {
+  return reportValue(row, ["amazon-order-id", "order-id", "merchant-order-id"]);
+}
+
+function orderItemIdFromReportRow(row: Record<string, string>, amazonOrderId: string, rowIndex: number): string | null {
+  const orderItemId = reportValue(row, ["order-item-id"]);
+  if (orderItemId) return orderItemId;
+
+  const sku = reportValue(row, ["sku"]);
+  return sku ? `${amazonOrderId}-${sku}-${rowIndex}` : null;
+}
+
 function splitTabDelimitedLine(line: string): string[] {
   const cells: string[] = [];
   let current = "";
@@ -582,7 +594,8 @@ function parseListingReportText(text: string): { listings: ListingSyncItem[]; sk
   const listings: ListingSyncItem[] = [];
   let skippedCount = 0;
 
-  for (const line of lines.slice(1)) {
+  for (const [rowOffset, line] of lines.slice(1).entries()) {
+    const rowIndex = rowOffset + 1;
     const cells = splitTabDelimitedLine(line);
     const row: Record<string, string> = {};
 
@@ -1169,7 +1182,8 @@ function parseOrderReportText(text: string): OrderReportParsedResult {
   const ordersById = new Map<string, OrderSyncItem>();
   let skippedCount = 0;
 
-  for (const line of lines.slice(1)) {
+  for (const [rowOffset, line] of lines.slice(1).entries()) {
+    const rowIndex = rowOffset + 1;
     const cells = splitTabDelimitedLine(line);
     const row: Record<string, string> = {};
 
@@ -1181,26 +1195,33 @@ function parseOrderReportText(text: string): OrderReportParsedResult {
       continue;
     }
 
-    const amazonOrderId = reportValue(row, ["order-id"]);
-    const orderItemId = reportValue(row, ["order-item-id"]);
+    const amazonOrderId = amazonOrderIdFromReportRow(row);
 
-    if (!amazonOrderId || !orderItemId) {
+    if (!amazonOrderId) {
       skippedCount += 1;
       continue;
     }
 
-    const purchaseDate = reportValue(row, ["purchase-date"]);
+    const sku = reportValue(row, ["sku"]);
+    const orderItemId = orderItemIdFromReportRow(row, amazonOrderId, rowIndex);
+
+    if (!orderItemId) {
+      skippedCount += 1;
+      continue;
+    }
+
+    const purchaseDate = reportValue(row, ["purchase-date", "last-updated-date"]);
     const paymentsDate = reportValue(row, ["payments-date"]);
     const orderStatus = reportValue(row, ["order-status"]);
-    const fulfillmentChannel = reportValue(row, ["fulfillment-channel"]);
+    const fulfillmentChannel = reportValue(row, ["fulfillment-channel", "fulfilled-by"]);
     const salesChannel = reportValue(row, ["sales-channel"]);
-    const quantityOrdered = toIntegerOrNull(reportValue(row, ["quantity-purchased"])) ?? 0;
-    const itemPriceAmount = reportNumber(row, ["item-price"]);
+    const quantityOrdered = toIntegerOrNull(reportValue(row, ["quantity", "quantity-purchased"])) ?? 0;
+    const itemPriceAmount = reportNumber(row, ["item-price", "item-price-amount"]);
     const itemTaxAmount = reportNumber(row, ["item-tax"]);
-    const promotionDiscountAmount = reportNumber(row, ["promotion-discount"]);
+    const promotionDiscountAmount = reportNumber(row, ["item-promotion-discount", "promotion-discount"]);
     const asin = reportValue(row, ["asin"]);
-    const sku = reportValue(row, ["sku"]);
-    const title = reportValue(row, ["product-name"]);
+    const title = reportValue(row, ["product-name", "item-name", "title"]);
+    const currency = reportValue(row, ["currency"]) ?? "INR";
 
     const sanitizedItemPayload = {
       amazonOrderId,
@@ -1211,6 +1232,7 @@ function parseOrderReportText(text: string): OrderReportParsedResult {
       asin,
       title,
       quantityOrdered,
+      currency,
       itemPriceAmount,
       itemTaxAmount,
       promotionDiscountAmount,
@@ -1228,7 +1250,7 @@ function parseOrderReportText(text: string): OrderReportParsedResult {
       quantityOrdered,
       quantityShipped: quantityOrdered,
       itemPriceAmount,
-      itemPriceCurrency: "INR",
+      itemPriceCurrency: currency,
       itemTaxAmount,
       promotionDiscountAmount,
       rawPayload: sanitizedItemPayload
@@ -1241,7 +1263,7 @@ function parseOrderReportText(text: string): OrderReportParsedResult {
       fulfillmentChannel,
       salesChannel,
       orderTotalAmount: 0,
-      orderTotalCurrency: "INR",
+      orderTotalCurrency: currency,
       numberOfItemsShipped: 0,
       numberOfItemsUnshipped: null,
       rawPayload: {
@@ -1251,6 +1273,7 @@ function parseOrderReportText(text: string): OrderReportParsedResult {
         orderStatus,
         fulfillmentChannel,
         salesChannel,
+        currency,
         itemCount: 0
       }
     };
@@ -1261,6 +1284,7 @@ function parseOrderReportText(text: string): OrderReportParsedResult {
     existingOrder.orderStatus = existingOrder.orderStatus ?? orderStatus;
     existingOrder.fulfillmentChannel = existingOrder.fulfillmentChannel ?? fulfillmentChannel;
     existingOrder.salesChannel = existingOrder.salesChannel ?? salesChannel;
+    existingOrder.orderTotalCurrency = existingOrder.orderTotalCurrency ?? currency;
     existingOrder.rawPayload = {
       ...(existingOrder.rawPayload ?? {}),
       itemCount: ((existingOrder.rawPayload as Record<string, unknown> | null)?.itemCount as number | undefined ?? 0) + 1
@@ -1299,10 +1323,10 @@ function safeReportHeaders(headers: string[]): string[] {
 
 function hasNumericParseIssue(row: Record<string, string>): boolean {
   const checks: Array<[string[], (value: unknown) => number | null]> = [
-    [["quantity-purchased"], toIntegerOrNull],
-    [["item-price"], (value) => reportNumber({ value: String(value ?? "") }, ["value"])],
+    [["quantity", "quantity-purchased"], toIntegerOrNull],
+    [["item-price", "item-price-amount"], (value) => reportNumber({ value: String(value ?? "") }, ["value"])],
     [["item-tax"], (value) => reportNumber({ value: String(value ?? "") }, ["value"])],
-    [["promotion-discount"], (value) => reportNumber({ value: String(value ?? "") }, ["value"])]
+    [["item-promotion-discount", "promotion-discount"], (value) => reportNumber({ value: String(value ?? "") }, ["value"])]
   ];
 
   return checks.some(([names, parser]) => {
@@ -1340,7 +1364,8 @@ function debugOrderReportText(text: string) {
   let missingSkuRows = 0;
   let numericParseIssueRows = 0;
 
-  for (const line of lines.slice(1)) {
+  for (const [rowOffset, line] of lines.slice(1).entries()) {
+    const rowIndex = rowOffset + 1;
     if (line.trim().length === 0) {
       blankRowCount += 1;
       continue;
@@ -1353,15 +1378,15 @@ function debugOrderReportText(text: string) {
       row[header] = (cells[index] ?? "").trim();
     });
 
-    const amazonOrderId = reportValue(row, ["order-id"]);
-    const orderItemId = reportValue(row, ["order-item-id"]);
+    const amazonOrderId = amazonOrderIdFromReportRow(row);
+    const orderItemId = amazonOrderId ? orderItemIdFromReportRow(row, amazonOrderId, rowIndex) : reportValue(row, ["order-item-id"]);
     const sku = reportValue(row, ["sku"]);
     const asin = reportValue(row, ["asin"]);
-    const title = reportValue(row, ["product-name"]);
-    const quantity = toIntegerOrNull(reportValue(row, ["quantity-purchased"]));
-    const itemPrice = reportNumber(row, ["item-price"]);
-    const purchaseDate = reportValue(row, ["purchase-date"]);
-    const fulfillmentChannel = reportValue(row, ["fulfillment-channel"]);
+    const title = reportValue(row, ["product-name", "item-name", "title"]);
+    const quantity = toIntegerOrNull(reportValue(row, ["quantity", "quantity-purchased"]));
+    const itemPrice = reportNumber(row, ["item-price", "item-price-amount"]);
+    const purchaseDate = reportValue(row, ["purchase-date", "last-updated-date"]);
+    const fulfillmentChannel = reportValue(row, ["fulfillment-channel", "fulfilled-by"]);
     const orderStatus = reportValue(row, ["order-status"]);
 
     if (!amazonOrderId) missingOrderIdRows += 1;
