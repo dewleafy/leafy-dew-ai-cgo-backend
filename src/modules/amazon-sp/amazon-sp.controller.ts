@@ -7,6 +7,7 @@ import {
   handleAmazonSpOAuthCallback,
   listAmazonSpListings,
   listAmazonSpOrders,
+  runAmazonSpDoctor,
   syncAmazonSpListings,
   syncAmazonSpOrders
 } from "./amazon-sp.service";
@@ -87,6 +88,14 @@ export async function getAmazonSpStatusController(req: Request, res: Response): 
     res.json(await getAmazonSpStatus(getSellerId(req)));
   } catch (error) {
     sendSafeError(res, "Could not load Amazon SP-API status.", error);
+  }
+}
+
+export async function getAmazonSpDoctorController(req: Request, res: Response): Promise<void> {
+  try {
+    res.json(await runAmazonSpDoctor(getSellerId(req)));
+  } catch (error) {
+    sendSafeError(res, "Could not run Amazon SP-API doctor.", error);
   }
 }
 

@@ -9,7 +9,7 @@ import {
   getAmazonSpRegion,
   parseAmazonSpState
 } from "./amazon-sp-auth.service";
-import { amazonSpGet } from "./amazon-sp-client.service";
+import { amazonSpGet, amazonSpPost } from "./amazon-sp-client.service";
 import {
   AMAZON_SP_ENV_CONNECTION_ID,
   encryptAmazonSpRefreshToken,
@@ -26,6 +26,7 @@ import {
 import {
   cleanText,
   logSafeAmazonSpError,
+  safeErrorDetails,
   safeErrorMessage,
   toIntegerOrNull,
   toNumberOrNull
@@ -72,6 +73,15 @@ type OrderItemSyncItem = {
   promotionDiscountAmount: number | null;
   rawPayload: Record<string, unknown>;
 };
+
+type DoctorDiagnosis =
+  | "CONFIG_MISSING"
+  | "TOKEN_FAILED"
+  | "MARKETPLACE_NOT_FOUND_FOR_TOKEN"
+  | "REPORTS_API_ALLOWED"
+  | "REPORTS_API_DENIED"
+  | "LISTINGS_ITEMS_DENIED"
+  | "UNKNOWN_NEEDS_REVIEW";
 
 function sellerIdOrDefault(sellerId?: string): string {
   return cleanText(sellerId) ?? "default";
@@ -236,6 +246,174 @@ export async function getAmazonSpStatus(sellerIdInput: string) {
     orderCount: orderStats.count,
     lastError: connection?.last_error ?? null
   };
+}
+
+function safeAmazonError(stage: string, error: unknown) {
+  const details = safeErrorDetails(error);
+
+  return typeof details === "string"
+    ? {
+        stage,
+        amazonErrorMessage: details
+      }
+    : {
+        stage,
+        ...details
+      };
+}
+
+function normalizeMarketplaceParticipations(response: unknown) {
+  const payload = response && typeof response === "object"
+    ? (response as Record<string, unknown>).payload
+    : undefined;
+  const rows = Array.isArray(payload) ? payload : [];
+
+  return rows
+    .filter((row): row is Record<string, unknown> => Boolean(row) && typeof row === "object")
+    .map((row) => {
+      const marketplace = row.marketplace && typeof row.marketplace === "object"
+        ? row.marketplace as Record<string, unknown>
+        : {};
+      const participation = row.participation && typeof row.participation === "object"
+        ? row.participation as Record<string, unknown>
+        : {};
+
+      return {
+        marketplaceId: typeof marketplace.id === "string" ? marketplace.id : null,
+        countryCode: typeof marketplace.countryCode === "string" ? marketplace.countryCode : null,
+        name: typeof marketplace.name === "string" ? marketplace.name : null,
+        defaultCurrencyCode: typeof marketplace.defaultCurrencyCode === "string" ? marketplace.defaultCurrencyCode : null,
+        defaultLanguageCode: typeof marketplace.defaultLanguageCode === "string" ? marketplace.defaultLanguageCode : null,
+        isParticipating: Boolean(participation.isParticipating),
+        hasSuspendedListings: Boolean(participation.hasSuspendedListings)
+      };
+    });
+}
+
+export async function runAmazonSpDoctor(sellerIdInput: string) {
+  const sellerId = sellerIdOrDefault(sellerIdInput);
+  const connection = await getConnection(sellerId);
+  const selectedMarketplaceId = connection?.marketplace_id ?? getAmazonSpMarketplaceId();
+  const selectedRegion = connection?.region ?? getAmazonSpRegion();
+  const configCheck = getAmazonSpConfigCheck();
+  const config = {
+    hasClientId: configCheck.hasClientId,
+    hasClientSecret: configCheck.hasClientSecret,
+    hasApplicationId: configCheck.hasApplicationId,
+    hasRefreshToken: Boolean(connection?.refresh_token_encrypted || env.SP_API_REFRESH_TOKEN),
+    hasMarketplaceId: configCheck.hasMarketplaceId,
+    hasRedirectUri: configCheck.hasRedirectUri,
+    region: selectedRegion,
+    marketplaceId: selectedMarketplaceId
+  };
+  const result: Record<string, unknown> = {
+    ok: true,
+    sellerId,
+    config,
+    tokenOk: false,
+    marketplaceParticipations: [],
+    selectedMarketplaceFound: false,
+    reportsApiOk: false,
+    listingsItemsProbeSkipped: false,
+    finalDiagnosis: "UNKNOWN_NEEDS_REVIEW" satisfies DoctorDiagnosis
+  };
+
+  if (
+    !config.hasClientId ||
+    !config.hasClientSecret ||
+    !config.hasApplicationId ||
+    !config.hasRefreshToken ||
+    !config.hasMarketplaceId ||
+    !config.hasRedirectUri
+  ) {
+    result.finalDiagnosis = "CONFIG_MISSING" satisfies DoctorDiagnosis;
+    return result;
+  }
+
+  let doctorConnection: AmazonSpConnectionRow;
+  let accessToken: string;
+
+  try {
+    doctorConnection = await requireConnectedConnection(sellerId);
+    accessToken = await getAmazonSpAccessToken(doctorConnection.id);
+    result.tokenOk = true;
+  } catch (error) {
+    result.tokenError = safeAmazonError("TOKEN_TEST", error);
+    result.finalDiagnosis = "TOKEN_FAILED" satisfies DoctorDiagnosis;
+    return result;
+  }
+
+  try {
+    const participationResponse = await amazonSpGet<unknown>({
+      path: "/sellers/v1/marketplaceParticipations",
+      accessToken,
+      region: doctorConnection.region
+    });
+    const participations = normalizeMarketplaceParticipations(participationResponse);
+    const selected = participations.some((row) => row.marketplaceId === selectedMarketplaceId);
+    result.marketplaceParticipations = participations;
+    result.selectedMarketplaceFound = selected;
+
+    if (!selected) {
+      result.finalDiagnosis = "MARKETPLACE_NOT_FOUND_FOR_TOKEN" satisfies DoctorDiagnosis;
+      return result;
+    }
+  } catch (error) {
+    result.marketplaceParticipationError = safeAmazonError("MARKETPLACE_PARTICIPATION_TEST", error);
+    result.finalDiagnosis = "MARKETPLACE_NOT_FOUND_FOR_TOKEN" satisfies DoctorDiagnosis;
+    return result;
+  }
+
+  try {
+    const reportResponse = await amazonSpPost<Record<string, unknown>>({
+      path: "/reports/2021-06-30/reports",
+      accessToken,
+      region: doctorConnection.region,
+      body: {
+        reportType: "GET_MERCHANT_LISTINGS_ALL_DATA",
+        marketplaceIds: [selectedMarketplaceId]
+      }
+    });
+
+    result.reportsApiOk = true;
+    result.reportId = typeof reportResponse.reportId === "string" ? reportResponse.reportId : null;
+    result.reportType = "GET_MERCHANT_LISTINGS_ALL_DATA";
+    result.marketplaceId = selectedMarketplaceId;
+    result.finalDiagnosis = "REPORTS_API_ALLOWED" satisfies DoctorDiagnosis;
+  } catch (error) {
+    result.reportsApiOk = false;
+    result.reportsApiError = safeAmazonError("REPORTS_API_PROBE", error);
+    result.finalDiagnosis = "REPORTS_API_DENIED" satisfies DoctorDiagnosis;
+  }
+
+  const amazonSellerId = cleanText(doctorConnection.amazon_seller_id) ?? cleanText(env.SP_API_AMAZON_SELLER_ID);
+
+  if (!amazonSellerId) {
+    result.listingsItemsProbeSkipped = true;
+    result.reason = "amazonSellerId is not confirmed";
+    return result;
+  }
+
+  try {
+    await amazonSpGet<unknown>({
+      path: `/listings/2021-08-01/items/${encodeURIComponent(amazonSellerId)}`,
+      accessToken,
+      region: doctorConnection.region,
+      query: {
+        marketplaceIds: selectedMarketplaceId,
+        includedData: "summaries",
+        pageSize: 20
+      }
+    });
+
+    result.listingsItemsProbeOk = true;
+  } catch (error) {
+    result.listingsItemsProbeOk = false;
+    result.listingsItemsProbeError = safeAmazonError("LISTINGS_ITEMS_PROBE", error);
+    result.finalDiagnosis = "LISTINGS_ITEMS_DENIED" satisfies DoctorDiagnosis;
+  }
+
+  return result;
 }
 
 async function getTableStats(table: string, sellerId: string): Promise<{ count: number; lastSyncedAt: string | null }> {

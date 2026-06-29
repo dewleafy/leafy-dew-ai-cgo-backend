@@ -4,6 +4,7 @@ import {
   getAmazonSpCallbackController,
   getAmazonSpConfigCheckController,
   getAmazonSpConnectUrlController,
+  getAmazonSpDoctorController,
   getAmazonSpSalesSummaryController,
   getAmazonSpStatusController,
   listAmazonSpListingsController,
@@ -18,6 +19,7 @@ amazonSpRouter.get("/config-check", asyncHandler(getAmazonSpConfigCheckControlle
 amazonSpRouter.get("/connect-url", asyncHandler(getAmazonSpConnectUrlController));
 amazonSpRouter.get("/callback", asyncHandler(getAmazonSpCallbackController));
 amazonSpRouter.get("/status", asyncHandler(getAmazonSpStatusController));
+amazonSpRouter.get("/doctor", asyncHandler(getAmazonSpDoctorController));
 amazonSpRouter.get("/sync-listings", asyncHandler(syncAmazonSpListingsController));
 amazonSpRouter.post("/sync-listings", asyncHandler(syncAmazonSpListingsController));
 amazonSpRouter.get("/listings", asyncHandler(listAmazonSpListingsController));

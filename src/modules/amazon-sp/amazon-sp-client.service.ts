@@ -3,6 +3,8 @@ import { getAmazonSpEndpoint } from "./amazon-sp-auth.service";
 import { AmazonSpRegion } from "./amazon-sp.types";
 import { AmazonSpHttpError, safeErrorMessage, sanitizeAmazonSpValue, smallDelay } from "./amazon-sp-utils";
 
+type AmazonSpQueryValue = string | number | Array<string | number> | null | undefined;
+
 function firstAmazonError(data: unknown): Record<string, unknown> {
   if (!data || typeof data !== "object") {
     return {};
@@ -36,7 +38,41 @@ function responseHeader(headers: unknown, keys: string[]): string | undefined {
 
 export async function amazonSpGet<T>(input: {
   path: string;
-  query?: Record<string, string | number | Array<string | number> | null | undefined>;
+  query?: Record<string, AmazonSpQueryValue>;
+  accessToken: string;
+  region: AmazonSpRegion;
+}): Promise<T> {
+  return amazonSpRequest<T>({
+    method: "GET",
+    path: input.path,
+    query: input.query,
+    accessToken: input.accessToken,
+    region: input.region
+  });
+}
+
+export async function amazonSpPost<T>(input: {
+  path: string;
+  query?: Record<string, AmazonSpQueryValue>;
+  body?: Record<string, unknown>;
+  accessToken: string;
+  region: AmazonSpRegion;
+}): Promise<T> {
+  return amazonSpRequest<T>({
+    method: "POST",
+    path: input.path,
+    query: input.query,
+    body: input.body,
+    accessToken: input.accessToken,
+    region: input.region
+  });
+}
+
+async function amazonSpRequest<T>(input: {
+  method: "GET" | "POST";
+  path: string;
+  query?: Record<string, AmazonSpQueryValue>;
+  body?: Record<string, unknown>;
   accessToken: string;
   region: AmazonSpRegion;
 }): Promise<T> {
@@ -72,7 +108,9 @@ export async function amazonSpGet<T>(input: {
 
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
-      const response = await axios.get<T>(url.toString(), { headers });
+      const response = input.method === "GET"
+        ? await axios.get<T>(url.toString(), { headers })
+        : await axios.post<T>(url.toString(), input.body ?? {}, { headers });
       return response.data;
     } catch (error) {
       const status = axios.isAxiosError(error) ? error.response?.status : undefined;
@@ -102,7 +140,7 @@ export async function amazonSpGet<T>(input: {
             typeof amazonError.details === "string" ? amazonError.details : undefined
           ),
           requestId: sanitizeAmazonSpValue(requestId),
-          method: "GET",
+          method: input.method,
           path: url.pathname,
           safeQuery
         });
