@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { asyncHandler } from "../../utils/async-handler";
 import {
+  dailyAmazonSpSyncController,
   debugAmazonSpOrderReportController,
   getAmazonSpCallbackController,
   getAmazonSpConfigCheckController,
@@ -8,8 +9,10 @@ import {
   getAmazonSpDoctorController,
   getAmazonSpSalesSummaryController,
   getAmazonSpStatusController,
+  listAmazonSpReportJobsController,
   listAmazonSpListingsController,
   listAmazonSpOrdersController,
+  processAmazonSpReportJobsController,
   syncAmazonSpListingsController,
   syncAmazonSpOrderReportController,
   syncAmazonSpOrderReportChunkedController,
@@ -31,5 +34,10 @@ amazonSpRouter.post("/sync-orders", asyncHandler(syncAmazonSpOrdersController));
 amazonSpRouter.get("/sync-order-report", asyncHandler(syncAmazonSpOrderReportController));
 amazonSpRouter.get("/sync-order-report-chunked", asyncHandler(syncAmazonSpOrderReportChunkedController));
 amazonSpRouter.get("/debug-order-report", asyncHandler(debugAmazonSpOrderReportController));
+amazonSpRouter.get("/daily-sync", asyncHandler(dailyAmazonSpSyncController));
+amazonSpRouter.post("/daily-sync", asyncHandler(dailyAmazonSpSyncController));
+amazonSpRouter.get("/process-report-jobs", asyncHandler(processAmazonSpReportJobsController));
+amazonSpRouter.post("/process-report-jobs", asyncHandler(processAmazonSpReportJobsController));
+amazonSpRouter.get("/report-jobs", asyncHandler(listAmazonSpReportJobsController));
 amazonSpRouter.get("/orders", asyncHandler(listAmazonSpOrdersController));
 amazonSpRouter.get("/sales-summary", asyncHandler(getAmazonSpSalesSummaryController));

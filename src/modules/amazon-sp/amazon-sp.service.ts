@@ -140,6 +140,25 @@ type OrderItemSaveResult = {
   }>;
 };
 
+type AmazonSpReportJobType = "LISTINGS_IMPORT" | "ORDER_IMPORT";
+
+type AmazonSpReportJobRow = {
+  id: string;
+  seller_id: string;
+  marketplace_id: string;
+  report_id: string;
+  report_type: string;
+  job_type: AmazonSpReportJobType;
+  status: string;
+  data_start_time: string | null;
+  data_end_time: string | null;
+  last_attempt_at: string | null;
+  processed_at: string | null;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 type DoctorDiagnosis =
   | "CONFIG_MISSING"
   | "TOKEN_FAILED"
@@ -1922,6 +1941,312 @@ export async function syncAmazonSpOrderReportChunked(input: { sellerId: string; 
     });
     throw error;
   }
+}
+
+function toSafeReportJob(row: AmazonSpReportJobRow) {
+  return {
+    reportId: row.report_id,
+    reportType: row.report_type,
+    jobType: row.job_type,
+    status: row.status,
+    dataStartTime: row.data_start_time,
+    dataEndTime: row.data_end_time,
+    createdAt: row.created_at,
+    processedAt: row.processed_at,
+    errorMessage: row.error_message
+  };
+}
+
+async function saveAmazonSpReportJob(input: {
+  sellerId: string;
+  marketplaceId: string;
+  reportId: string;
+  reportType: string;
+  jobType: AmazonSpReportJobType;
+  status: string;
+  dataStartTime?: string | null;
+  dataEndTime?: string | null;
+}): Promise<void> {
+  const now = new Date().toISOString();
+  const { error } = await supabase.from("amazon_sp_report_jobs").upsert(
+    {
+      seller_id: input.sellerId,
+      marketplace_id: input.marketplaceId,
+      report_id: input.reportId,
+      report_type: input.reportType,
+      job_type: input.jobType,
+      status: input.status,
+      data_start_time: input.dataStartTime ?? null,
+      data_end_time: input.dataEndTime ?? null,
+      error_message: null,
+      updated_at: now
+    },
+    { onConflict: "report_id" }
+  );
+
+  if (error) {
+    logSafeAmazonSpError("Could not save Amazon SP-API report job.", error);
+    throw new Error("Could not save Amazon SP-API report job in Supabase.");
+  }
+}
+
+async function updateAmazonSpReportJob(input: {
+  reportId: string;
+  status: string;
+  processedAt?: string | null;
+  errorMessage?: string | null;
+}): Promise<void> {
+  const now = new Date().toISOString();
+  const { error } = await supabase
+    .from("amazon_sp_report_jobs")
+    .update({
+      status: input.status,
+      last_attempt_at: now,
+      processed_at: input.processedAt,
+      error_message: input.errorMessage ? sanitizeAmazonSpValue(input.errorMessage) : null,
+      updated_at: now
+    })
+    .eq("report_id", input.reportId);
+
+  if (error) {
+    logSafeAmazonSpError("Could not update Amazon SP-API report job.", error);
+    throw new Error("Could not update Amazon SP-API report job in Supabase.");
+  }
+}
+
+export async function createDailyAmazonSpSyncJobs(sellerIdInput: string) {
+  const sellerId = sellerIdOrDefault(sellerIdInput);
+  const connection = await requireConnectedConnection(sellerId);
+  const accessToken = await getAmazonSpAccessToken(connection.id);
+  const orderEndMs = Date.now() - 2 * 60 * 1000;
+  const orderStartMs = orderEndMs - 30 * 24 * 60 * 60 * 1000;
+  const orderDataStartTime = new Date(orderStartMs).toISOString();
+  const orderDataEndTime = new Date(orderEndMs).toISOString();
+  const listingReportId = await createListingsReport(accessToken, connection.region, connection.marketplace_id);
+  const orderReportId = await createOrderReport({
+    accessToken,
+    region: connection.region,
+    marketplaceId: connection.marketplace_id,
+    days: 30,
+    reportType: ORDERS_REPORT_TYPE,
+    dataStartTime: orderDataStartTime,
+    dataEndTime: orderDataEndTime
+  });
+
+  await saveAmazonSpReportJob({
+    sellerId,
+    marketplaceId: connection.marketplace_id,
+    reportId: listingReportId,
+    reportType: LISTINGS_REPORT_TYPE,
+    jobType: "LISTINGS_IMPORT",
+    status: "PROCESSING"
+  });
+  await saveAmazonSpReportJob({
+    sellerId,
+    marketplaceId: connection.marketplace_id,
+    reportId: orderReportId,
+    reportType: ORDERS_REPORT_TYPE,
+    jobType: "ORDER_IMPORT",
+    status: "PROCESSING",
+    dataStartTime: orderDataStartTime,
+    dataEndTime: orderDataEndTime
+  });
+
+  await logSpActivity({
+    sellerId,
+    action: "DAILY_SP_SYNC_JOBS_CREATED",
+    status: "SUCCESS",
+    message: "Amazon SP-API daily sync jobs created.",
+    metadata: { createdJobs: 2 }
+  });
+
+  return {
+    ok: true,
+    createdJobs: [
+      {
+        reportId: listingReportId,
+        reportType: LISTINGS_REPORT_TYPE,
+        jobType: "LISTINGS_IMPORT",
+        status: "PROCESSING"
+      },
+      {
+        reportId: orderReportId,
+        reportType: ORDERS_REPORT_TYPE,
+        jobType: "ORDER_IMPORT",
+        status: "PROCESSING"
+      }
+    ],
+    message: "Amazon SP-API sync jobs created. Reports will be processed when ready."
+  };
+}
+
+async function processDoneReportJob(input: {
+  job: AmazonSpReportJobRow;
+  report: AmazonSpReportResponse;
+  accessToken: string;
+  connection: AmazonSpConnectionRow;
+}) {
+  if (!input.report.reportDocumentId) {
+    throw new Error("Amazon report is DONE but did not include a document id.");
+  }
+
+  const reportText = await loadAmazonSpReportDocument({
+    accessToken: input.accessToken,
+    region: input.connection.region,
+    reportDocumentId: input.report.reportDocumentId,
+    stage: input.job.job_type === "LISTINGS_IMPORT" ? "GET_JOB_LISTINGS_REPORT_DOCUMENT" : "GET_JOB_ORDER_REPORT_DOCUMENT"
+  });
+
+  if (input.job.job_type === "LISTINGS_IMPORT") {
+    const parsed = parseListingReportText(reportText);
+    await upsertAmazonSpListingRows({
+      sellerId: input.job.seller_id,
+      connection: input.connection,
+      listings: parsed.listings
+    });
+    const passportCount = await upsertProductPassportsFromListings(input.job.seller_id, parsed.listings);
+
+    return {
+      syncedListings: parsed.listings.length,
+      upsertedProductPassports: passportCount,
+      skippedCount: parsed.skippedCount
+    };
+  }
+
+  const parsed = parseOrderReportText(reportText);
+  await upsertOrders(input.job.seller_id, input.job.marketplace_id, parsed.orders);
+  const saveResult = await upsertOrderItems(input.job.seller_id, parsed.orderItems, { throwOnFailure: false });
+
+  if (saveResult.failedOrderItems > 0) {
+    throw new Error(`Could not save ${saveResult.failedOrderItems} Amazon SP-API order items in Supabase.`);
+  }
+
+  return {
+    syncedOrders: parsed.orders.length,
+    syncedOrderItems: saveResult.savedOrderItems,
+    totalSales: parsed.totalSales,
+    totalUnits: parsed.totalUnits,
+    skippedCount: parsed.skippedCount
+  };
+}
+
+export async function processAmazonSpReportJobs(input: { sellerId: string; limit: number }) {
+  const sellerId = sellerIdOrDefault(input.sellerId);
+  const limit = Math.min(Math.max(Math.floor(input.limit), 1), 20);
+  const connection = await requireConnectedConnection(sellerId);
+  const accessToken = await getAmazonSpAccessToken(connection.id);
+  const { data, error } = await supabase
+    .from("amazon_sp_report_jobs")
+    .select("*")
+    .eq("seller_id", sellerId)
+    .in("status", ["PROCESSING", "IN_QUEUE", "IN_PROGRESS"])
+    .order("created_at", { ascending: true })
+    .limit(limit);
+
+  if (error) {
+    logSafeAmazonSpError("Could not load Amazon SP-API report jobs.", error);
+    throw new Error("Could not load Amazon SP-API report jobs from Supabase.");
+  }
+
+  let processed = 0;
+  let stillProcessing = 0;
+  let failed = 0;
+  const results: Array<Record<string, unknown>> = [];
+
+  for (const job of (data ?? []) as AmazonSpReportJobRow[]) {
+    try {
+      const report = job.job_type === "LISTINGS_IMPORT"
+        ? await getListingsReportStatus(accessToken, connection.region, job.report_id)
+        : await getOrderReportStatus(accessToken, connection.region, job.report_id);
+      const status = report.processingStatus ?? "UNKNOWN";
+
+      if (LISTINGS_REPORT_PROCESSING_STATUSES.has(status) || ORDER_REPORT_PROCESSING_STATUSES.has(status)) {
+        stillProcessing += 1;
+        await updateAmazonSpReportJob({ reportId: job.report_id, status });
+        results.push({ reportId: job.report_id, jobType: job.job_type, status });
+        continue;
+      }
+
+      if (status === "DONE") {
+        const details = await processDoneReportJob({ job, report, accessToken, connection });
+        processed += 1;
+        await updateAmazonSpReportJob({
+          reportId: job.report_id,
+          status: "DONE",
+          processedAt: new Date().toISOString()
+        });
+        results.push({ reportId: job.report_id, jobType: job.job_type, status: "DONE", ...details });
+        continue;
+      }
+
+      if (status === "CANCELLED" || status === "FATAL" || status === "DONE_NO_DATA") {
+        failed += 1;
+        await updateAmazonSpReportJob({
+          reportId: job.report_id,
+          status,
+          processedAt: new Date().toISOString(),
+          errorMessage: `Amazon report finished with status ${status}.`
+        });
+        results.push({ reportId: job.report_id, jobType: job.job_type, status });
+        continue;
+      }
+
+      failed += 1;
+      await updateAmazonSpReportJob({
+        reportId: job.report_id,
+        status,
+        errorMessage: `Amazon report returned unexpected status ${status}.`
+      });
+      results.push({ reportId: job.report_id, jobType: job.job_type, status });
+    } catch (error) {
+      failed += 1;
+      const message = safeErrorMessage(error);
+      await updateAmazonSpReportJob({
+        reportId: job.report_id,
+        status: "FAILED",
+        errorMessage: message
+      });
+      results.push({
+        reportId: job.report_id,
+        jobType: job.job_type,
+        status: "FAILED",
+        errorMessage: message,
+        details: safeErrorDetails(error)
+      });
+    }
+  }
+
+  return {
+    ok: true,
+    processed,
+    stillProcessing,
+    failed,
+    results
+  };
+}
+
+export async function listAmazonSpReportJobs(sellerIdInput: string) {
+  const sellerId = sellerIdOrDefault(sellerIdInput);
+  const { data, error } = await supabase
+    .from("amazon_sp_report_jobs")
+    .select("*")
+    .eq("seller_id", sellerId)
+    .order("created_at", { ascending: false })
+    .limit(20);
+
+  if (error) {
+    logSafeAmazonSpError("Could not list Amazon SP-API report jobs.", error);
+    throw new Error("Could not list Amazon SP-API report jobs from Supabase.");
+  }
+
+  const rows = ((data ?? []) as AmazonSpReportJobRow[]).map(toSafeReportJob);
+
+  return {
+    ok: true,
+    sellerId,
+    count: rows.length,
+    rows
+  };
 }
 
 async function upsertOrders(sellerId: string, marketplaceId: string, orders: OrderSyncItem[]): Promise<void> {

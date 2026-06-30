@@ -1,13 +1,17 @@
 import { Request, Response } from "express";
+import { env } from "../../config/env";
 import {
   buildAmazonSpConnectUrl,
+  createDailyAmazonSpSyncJobs,
   debugAmazonSpOrderReport,
   getAmazonSpConfigCheck,
   getAmazonSpSalesSummary,
   getAmazonSpStatus,
   handleAmazonSpOAuthCallback,
+  listAmazonSpReportJobs,
   listAmazonSpListings,
   listAmazonSpOrders,
+  processAmazonSpReportJobs,
   runAmazonSpDoctor,
   syncAmazonSpListings,
   syncAmazonSpOrderReport,
@@ -44,6 +48,33 @@ function getReportTypeMode(req: Request): string | undefined {
   return typeof req.query.reportType === "string" && req.query.reportType.trim()
     ? req.query.reportType.trim().toUpperCase()
     : undefined;
+}
+
+function getJobLimit(req: Request): number {
+  const rawLimit = typeof req.query.limit === "string" ? Number(req.query.limit) : 5;
+  const limit = Number.isFinite(rawLimit) ? Math.floor(rawLimit) : 5;
+  return Math.min(Math.max(limit, 1), 20);
+}
+
+function requireCronSecret(req: Request, res: Response): boolean {
+  if (!env.CRON_SECRET) {
+    res.status(500).json({
+      ok: false,
+      message: "CRON_SECRET is not configured."
+    });
+    return false;
+  }
+
+  const headerSecret = req.header("x-cron-secret");
+  if (headerSecret !== env.CRON_SECRET) {
+    res.status(401).json({
+      ok: false,
+      message: "Unauthorized."
+    });
+    return false;
+  }
+
+  return true;
 }
 
 function sendSafeError(res: Response, message: string, error: unknown): void {
@@ -180,6 +211,37 @@ export async function debugAmazonSpOrderReportController(req: Request, res: Resp
     }));
   } catch (error) {
     sendSafeError(res, "Could not debug Amazon SP-API order report.", error);
+  }
+}
+
+export async function dailyAmazonSpSyncController(req: Request, res: Response): Promise<void> {
+  if (!requireCronSecret(req, res)) return;
+
+  try {
+    res.json(await createDailyAmazonSpSyncJobs(getSellerId(req)));
+  } catch (error) {
+    sendSafeError(res, "Could not create Amazon SP-API daily sync jobs.", error);
+  }
+}
+
+export async function processAmazonSpReportJobsController(req: Request, res: Response): Promise<void> {
+  if (!requireCronSecret(req, res)) return;
+
+  try {
+    res.json(await processAmazonSpReportJobs({
+      sellerId: getSellerId(req),
+      limit: getJobLimit(req)
+    }));
+  } catch (error) {
+    sendSafeError(res, "Could not process Amazon SP-API report jobs.", error);
+  }
+}
+
+export async function listAmazonSpReportJobsController(req: Request, res: Response): Promise<void> {
+  try {
+    res.json(await listAmazonSpReportJobs(getSellerId(req)));
+  } catch (error) {
+    sendSafeError(res, "Could not load Amazon SP-API report jobs.", error);
   }
 }
 
