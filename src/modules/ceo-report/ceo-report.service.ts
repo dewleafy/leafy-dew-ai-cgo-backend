@@ -6,7 +6,7 @@ import { ProductEconomicsRow, ProductProfitStatus } from "../product-economics/p
 import { AiRecommendationRow, AiRecommendationStatus } from "../recommendations/recommendations.types";
 
 type BusinessStatus = "GOOD" | "WATCH" | "RISK";
-type ProfitDataStatus = "AVAILABLE" | "MISSING";
+type ProfitDataStatus = "AVAILABLE" | "MISSING" | "MISSING_COST_DATA" | "INCOMPLETE";
 type Priority = "LOW" | "MEDIUM" | "HIGH";
 
 type MetricRow = {
@@ -205,6 +205,14 @@ function getProfitReason(productEconomics: ProductEconomicsRow | null): string {
     return "Product economics are missing. Add costs, price, and target profit before scaling ads.";
   }
 
+  if (hasMissingCostData(productEconomics)) {
+    return "Product cost data is missing, so profit-safe decisions are blocked.";
+  }
+
+  if (productEconomics.profit_status === "NEEDS_COST_DATA" || productEconomics.profit_status === "BLOCKED") {
+    return "Product cost data is missing, so profit-safe decisions are blocked.";
+  }
+
   if (productEconomics.profit_status === "PASS") {
     return "Product economics currently protect the required net profit.";
   }
@@ -220,7 +228,34 @@ function getProfitReason(productEconomics: ProductEconomicsRow | null): string {
   return "Product economics are available but profit status is unknown.";
 }
 
+function hasMissingCostData(productEconomics: ProductEconomicsRow | null): boolean {
+  if (!productEconomics) return true;
+
+  return (
+    toNumber(productEconomics.selling_price) <= 0 ||
+    toNumber(productEconomics.non_ad_cost) <= 0 ||
+    toNumber(productEconomics.landed_cost) <= 0 ||
+    toNumber(productEconomics.amazon_fee_estimate) <= 0 ||
+    toNumber(productEconomics.shipping_fee_estimate) <= 0
+  );
+}
+
 function buildProfitGuardrail(productEconomics: ProductEconomicsRow | null) {
+  if (productEconomics && hasMissingCostData(productEconomics)) {
+    return {
+      profitDataStatus: "MISSING_COST_DATA" as ProfitDataStatus,
+      sellingPrice: roundTwo(toNumber(productEconomics.selling_price)),
+      targetProfit: roundTwo(toNumber(productEconomics.target_profit)),
+      nonAdCost: roundTwo(toNumber(productEconomics.non_ad_cost)),
+      maxAllowableAdSpend: null,
+      targetAcos: null,
+      effectiveTargetAcos: 20,
+      breakEvenAcos: null,
+      profitStatus: "NEEDS_COST_DATA" as ProductProfitStatus,
+      reason: "Product cost data is missing, so profit-safe decisions are blocked."
+    };
+  }
+
   return {
     profitDataStatus: productEconomics ? "AVAILABLE" as ProfitDataStatus : "MISSING" as ProfitDataStatus,
     sellingPrice: roundTwo(toNumber(productEconomics?.selling_price)),
@@ -228,6 +263,7 @@ function buildProfitGuardrail(productEconomics: ProductEconomicsRow | null) {
     nonAdCost: roundTwo(toNumber(productEconomics?.non_ad_cost)),
     maxAllowableAdSpend: roundTwo(toNumber(productEconomics?.max_allowable_ad_spend)),
     targetAcos: roundTwo(toNumber(productEconomics?.target_acos)),
+    effectiveTargetAcos: roundTwo(Math.min(toNumber(productEconomics?.target_acos) || 20, 35)),
     breakEvenAcos: roundTwo(toNumber(productEconomics?.break_even_acos)),
     profitStatus: productEconomics?.profit_status ?? "UNKNOWN" as ProductProfitStatus,
     reason: getProfitReason(productEconomics)
@@ -239,8 +275,9 @@ function buildExecutiveSummary(input: {
   ppcSnapshot: MetricSummary;
   amazonSalesSummary: AmazonSalesSummaryForCeo;
 }) {
-  const profitStatus = input.productEconomics?.profit_status ?? "UNKNOWN";
-  const targetAcos = toNumber(input.productEconomics?.target_acos);
+  const missingCostData = hasMissingCostData(input.productEconomics);
+  const profitStatus = missingCostData ? "NEEDS_COST_DATA" : input.productEconomics?.profit_status ?? "UNKNOWN";
+  const targetAcos = missingCostData ? 0 : toNumber(input.productEconomics?.target_acos);
   const hasConfirmedSales = input.amazonSalesSummary.confirmedSales > 0;
   const hasPendingSales = input.amazonSalesSummary.pendingSales > 0;
   let businessStatus: BusinessStatus = "WATCH";
@@ -251,6 +288,10 @@ function buildExecutiveSummary(input: {
     businessStatus = "WATCH";
     oneLineAdvice = "Add product economics before scaling ads.";
     headline = "WATCH: Product economics are missing.";
+  } else if (missingCostData) {
+    businessStatus = "WATCH";
+    oneLineAdvice = "Add product cost data before scaling PPC or approving growth actions.";
+    headline = "WATCH: Product cost data is missing, so profit-safe decisions are blocked.";
   } else if (profitStatus === "FAIL") {
     businessStatus = "RISK";
     oneLineAdvice = "Do not scale ads until price, cost, bundle, or charges are fixed.";
@@ -431,6 +472,14 @@ function buildNextBestAction(input: {
       row.approval_tier === "TIER_2" &&
       ["EXACT_MATCH_OPPORTUNITIES", "PRODUCT_TARGETING_OPPORTUNITIES"].includes(row.recommendation_type)
   );
+
+  if (input.profitStatus === "NEEDS_COST_DATA" || input.profitStatus === "BLOCKED") {
+    return {
+      title: "Add product cost data",
+      reason: "Profit-safe PPC decisions are blocked until landed cost and fees are added.",
+      priority: "HIGH"
+    };
+  }
 
   if (hasNewTier2ScaleRecommendation) {
     return {
@@ -616,6 +665,8 @@ export async function getDailyCeoReport(input: { sellerId: string; days: number 
 
   if (!productEconomics) {
     warnings.push("Product economics missing. Add product economics before scaling ads.");
+  } else if (hasMissingCostData(productEconomics)) {
+    warnings.push("Product cost data is missing. Profit-safe PPC decisions are blocked until landed cost is added.");
   }
 
   const ppcSnapshot = summarizeMetrics(campaignRows);
@@ -652,7 +703,7 @@ export async function getDailyCeoReport(input: { sellerId: string; days: number 
   const profitGuardrail = buildProfitGuardrail(productEconomics);
   const metricProfitRiskAlerts = buildMetricProfitRiskAlerts({
     ppcSnapshot,
-    targetAcos: profitGuardrail.targetAcos
+    targetAcos: profitGuardrail.targetAcos ?? 0
   });
   const amazonSalesRiskAlerts = buildAmazonSalesRiskAlerts({ amazonSalesSummary });
   const executiveSummary = buildExecutiveSummary({

@@ -63,7 +63,7 @@ type Evidence = {
 };
 
 type ProfitEvidence = {
-  profitDataStatus: "AVAILABLE" | "MISSING";
+  profitDataStatus: "AVAILABLE" | "MISSING" | "MISSING_COST_DATA";
   targetProfit: number | null;
   maxAllowableAdSpend: number | null;
   targetAcos: number | null;
@@ -101,7 +101,7 @@ export type PpcRecommendationResponse = {
   effectiveTargetAcos: number;
   effectiveMode: "READ_ONLY_SHADOW_MODE";
   summary: Record<string, number>;
-  profitDataStatus: "AVAILABLE" | "MISSING";
+  profitDataStatus: "AVAILABLE" | "MISSING" | "MISSING_COST_DATA";
   exactMatchOpportunities: RecommendationItem[];
   productTargetingOpportunities: RecommendationItem[];
   watchlistWasteTerms: RecommendationItem[];
@@ -184,6 +184,17 @@ function createProfitEvidence(productEconomics: ProductEconomicsRow | null): Pro
     };
   }
 
+  if (hasMissingCostData(productEconomics)) {
+    return {
+      profitDataStatus: "MISSING_COST_DATA",
+      targetProfit: roundTwo(toNumber(productEconomics.target_profit)),
+      maxAllowableAdSpend: null,
+      targetAcos: null,
+      breakEvenAcos: null,
+      profitStatus: "NEEDS_COST_DATA"
+    };
+  }
+
   return {
     profitDataStatus: "AVAILABLE",
     targetProfit: roundTwo(toNumber(productEconomics.target_profit)),
@@ -192,6 +203,18 @@ function createProfitEvidence(productEconomics: ProductEconomicsRow | null): Pro
     breakEvenAcos: roundTwo(toNumber(productEconomics.break_even_acos)),
     profitStatus: productEconomics.profit_status
   };
+}
+
+function hasMissingCostData(productEconomics: ProductEconomicsRow | null): boolean {
+  if (!productEconomics) return true;
+
+  return (
+    toNumber(productEconomics.selling_price) <= 0 ||
+    toNumber(productEconomics.non_ad_cost) <= 0 ||
+    toNumber(productEconomics.landed_cost) <= 0 ||
+    toNumber(productEconomics.amazon_fee_estimate) <= 0 ||
+    toNumber(productEconomics.shipping_fee_estimate) <= 0
+  );
 }
 
 function getPriorityLabel(score: number): RecommendationItem["priorityLabel"] {
@@ -226,6 +249,7 @@ function getConfidenceScore(input: {
   clicks: number;
   orders: number;
   productEconomicsAvailable: boolean;
+  costDataAvailable: boolean;
   isScaleRecommendation: boolean;
 }): number {
   let score = input.clicks < 3 ? 30 : input.clicks <= 7 ? 60 : 85;
@@ -240,6 +264,10 @@ function getConfidenceScore(input: {
 
   if (!input.productEconomicsAvailable && input.isScaleRecommendation) {
     score -= 15;
+  }
+
+  if (!input.costDataAvailable && input.isScaleRecommendation) {
+    score = Math.min(score, 40);
   }
 
   return roundTwo(clamp(score, 0, 100));
@@ -283,14 +311,23 @@ function getRecommendationDetails(input: {
   isAsinLike: boolean;
   effectiveTargetAcos: number;
   productEconomics: ProductEconomicsRow | null;
+  costDataMissing: boolean;
 }): {
   category: RecommendationCategory;
   recommendedAction: RecommendationAction;
   reason: string;
 } {
-  const { evidence, isAsinLike, effectiveTargetAcos, productEconomics } = input;
+  const { evidence, isAsinLike, effectiveTargetAcos, productEconomics, costDataMissing } = input;
 
-  if (productEconomics?.profit_status === "FAIL") {
+  if (costDataMissing && evidence.orders > 0 && evidence.sales > 0) {
+    return {
+      category: "profitRiskWarnings",
+      recommendedAction: "DO_NOT_SCALE_FIX_PRICE_COST_OR_BUNDLE",
+      reason: "Product cost data is missing. Profit-safe PPC decisions are blocked until landed cost and fees are added."
+    };
+  }
+
+  if (productEconomics?.profit_status === "FAIL" || productEconomics?.profit_status === "NEEDS_COST_DATA" || productEconomics?.profit_status === "BLOCKED") {
     return {
       category: "profitRiskWarnings",
       recommendedAction: "DO_NOT_SCALE_FIX_PRICE_COST_OR_BUNDLE",

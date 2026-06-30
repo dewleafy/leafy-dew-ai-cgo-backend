@@ -40,6 +40,10 @@ function sanitizeErrorMessage(message: string): string {
 }
 
 function getProfitReason(status: ProductProfitStatus): string {
+  if (status === "NEEDS_COST_DATA" || status === "BLOCKED") {
+    return "Product cost data is missing, so profit-safe decisions are blocked.";
+  }
+
   if (status === "PASS") {
     return "This product has enough ad room while protecting required net profit.";
   }
@@ -89,6 +93,11 @@ function getTargetProfit(input: ProductEconomicsInput): { targetProfit: number; 
 export function calculateProductEconomics(input: ProductEconomicsInput): ProductEconomicsCalculation {
   const sellingPrice = toNumber(input.sellingPrice);
   const { targetProfit, targetProfitRule } = getTargetProfit(input);
+  const hasMissingCostBasis =
+    sellingPrice <= 0 ||
+    toNumber(input.landedCost) <= 0 ||
+    toNumber(input.amazonFeeEstimate) <= 0 ||
+    toNumber(input.shippingFeeEstimate) <= 0;
   const providedReturnReserve = toNumber(input.returnReservePerUnit);
   const returnReservePerUnit =
     providedReturnReserve > 0
@@ -109,7 +118,7 @@ export function calculateProductEconomics(input: ProductEconomicsInput): Product
   const breakEvenAcos = sellingPrice > 0 ? ((sellingPrice - nonAdCost) / sellingPrice) * 100 : 0;
   const targetAcos = sellingPrice > 0 ? (maxAllowableAdSpend / sellingPrice) * 100 : 0;
   const profitStatus: ProductProfitStatus =
-    maxAllowableAdSpend < 0 ? "FAIL" : targetAcos < 5 ? "RISK" : "PASS";
+    hasMissingCostBasis ? "NEEDS_COST_DATA" : maxAllowableAdSpend < 0 ? "FAIL" : targetAcos < 5 ? "RISK" : "PASS";
 
   return {
     targetProfit,

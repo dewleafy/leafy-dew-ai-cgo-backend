@@ -1,4 +1,4 @@
-export type ProductProfitStatus = "PASS" | "RISK" | "FAIL" | "UNKNOWN";
+export type ProductProfitStatus = "PASS" | "RISK" | "FAIL" | "UNKNOWN" | "NEEDS_COST_DATA" | "BLOCKED";
 
 export type ProductEconomicsInput = {
   sellerId: string;
