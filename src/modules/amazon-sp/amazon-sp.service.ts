@@ -30,6 +30,7 @@ import {
   logSafeAmazonSpError,
   safeErrorDetails,
   safeErrorMessage,
+  sanitizeAmazonSpValue,
   smallDelay,
   toIntegerOrNull,
   toNumberOrNull
@@ -113,6 +114,31 @@ type OrderReportDiagnosis =
   | "REPORT_PROCESSING"
   | "REPORT_FAILED"
   | "UNKNOWN";
+
+type SafeDbErrorDetails = {
+  code?: string;
+  message?: string;
+  details?: string;
+  hint?: string;
+};
+
+type OrderItemSaveResult = {
+  savedOrderItems: number;
+  failedOrderItems: number;
+  dbErrorCode?: string;
+  dbErrorMessage?: string;
+  dbErrorDetails?: string;
+  failedRowsSafe: Array<{
+    rowIndex: number;
+    amazonOrderIdPresent: boolean;
+    orderItemIdPresent: boolean;
+    sku: string | null;
+    asin: string | null;
+    quantity: number | null;
+    itemPrice: number | null;
+    orderStatus: string | null;
+  }>;
+};
 
 type DoctorDiagnosis =
   | "CONFIG_MISSING"
@@ -1226,21 +1252,20 @@ function parseOrderReportText(text: string): OrderReportParsedResult {
     const currency = reportValue(row, ["currency"]) ?? "INR";
 
     const sanitizedItemPayload = {
-      amazonOrderId,
-      orderItemId,
-      purchaseDate,
-      paymentsDate,
+      amazon_order_id: amazonOrderId,
+      order_item_id: orderItemId,
+      purchase_date: purchaseDate,
       sku,
       asin,
       title,
-      quantityOrdered,
+      quantity: quantityOrdered,
       currency,
-      itemPriceAmount,
-      itemTaxAmount,
-      promotionDiscountAmount,
-      orderStatus,
-      fulfillmentChannel,
-      salesChannel
+      item_price_amount: itemPriceAmount,
+      item_tax_amount: itemTaxAmount,
+      promotion_discount_amount: promotionDiscountAmount,
+      order_status: orderStatus,
+      fulfillment_channel: fulfillmentChannel,
+      sales_channel: salesChannel
     };
 
     orderItems.push({
@@ -1651,7 +1676,37 @@ export async function syncAmazonSpOrderReport(input: { sellerId: string; days: n
     const parsed = parseOrderReportText(reportText);
 
     await upsertOrders(sellerId, connection.marketplace_id, parsed.orders);
-    await upsertOrderItems(sellerId, parsed.orderItems);
+    const orderItemSaveResult = await upsertOrderItems(sellerId, parsed.orderItems, { throwOnFailure: false });
+
+    if (orderItemSaveResult.failedOrderItems > 0) {
+      await updateConnectionError(connection.id, "Could not save all Amazon SP-API order items in Supabase.");
+      await logSpActivity({
+        sellerId,
+        action: "SYNC_ORDER_REPORT_SAVE_ITEMS_PARTIAL_FAILURE",
+        status: "ERROR",
+        message: "Could not save all Amazon SP-API order items in Supabase.",
+        metadata: {
+          source: "REPORTS_API",
+          reportType: ORDERS_REPORT_TYPE,
+          reportId,
+          savedOrderItems: orderItemSaveResult.savedOrderItems,
+          failedOrderItems: orderItemSaveResult.failedOrderItems
+        }
+      });
+
+      return {
+        ok: false,
+        message: "Could not save all Amazon SP-API order items in Supabase.",
+        stage: "SAVE_ORDER_ITEMS",
+        savedOrderItems: orderItemSaveResult.savedOrderItems,
+        failedOrderItems: orderItemSaveResult.failedOrderItems,
+        dbErrorCode: orderItemSaveResult.dbErrorCode,
+        dbErrorMessage: orderItemSaveResult.dbErrorMessage,
+        dbErrorDetails: orderItemSaveResult.dbErrorDetails,
+        failedRowsSafe: orderItemSaveResult.failedRowsSafe
+      };
+    }
+
     await updateConnectionError(connection.id, null);
     await logSpActivity({
       sellerId,
@@ -1664,7 +1719,7 @@ export async function syncAmazonSpOrderReport(input: { sellerId: string; days: n
         reportId,
         days,
         syncedOrders: parsed.orders.length,
-        syncedOrderItems: parsed.orderItems.length,
+        syncedOrderItems: orderItemSaveResult.savedOrderItems,
         totalSales: parsed.totalSales,
         totalUnits: parsed.totalUnits,
         skippedCount: parsed.skippedCount
@@ -1678,7 +1733,7 @@ export async function syncAmazonSpOrderReport(input: { sellerId: string; days: n
       reportId,
       days,
       syncedOrders: parsed.orders.length,
-      syncedOrderItems: parsed.orderItems.length,
+      syncedOrderItems: orderItemSaveResult.savedOrderItems,
       totalSales: parsed.totalSales,
       totalUnits: parsed.totalUnits,
       skippedCount: parsed.skippedCount,
@@ -1898,33 +1953,114 @@ async function upsertOrders(sellerId: string, marketplaceId: string, orders: Ord
   }
 }
 
-async function upsertOrderItems(sellerId: string, items: OrderItemSyncItem[]): Promise<void> {
-  if (items.length === 0) return;
+function safeDbErrorDetails(error: { message?: string; code?: string; details?: string; hint?: string }): SafeDbErrorDetails {
+  return {
+    code: sanitizeAmazonSpValue(error.code),
+    message: sanitizeAmazonSpValue(error.message),
+    details: sanitizeAmazonSpValue(error.details),
+    hint: sanitizeAmazonSpValue(error.hint)
+  };
+}
+
+function safeFailedOrderItemRow(rowIndex: number, item: OrderItemSyncItem) {
+  const rawPayload = item.rawPayload && typeof item.rawPayload === "object"
+    ? item.rawPayload as Record<string, unknown>
+    : {};
+
+  return {
+    rowIndex,
+    amazonOrderIdPresent: Boolean(item.amazonOrderId),
+    orderItemIdPresent: Boolean(item.orderItemId),
+    sku: item.sku,
+    asin: item.asin,
+    quantity: item.quantityOrdered,
+    itemPrice: item.itemPriceAmount,
+    orderStatus: typeof rawPayload.order_status === "string" ? rawPayload.order_status : null
+  };
+}
+
+function toOrderItemUpsertRow(sellerId: string, item: OrderItemSyncItem, now: string) {
+  return {
+    seller_id: sellerId,
+    amazon_order_id: item.amazonOrderId,
+    order_item_id: item.orderItemId,
+    asin: item.asin,
+    sku: item.sku,
+    title: item.title,
+    quantity_ordered: item.quantityOrdered,
+    quantity_shipped: item.quantityShipped,
+    item_price_amount: item.itemPriceAmount,
+    item_price_currency: item.itemPriceCurrency,
+    item_tax_amount: item.itemTaxAmount,
+    promotion_discount_amount: item.promotionDiscountAmount,
+    raw_payload: item.rawPayload,
+    updated_at: now
+  };
+}
+
+async function upsertOrderItems(
+  sellerId: string,
+  items: OrderItemSyncItem[],
+  options: { throwOnFailure?: boolean } = {}
+): Promise<OrderItemSaveResult> {
+  if (items.length === 0) {
+    return {
+      savedOrderItems: 0,
+      failedOrderItems: 0,
+      failedRowsSafe: []
+    };
+  }
+
   const now = new Date().toISOString();
+  const rows = items.map((item) => toOrderItemUpsertRow(sellerId, item, now));
   const { error } = await supabase.from("amazon_sp_order_items").upsert(
-    items.map((item) => ({
-      seller_id: sellerId,
-      amazon_order_id: item.amazonOrderId,
-      order_item_id: item.orderItemId,
-      asin: item.asin,
-      sku: item.sku,
-      title: item.title,
-      quantity_ordered: item.quantityOrdered,
-      quantity_shipped: item.quantityShipped,
-      item_price_amount: item.itemPriceAmount,
-      item_price_currency: item.itemPriceCurrency,
-      item_tax_amount: item.itemTaxAmount,
-      promotion_discount_amount: item.promotionDiscountAmount,
-      raw_payload: item.rawPayload,
-      updated_at: now
-    })),
+    rows,
     { onConflict: "seller_id,order_item_id" }
   );
 
-  if (error) {
-    logSafeAmazonSpError("Could not upsert Amazon SP-API order items.", error);
+  if (!error) {
+    return {
+      savedOrderItems: items.length,
+      failedOrderItems: 0,
+      failedRowsSafe: []
+    };
+  }
+
+  logSafeAmazonSpError("Could not batch upsert Amazon SP-API order items. Retrying row-by-row.", error);
+
+  let savedOrderItems = 0;
+  const failedRowsSafe: OrderItemSaveResult["failedRowsSafe"] = [];
+  let firstError = safeDbErrorDetails(error);
+
+  for (const [index, item] of items.entries()) {
+    const { error: rowError } = await supabase
+      .from("amazon_sp_order_items")
+      .upsert([toOrderItemUpsertRow(sellerId, item, now)], { onConflict: "seller_id,order_item_id" });
+
+    if (rowError) {
+      const safeError = safeDbErrorDetails(rowError);
+      firstError = firstError.message ? firstError : safeError;
+      failedRowsSafe.push(safeFailedOrderItemRow(index + 1, item));
+      logSafeAmazonSpError("Could not upsert one Amazon SP-API order item.", rowError);
+    } else {
+      savedOrderItems += 1;
+    }
+  }
+
+  const result: OrderItemSaveResult = {
+    savedOrderItems,
+    failedOrderItems: failedRowsSafe.length,
+    dbErrorCode: firstError.code,
+    dbErrorMessage: firstError.message,
+    dbErrorDetails: firstError.details,
+    failedRowsSafe
+  };
+
+  if (result.failedOrderItems > 0 && options.throwOnFailure !== false) {
     throw new Error("Could not save Amazon SP-API order items in Supabase.");
   }
+
+  return result;
 }
 
 export async function listAmazonSpOrders(sellerIdInput: string, daysInput: number): Promise<SafeAmazonSpOrder[]> {
