@@ -12,6 +12,7 @@ import {
   listAmazonSpOrdersController,
   syncAmazonSpListingsController,
   syncAmazonSpOrderReportController,
+  syncAmazonSpOrderReportChunkedController,
   syncAmazonSpOrdersController
 } from "./amazon-sp.controller";
 
@@ -28,6 +29,7 @@ amazonSpRouter.get("/listings", asyncHandler(listAmazonSpListingsController));
 amazonSpRouter.get("/sync-orders", asyncHandler(syncAmazonSpOrdersController));
 amazonSpRouter.post("/sync-orders", asyncHandler(syncAmazonSpOrdersController));
 amazonSpRouter.get("/sync-order-report", asyncHandler(syncAmazonSpOrderReportController));
+amazonSpRouter.get("/sync-order-report-chunked", asyncHandler(syncAmazonSpOrderReportChunkedController));
 amazonSpRouter.get("/debug-order-report", asyncHandler(debugAmazonSpOrderReportController));
 amazonSpRouter.get("/orders", asyncHandler(listAmazonSpOrdersController));
 amazonSpRouter.get("/sales-summary", asyncHandler(getAmazonSpSalesSummaryController));

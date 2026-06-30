@@ -11,6 +11,7 @@ import {
   runAmazonSpDoctor,
   syncAmazonSpListings,
   syncAmazonSpOrderReport,
+  syncAmazonSpOrderReportChunked,
   syncAmazonSpOrders
 } from "./amazon-sp.service";
 import { safeErrorDetails, safeErrorMessage } from "./amazon-sp-utils";
@@ -155,6 +156,17 @@ export async function syncAmazonSpOrderReportController(req: Request, res: Respo
     }));
   } catch (error) {
     sendSafeError(res, "Could not sync Amazon SP-API order report.", error);
+  }
+}
+
+export async function syncAmazonSpOrderReportChunkedController(req: Request, res: Response): Promise<void> {
+  try {
+    res.json(await syncAmazonSpOrderReportChunked({
+      sellerId: getSellerId(req),
+      days: getDays(req, 90, 90)
+    }));
+  } catch (error) {
+    sendSafeError(res, "Could not create chunked Amazon SP-API order reports.", error);
   }
 }
 

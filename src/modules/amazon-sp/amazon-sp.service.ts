@@ -1104,6 +1104,8 @@ async function createOrderReport(input: {
   marketplaceId: string;
   days: number;
   reportType: string;
+  dataStartTime?: string;
+  dataEndTime?: string;
 }): Promise<string> {
   const now = Date.now();
   const response = await amazonSpPost<AmazonSpReportResponse>({
@@ -1114,8 +1116,8 @@ async function createOrderReport(input: {
     body: {
       reportType: input.reportType,
       marketplaceIds: [input.marketplaceId],
-      dataStartTime: new Date(now - input.days * 24 * 60 * 60 * 1000).toISOString(),
-      dataEndTime: new Date(now - 2 * 60 * 1000).toISOString()
+      dataStartTime: input.dataStartTime ?? new Date(now - input.days * 24 * 60 * 60 * 1000).toISOString(),
+      dataEndTime: input.dataEndTime ?? new Date(now - 2 * 60 * 1000).toISOString()
     }
   });
 
@@ -1762,6 +1764,104 @@ export async function syncAmazonSpOrders(sellerIdInput: string, daysInput: numbe
     await logSpActivity({
       sellerId,
       action: "SYNC_ORDERS_FAILED",
+      status: "ERROR",
+      message: safeErrorMessage(error)
+    });
+    throw error;
+  }
+}
+
+export async function syncAmazonSpOrderReportChunked(input: { sellerId: string; days: number }) {
+  const sellerId = sellerIdOrDefault(input.sellerId);
+  const requestedDays = Math.min(Math.max(Math.floor(input.days), 1), 90);
+  const chunkSizeDays = 30;
+
+  if (requestedDays <= chunkSizeDays) {
+    return {
+      ok: true,
+      source: "REPORTS_API",
+      status: "SKIPPED",
+      requestedDays,
+      chunkSizeDays,
+      chunks: [],
+      message: "Use sync-order-report directly for 30 days or less.",
+      nextStep: "Retry each reportId with /api/amazon-sp/sync-order-report?sellerId=default&reportId=REPORT_ID"
+    };
+  }
+
+  const connection = await requireConnectedConnection(sellerId);
+
+  await logSpActivity({
+    sellerId,
+    action: "SYNC_ORDER_REPORT_CHUNKED_STARTED",
+    status: "INFO",
+    message: "Amazon SP-API chunked order report creation started.",
+    metadata: { source: "REPORTS_API", reportType: ORDERS_REPORT_TYPE, requestedDays, chunkSizeDays }
+  });
+
+  try {
+    const accessToken = await getAmazonSpAccessToken(connection.id);
+    const endMs = Date.now() - 2 * 60 * 1000;
+    const startMs = endMs - requestedDays * 24 * 60 * 60 * 1000;
+    const chunks: Array<{
+      chunkNumber: number;
+      dataStartTime: string;
+      dataEndTime: string;
+      reportId: string;
+      status: "PROCESSING";
+    }> = [];
+    let chunkStartMs = startMs;
+    let chunkNumber = 1;
+
+    while (chunkStartMs < endMs) {
+      const chunkEndMs = Math.min(chunkStartMs + chunkSizeDays * 24 * 60 * 60 * 1000, endMs);
+      const dataStartTime = new Date(chunkStartMs).toISOString();
+      const dataEndTime = new Date(chunkEndMs).toISOString();
+      const reportId = await createOrderReport({
+        accessToken,
+        region: connection.region,
+        marketplaceId: connection.marketplace_id,
+        days: chunkSizeDays,
+        reportType: ORDERS_REPORT_TYPE,
+        dataStartTime,
+        dataEndTime
+      });
+
+      chunks.push({
+        chunkNumber,
+        dataStartTime,
+        dataEndTime,
+        reportId,
+        status: "PROCESSING"
+      });
+
+      chunkStartMs = chunkEndMs;
+      chunkNumber += 1;
+    }
+
+    await updateConnectionError(connection.id, null);
+    await logSpActivity({
+      sellerId,
+      action: "SYNC_ORDER_REPORT_CHUNKED_CREATED",
+      status: "SUCCESS",
+      message: "Amazon SP-API chunked order reports created.",
+      metadata: { source: "REPORTS_API", requestedDays, chunkSizeDays, chunksCount: chunks.length }
+    });
+
+    return {
+      ok: true,
+      source: "REPORTS_API",
+      status: "PROCESSING",
+      requestedDays,
+      chunkSizeDays,
+      chunks,
+      nextStep: "Retry each reportId with /api/amazon-sp/sync-order-report?sellerId=default&reportId=REPORT_ID"
+    };
+  } catch (error) {
+    await updateConnectionError(connection.id, safeErrorMessage(error));
+    await logSpActivity({
+      sellerId,
+      action: "SYNC_ORDER_REPORT_CHUNKED_FAILED",
       status: "ERROR",
       message: safeErrorMessage(error)
     });
