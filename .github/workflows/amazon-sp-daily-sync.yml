@@ -1,0 +1,65 @@
+name: Daily Amazon SP-API Sync
+
+on:
+  schedule:
+    # 7:00 AM IST = 1:30 AM UTC
+    - cron: "30 1 * * *"
+  workflow_dispatch:
+
+jobs:
+  amazon-sp-daily-sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create Amazon SP-API report jobs
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          API_BASE_URL: https://api.leafydew.in
+        run: |
+          set -e
+          curl --fail --show-error --silent \
+            -H "x-cron-secret: ${CRON_SECRET}" \
+            "${API_BASE_URL}/api/amazon-sp/daily-sync?sellerId=default"
+          echo
+
+      - name: Wait before processing
+        run: sleep 180
+
+      - name: Process Amazon SP-API report jobs attempt 1
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          API_BASE_URL: https://api.leafydew.in
+        run: |
+          set -e
+          curl --fail --show-error --silent \
+            -H "x-cron-secret: ${CRON_SECRET}" \
+            "${API_BASE_URL}/api/amazon-sp/process-report-jobs?sellerId=default&limit=5"
+          echo
+
+      - name: Wait before processing again
+        run: sleep 180
+
+      - name: Process Amazon SP-API report jobs attempt 2
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          API_BASE_URL: https://api.leafydew.in
+        run: |
+          set -e
+          curl --fail --show-error --silent \
+            -H "x-cron-secret: ${CRON_SECRET}" \
+            "${API_BASE_URL}/api/amazon-sp/process-report-jobs?sellerId=default&limit=5"
+          echo
+
+      - name: Wait before final processing
+        run: sleep 180
+
+      - name: Process Amazon SP-API report jobs attempt 3
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          API_BASE_URL: https://api.leafydew.in
+        run: |
+          set -e
+          curl --fail --show-error --silent \
+            -H "x-cron-secret: ${CRON_SECRET}" \
+            "${API_BASE_URL}/api/amazon-sp/process-report-jobs?sellerId=default&limit=5"
+          echo
