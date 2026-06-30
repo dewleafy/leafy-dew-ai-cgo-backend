@@ -266,7 +266,7 @@ function getConfidenceScore(input: {
     score -= 15;
   }
 
-  if (!input.costDataAvailable && input.isScaleRecommendation) {
+  if (!input.costDataAvailable) {
     score = Math.min(score, 40);
   }
 
@@ -425,7 +425,7 @@ function getRiskLevel(category: RecommendationCategory): RecommendationItem["ris
 async function getLatestProductEconomics(sellerId: string): Promise<ProductEconomicsRow | null> {
   const { data, error } = await supabase
     .from("amazon_product_economics")
-    .select("target_profit, max_allowable_ad_spend, target_acos, break_even_acos, profit_status, created_at")
+    .select("selling_price, landed_cost, amazon_fee_estimate, shipping_fee_estimate, non_ad_cost, target_profit, max_allowable_ad_spend, target_acos, break_even_acos, profit_status, created_at")
     .eq("seller_id", sellerId)
     .order("created_at", { ascending: false })
     .limit(1)
@@ -475,14 +475,19 @@ export async function getAmazonAdsPpcRecommendations(input: {
     })
   ]);
   const productTargetAcos = toNumber(productEconomics?.target_acos);
+  const costDataMissing = Boolean(productEconomics) && hasMissingCostData(productEconomics);
   const effectiveTargetAcos = roundTwo(
-    productEconomics && productTargetAcos > 0
+    costDataMissing
+      ? Math.min(input.targetAcos, 20)
+      : productEconomics && productTargetAcos > 0
       ? Math.min(productTargetAcos, input.targetAcos)
       : input.targetAcos
   );
-  const profitDataStatus = productEconomics ? "AVAILABLE" : "MISSING";
+  const profitDataStatus = costDataMissing ? "MISSING_COST_DATA" : productEconomics ? "AVAILABLE" : "MISSING";
   const warnings = productEconomics
-    ? []
+    ? costDataMissing
+      ? ["Product cost data is missing. Profit-safe PPC decisions are blocked until landed cost is added."]
+      : []
     : ["Product economics missing. Profit-safe scaling cannot be confirmed."];
   const categories: Record<RecommendationCategory, RecommendationItem[]> = {
     exactMatchOpportunities: [],
@@ -539,7 +544,8 @@ export async function getAmazonAdsPpcRecommendations(input: {
       evidence,
       isAsinLike,
       effectiveTargetAcos,
-      productEconomics
+      productEconomics,
+      costDataMissing
     });
     const isScaleRecommendation = ["exactMatchOpportunities", "productTargetingOpportunities"].includes(details.category);
     const priorityScore = getPriorityScore({
@@ -551,6 +557,7 @@ export async function getAmazonAdsPpcRecommendations(input: {
       clicks: evidence.clicks,
       orders: evidence.orders,
       productEconomicsAvailable: Boolean(productEconomics),
+      costDataAvailable: !costDataMissing,
       isScaleRecommendation
     });
     const item: RecommendationItem = {
