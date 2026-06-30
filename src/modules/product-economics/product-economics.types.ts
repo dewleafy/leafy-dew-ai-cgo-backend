@@ -28,19 +28,22 @@ export type ProductEconomicsCalculation = {
   targetProfitRule: string;
   returnReservePerUnit: number;
   nonAdCost: number;
-  maxAllowableAdSpend: number;
-  breakEvenAcos: number;
-  targetAcos: number;
+  maxAllowableAdSpend: number | null;
+  breakEvenAcos: number | null;
+  targetAcos: number | null;
   profitStatus: ProductProfitStatus;
+  profitDataStatus: "AVAILABLE" | "MISSING_COST_DATA";
+  reason: string;
 };
 
 export type ProductEconomicsExplanation = {
   profitStatus: ProductProfitStatus;
+  profitDataStatus: "AVAILABLE" | "MISSING_COST_DATA";
   targetProfit: number;
   nonAdCost: number;
-  maxAllowableAdSpend: number;
-  breakEvenAcos: number;
-  targetAcos: number;
+  maxAllowableAdSpend: number | null;
+  breakEvenAcos: number | null;
+  targetAcos: number | null;
   reason: string;
 };
 
@@ -84,8 +87,12 @@ export type SafeProductEconomicsRow = {
   sku: string | null;
   productName: string | null;
   sellingPrice: number;
+  buyingCost: number;
   landedCost: number;
   packagingCost: number;
+  shippingCost: number;
+  referralFee: number;
+  closingFee: number;
   amazonFeeEstimate: number;
   shippingFeeEstimate: number;
   taxEstimate: number;
@@ -96,13 +103,16 @@ export type SafeProductEconomicsRow = {
   socialMarketingCostPerUnit: number;
   couponDiscountEstimate: number;
   otherCostPerUnit: number;
+  requiredProfit: number;
   targetProfit: number;
   targetProfitRule: string | null;
   nonAdCost: number;
-  maxAllowableAdSpend: number;
-  breakEvenAcos: number;
-  targetAcos: number;
+  maxAllowableAdSpend: number | null;
+  breakEvenAcos: number | null;
+  targetAcos: number | null;
   profitStatus: ProductProfitStatus;
+  profitDataStatus: "AVAILABLE" | "MISSING_COST_DATA";
+  reason: string;
   notes: string | null;
   createdAt: string | null;
   updatedAt: string | null;

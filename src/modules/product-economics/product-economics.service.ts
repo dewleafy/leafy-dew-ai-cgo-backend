@@ -41,7 +41,9 @@ function sanitizeErrorMessage(message: string): string {
 
 function getProfitReason(status: ProductProfitStatus): string {
   if (status === "NEEDS_COST_DATA" || status === "BLOCKED") {
-    return "Product cost data is missing, so profit-safe decisions are blocked.";
+    return status === "BLOCKED"
+      ? "Costs and required profit leave no room for PPC spend."
+      : "Product cost data is missing, so profit-safe decisions are blocked.";
   }
 
   if (status === "PASS") {
@@ -63,6 +65,13 @@ function getTargetProfit(input: ProductEconomicsInput): { targetProfit: number; 
   const sellingPrice = toNumber(input.sellingPrice);
   const providedTargetProfit = Math.max(toNumber(input.targetProfit), 0);
 
+  if (providedTargetProfit > 0) {
+    return {
+      targetProfit: roundTwo(providedTargetProfit),
+      targetProfitRule: "PROVIDED_TARGET_PROFIT"
+    };
+  }
+
   if (sellingPrice <= 299) {
     return {
       targetProfit: roundTwo(Math.max(providedTargetProfit, 60)),
@@ -77,13 +86,6 @@ function getTargetProfit(input: ProductEconomicsInput): { targetProfit: number; 
     };
   }
 
-  if (providedTargetProfit > 0) {
-    return {
-      targetProfit: roundTwo(providedTargetProfit),
-      targetProfitRule: "PROVIDED_TARGET_PROFIT"
-    };
-  }
-
   return {
     targetProfit: roundTwo(sellingPrice * 0.25),
     targetProfitRule: "DEFAULT_25_PERCENT_OF_SELLING_PRICE"
@@ -95,9 +97,7 @@ export function calculateProductEconomics(input: ProductEconomicsInput): Product
   const { targetProfit, targetProfitRule } = getTargetProfit(input);
   const hasMissingCostBasis =
     sellingPrice <= 0 ||
-    toNumber(input.landedCost) <= 0 ||
-    toNumber(input.amazonFeeEstimate) <= 0 ||
-    toNumber(input.shippingFeeEstimate) <= 0;
+    toNumber(input.landedCost) <= 0;
   const providedReturnReserve = toNumber(input.returnReservePerUnit);
   const returnReservePerUnit =
     providedReturnReserve > 0
@@ -118,18 +118,28 @@ export function calculateProductEconomics(input: ProductEconomicsInput): Product
   const breakEvenAcos = sellingPrice > 0 ? ((sellingPrice - nonAdCost) / sellingPrice) * 100 : 0;
   const targetAcos = sellingPrice > 0 ? (maxAllowableAdSpend / sellingPrice) * 100 : 0;
   const profitStatus: ProductProfitStatus =
-    hasMissingCostBasis ? "NEEDS_COST_DATA" : maxAllowableAdSpend < 0 ? "FAIL" : targetAcos < 5 ? "RISK" : "PASS";
+    hasMissingCostBasis ? "NEEDS_COST_DATA" : maxAllowableAdSpend <= 0 ? "BLOCKED" : "PASS";
+  const reason = getProfitReason(profitStatus);
 
   return {
     targetProfit,
     targetProfitRule,
     returnReservePerUnit: roundTwo(returnReservePerUnit),
     nonAdCost: roundTwo(nonAdCost),
-    maxAllowableAdSpend: roundTwo(maxAllowableAdSpend),
-    breakEvenAcos: roundTwo(breakEvenAcos),
-    targetAcos: roundTwo(targetAcos),
-    profitStatus
+    maxAllowableAdSpend: hasMissingCostBasis ? null : roundTwo(maxAllowableAdSpend),
+    breakEvenAcos: hasMissingCostBasis ? null : roundTwo(breakEvenAcos),
+    targetAcos: hasMissingCostBasis ? null : roundTwo(targetAcos),
+    profitStatus,
+    profitDataStatus: hasMissingCostBasis ? "MISSING_COST_DATA" : "AVAILABLE",
+    reason
   };
+}
+
+function hasMissingCostData(row: ProductEconomicsRow | SafeProductEconomicsRow): boolean {
+  const sellingPrice = "selling_price" in row ? row.selling_price : row.sellingPrice;
+  const landedCost = "landed_cost" in row ? row.landed_cost : row.landedCost;
+
+  return toNumber(sellingPrice) <= 0 || toNumber(landedCost) <= 0;
 }
 
 export function toSafeProductEconomicsRow(row: ProductEconomicsRow): SafeProductEconomicsRow {
@@ -141,8 +151,12 @@ export function toSafeProductEconomicsRow(row: ProductEconomicsRow): SafeProduct
     sku: row.sku,
     productName: row.product_name,
     sellingPrice: toNumber(row.selling_price),
+    buyingCost: toNumber(row.landed_cost),
     landedCost: toNumber(row.landed_cost),
     packagingCost: toNumber(row.packaging_cost),
+    shippingCost: toNumber(row.shipping_fee_estimate),
+    referralFee: toNumber(row.amazon_fee_estimate),
+    closingFee: toNumber(row.other_cost_per_unit),
     amazonFeeEstimate: toNumber(row.amazon_fee_estimate),
     shippingFeeEstimate: toNumber(row.shipping_fee_estimate),
     taxEstimate: toNumber(row.tax_estimate),
@@ -153,13 +167,16 @@ export function toSafeProductEconomicsRow(row: ProductEconomicsRow): SafeProduct
     socialMarketingCostPerUnit: toNumber(row.social_marketing_cost_per_unit),
     couponDiscountEstimate: toNumber(row.coupon_discount_estimate),
     otherCostPerUnit: toNumber(row.other_cost_per_unit),
+    requiredProfit: toNumber(row.target_profit),
     targetProfit: toNumber(row.target_profit),
     targetProfitRule: row.target_profit_rule,
     nonAdCost: toNumber(row.non_ad_cost),
-    maxAllowableAdSpend: toNumber(row.max_allowable_ad_spend),
-    breakEvenAcos: toNumber(row.break_even_acos),
-    targetAcos: toNumber(row.target_acos),
-    profitStatus: row.profit_status,
+    maxAllowableAdSpend: hasMissingCostData(row) ? null : toNumber(row.max_allowable_ad_spend),
+    breakEvenAcos: hasMissingCostData(row) ? null : toNumber(row.break_even_acos),
+    targetAcos: hasMissingCostData(row) ? null : toNumber(row.target_acos),
+    profitStatus: hasMissingCostData(row) ? "NEEDS_COST_DATA" : row.profit_status,
+    profitDataStatus: hasMissingCostData(row) ? "MISSING_COST_DATA" : "AVAILABLE",
+    reason: hasMissingCostData(row) ? getProfitReason("NEEDS_COST_DATA") : getProfitReason(row.profit_status),
     notes: row.notes,
     createdAt: row.created_at,
     updatedAt: row.updated_at
@@ -171,19 +188,20 @@ export function buildProductEconomicsExplanation(
 ): ProductEconomicsExplanation {
   return {
     profitStatus: row.profitStatus,
+    profitDataStatus: row.profitDataStatus,
     targetProfit: row.targetProfit,
     nonAdCost: row.nonAdCost,
     maxAllowableAdSpend: row.maxAllowableAdSpend,
     breakEvenAcos: row.breakEvenAcos,
     targetAcos: row.targetAcos,
-    reason: getProfitReason(row.profitStatus)
+    reason: row.reason
   };
 }
 
 export async function saveProductEconomics(input: ProductEconomicsInput): Promise<SafeProductEconomicsRow> {
   const calculation = calculateProductEconomics(input);
   const now = new Date().toISOString();
-  const insertRow = {
+  const upsertRow = {
     seller_id: cleanText(input.sellerId) ?? "default",
     marketplace_id: cleanText(input.marketplaceId),
     asin: cleanText(input.asin),
@@ -213,9 +231,35 @@ export async function saveProductEconomics(input: ProductEconomicsInput): Promis
     updated_at: now
   };
 
-  const { data, error } = await supabase
-    .from("amazon_product_economics")
-    .insert(insertRow)
+  const sellerId = cleanText(input.sellerId) ?? "default";
+  const sku = cleanText(input.sku);
+  let existingId: string | null = null;
+
+  if (sku) {
+    const { data: existing, error: loadError } = await supabase
+      .from("amazon_product_economics")
+      .select("id")
+      .eq("seller_id", sellerId)
+      .eq("sku", sku)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle<{ id: string }>();
+
+    if (loadError) {
+      logger.warn("Could not load existing product economics row.", {
+        message: sanitizeErrorMessage(loadError.message)
+      });
+      throw new Error("Could not save product economics in Supabase.");
+    }
+
+    existingId = existing?.id ?? null;
+  }
+
+  const query = existingId
+    ? supabase.from("amazon_product_economics").update(upsertRow).eq("id", existingId)
+    : supabase.from("amazon_product_economics").insert(upsertRow);
+
+  const { data, error } = await query
     .select("*")
     .single<ProductEconomicsRow>();
 

@@ -20,11 +20,15 @@ const productEconomicsBodySchema = z.object({
   sellerId: z.string().trim().min(1).default("default"),
   marketplaceId: nullableTextSchema,
   asin: nullableTextSchema,
-  sku: nullableTextSchema,
+  sku: z.string().trim().min(1, "SKU is required."),
   productName: nullableTextSchema,
   sellingPrice: z.coerce.number().min(0, "sellingPrice must be 0 or higher."),
+  buyingCost: z.coerce.number().min(0).optional(),
   landedCost: z.coerce.number().min(0).default(0),
   packagingCost: z.coerce.number().min(0).default(0),
+  shippingCost: z.coerce.number().min(0).optional(),
+  referralFee: z.coerce.number().min(0).optional(),
+  closingFee: z.coerce.number().min(0).optional(),
   amazonFeeEstimate: z.coerce.number().min(0).default(0),
   shippingFeeEstimate: z.coerce.number().min(0).default(0),
   taxEstimate: z.coerce.number().min(0).default(0),
@@ -35,6 +39,7 @@ const productEconomicsBodySchema = z.object({
   socialMarketingCostPerUnit: z.coerce.number().min(0).default(0),
   couponDiscountEstimate: z.coerce.number().min(0).default(0),
   otherCostPerUnit: z.coerce.number().min(0).default(0),
+  requiredProfit: z.coerce.number().min(0).optional(),
   targetProfit: z.coerce.number().min(0).optional(),
   notes: nullableTextSchema
 });
@@ -53,6 +58,28 @@ function sendProductEconomicsError(res: Response, message: string): void {
   });
 }
 
+function toFounderEconomics(row: Awaited<ReturnType<typeof saveProductEconomics>>) {
+  return {
+    sellerId: row.sellerId,
+    sku: row.sku,
+    asin: row.asin,
+    sellingPrice: row.sellingPrice,
+    buyingCost: row.buyingCost,
+    packagingCost: row.packagingCost,
+    shippingCost: row.shippingCost,
+    referralFee: row.referralFee,
+    closingFee: row.closingFee,
+    requiredProfit: row.requiredProfit,
+    nonAdCost: row.nonAdCost,
+    maxAllowableAdSpend: row.maxAllowableAdSpend,
+    targetAcos: row.targetAcos,
+    breakEvenAcos: row.breakEvenAcos,
+    profitStatus: row.profitStatus,
+    profitDataStatus: row.profitDataStatus,
+    reason: row.reason
+  };
+}
+
 export async function postProductEconomics(req: Request, res: Response): Promise<void> {
   const parsed = productEconomicsBodySchema.safeParse(req.body);
 
@@ -69,11 +96,20 @@ export async function postProductEconomics(req: Request, res: Response): Promise
   }
 
   try {
-    const row = await saveProductEconomics(parsed.data);
+    const body = parsed.data;
+    const row = await saveProductEconomics({
+      ...body,
+      landedCost: body.buyingCost ?? body.landedCost,
+      shippingFeeEstimate: body.shippingCost ?? body.shippingFeeEstimate,
+      amazonFeeEstimate: body.referralFee ?? body.amazonFeeEstimate,
+      otherCostPerUnit: body.closingFee ?? body.otherCostPerUnit,
+      targetProfit: body.requiredProfit ?? body.targetProfit
+    });
     const explanation = buildProductEconomicsExplanation(row);
 
     res.json({
       ok: true,
+      economics: toFounderEconomics(row),
       row,
       explanation
     });

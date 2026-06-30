@@ -6,7 +6,7 @@ import { ProductEconomicsRow, ProductProfitStatus } from "../product-economics/p
 import { AiRecommendationRow, AiRecommendationStatus } from "../recommendations/recommendations.types";
 
 type BusinessStatus = "GOOD" | "WATCH" | "RISK";
-type ProfitDataStatus = "AVAILABLE" | "MISSING" | "MISSING_COST_DATA" | "INCOMPLETE";
+type ProfitDataStatus = "AVAILABLE" | "MISSING" | "MISSING_COST_DATA" | "INCOMPLETE" | "PARTIAL";
 type Priority = "LOW" | "MEDIUM" | "HIGH";
 
 type MetricRow = {
@@ -609,6 +609,54 @@ async function loadRecommendations(sellerId: string): Promise<AiRecommendationRo
   return (data ?? []) as AiRecommendationRow[];
 }
 
+async function loadProductCostCoverage(sellerId: string): Promise<{
+  totalSkuCount: number;
+  skuWithCostCount: number;
+  hasPartialCostData: boolean;
+}> {
+  try {
+    const [{ data: listingData }, { data: economicsData }] = await Promise.all([
+      supabase
+        .from("amazon_sp_listings")
+        .select("sku")
+        .eq("seller_id", sellerId)
+        .limit(10000),
+      supabase
+        .from("amazon_product_economics")
+        .select("sku, selling_price, landed_cost, amazon_fee_estimate, shipping_fee_estimate, non_ad_cost")
+        .eq("seller_id", sellerId)
+        .limit(10000)
+    ]);
+
+    const listingSkus = new Set(
+      ((listingData ?? []) as Array<{ sku: string | null }>)
+        .map((row) => row.sku?.trim())
+        .filter((sku): sku is string => Boolean(sku))
+    );
+    const costSkus = new Set(
+      ((economicsData ?? []) as ProductEconomicsRow[])
+        .filter((row) => row.sku && !hasMissingCostData(row))
+        .map((row) => String(row.sku))
+    );
+
+    return {
+      totalSkuCount: listingSkus.size,
+      skuWithCostCount: Array.from(listingSkus).filter((sku) => costSkus.has(sku)).length,
+      hasPartialCostData: listingSkus.size > 1 && costSkus.size > 0 && Array.from(listingSkus).some((sku) => !costSkus.has(sku))
+    };
+  } catch (error) {
+    logger.warn("Could not load product cost coverage for CEO report.", {
+      message: sanitizeErrorMessage(error instanceof Error ? error.message : "Unknown error")
+    });
+
+    return {
+      totalSkuCount: 0,
+      skuWithCostCount: 0,
+      hasPartialCostData: false
+    };
+  }
+}
+
 function emptyAmazonSalesSummary(days: number): AmazonSalesSummaryForCeo {
   return {
     days,
@@ -649,7 +697,7 @@ export async function getDailyCeoReport(input: { sellerId: string; days: number 
   const startDate = getDateDaysAgo(input.days);
   const reportDate = new Date().toISOString().slice(0, 10);
   const warnings: string[] = [];
-  const [productEconomics, campaignRows, searchTermRows, recommendations, amazonSalesSummary] = await Promise.all([
+  const [productEconomics, campaignRows, searchTermRows, recommendations, amazonSalesSummary, productCostCoverage] = await Promise.all([
     loadLatestProductEconomics(input.sellerId),
     loadCampaignMetrics({ sellerId: input.sellerId, startDate, endDate }),
     loadSearchTermMetrics({ sellerId: input.sellerId, startDate, endDate }),
@@ -660,7 +708,8 @@ export async function getDailyCeoReport(input: { sellerId: string; days: number 
       });
       warnings.push("Amazon SP-API sales summary unavailable. CEO report is using PPC-only context for sales.");
       return emptyAmazonSalesSummary(input.days);
-    })
+    }),
+    loadProductCostCoverage(input.sellerId)
   ]);
 
   if (!productEconomics) {
@@ -700,7 +749,18 @@ export async function getDailyCeoReport(input: { sellerId: string; days: number 
   const pendingApprovals = sortByPriority(newRecommendations).slice(0, 10).map(toRecommendationItem);
   const approvedShadowActions = sortByCreatedAt(approvedRecommendations).slice(0, 10).map(toRecommendationItem);
   const monitoringItems = sortByCreatedAt(monitoringRecommendations).slice(0, 10).map(toRecommendationItem);
-  const profitGuardrail = buildProfitGuardrail(productEconomics);
+  const baseProfitGuardrail = buildProfitGuardrail(productEconomics);
+  const profitGuardrail = productCostCoverage.hasPartialCostData
+    ? {
+        ...baseProfitGuardrail,
+        profitDataStatus: "PARTIAL" as ProfitDataStatus,
+        reason: `${baseProfitGuardrail.reason} Cost data exists for ${productCostCoverage.skuWithCostCount} of ${productCostCoverage.totalSkuCount} synced SKUs.`
+      }
+    : baseProfitGuardrail;
+
+  if (productCostCoverage.hasPartialCostData) {
+    warnings.push("Product cost data is partial. Add landed cost for every synced SKU before broad PPC scaling.");
+  }
   const metricProfitRiskAlerts = buildMetricProfitRiskAlerts({
     ppcSnapshot,
     targetAcos: profitGuardrail.targetAcos ?? 0
