@@ -175,12 +175,12 @@ function createEvidence(accumulator: MetricAccumulator): Evidence {
 function createProfitEvidence(productEconomics: ProductEconomicsRow | null): ProfitEvidence {
   if (!productEconomics) {
     return {
-      profitDataStatus: "MISSING",
+      profitDataStatus: "MISSING_COST_DATA",
       targetProfit: null,
       maxAllowableAdSpend: null,
       targetAcos: null,
       breakEvenAcos: null,
-      profitStatus: null
+      profitStatus: "NEEDS_COST_DATA"
     };
   }
 
@@ -475,7 +475,7 @@ export async function getAmazonAdsPpcRecommendations(input: {
     })
   ]);
   const productTargetAcos = toNumber(productEconomics?.target_acos);
-  const costDataMissing = Boolean(productEconomics) && hasMissingCostData(productEconomics);
+  const costDataMissing = !productEconomics || hasMissingCostData(productEconomics);
   const effectiveTargetAcos = roundTwo(
     costDataMissing
       ? Math.min(input.targetAcos, 20)
@@ -483,12 +483,12 @@ export async function getAmazonAdsPpcRecommendations(input: {
       ? Math.min(productTargetAcos, input.targetAcos)
       : input.targetAcos
   );
-  const profitDataStatus = costDataMissing ? "MISSING_COST_DATA" : productEconomics ? "AVAILABLE" : "MISSING";
+  const profitDataStatus = costDataMissing ? "MISSING_COST_DATA" : "AVAILABLE";
   const warnings = productEconomics
     ? costDataMissing
       ? ["Product cost data is missing. Profit-safe PPC decisions are blocked until landed cost is added."]
       : []
-    : ["Product economics missing. Profit-safe scaling cannot be confirmed."];
+    : ["Product cost data is missing. Profit-safe PPC decisions are blocked until landed cost is added."];
   const categories: Record<RecommendationCategory, RecommendationItem[]> = {
     exactMatchOpportunities: [],
     productTargetingOpportunities: [],

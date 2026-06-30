@@ -66,6 +66,7 @@ export type SafeAiRecommendationRow = {
   reason: string;
   evidence: Record<string, unknown>;
   profitEvidence: Record<string, unknown>;
+  safeWarning?: string;
   status: AiRecommendationStatus;
   userNote: string | null;
   ruleVersion: string;

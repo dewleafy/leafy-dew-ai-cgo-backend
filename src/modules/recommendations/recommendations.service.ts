@@ -1,6 +1,7 @@
 import { supabase } from "../../db/supabase";
 import { env } from "../../config/env";
 import { logger } from "../../utils/logger";
+import { ProductEconomicsRow } from "../product-economics/product-economics.types";
 import {
   AiRecommendationRow,
   AiRecommendationStatus,
@@ -19,6 +20,35 @@ const ALLOWED_RECOMMENDATION_STATUSES: AiRecommendationStatus[] = [
 function toNumber(value: unknown): number {
   const numeric = Number(value ?? 0);
   return Number.isFinite(numeric) ? numeric : 0;
+}
+
+function hasMissingCostData(productEconomics: ProductEconomicsRow | null): boolean {
+  if (!productEconomics) return true;
+
+  return (
+    toNumber(productEconomics.selling_price) <= 0 ||
+    toNumber(productEconomics.non_ad_cost) <= 0 ||
+    toNumber(productEconomics.landed_cost) <= 0 ||
+    toNumber(productEconomics.amazon_fee_estimate) <= 0 ||
+    toNumber(productEconomics.shipping_fee_estimate) <= 0
+  );
+}
+
+function isScaleOrGrowthRecommendation(row: SafeAiRecommendationRow): boolean {
+  const type = row.recommendationType.toUpperCase();
+  const action = row.recommendedAction.toUpperCase();
+
+  return (
+    [
+      "EXACT_MATCH_OPPORTUNITIES",
+      "PRODUCT_TARGETING_OPPORTUNITIES",
+      "BID_UP",
+      "BUDGET_INCREASE",
+      "SCALE"
+    ].some((value) => type.includes(value) || action.includes(value)) ||
+    action.includes("ADD_EXACT_KEYWORD") ||
+    action.includes("ADD_PRODUCT_TARGET")
+  );
 }
 
 function sanitizeErrorMessage(message: string): string {
@@ -73,6 +103,55 @@ function toSafeRecommendation(row: AiRecommendationRow): SafeAiRecommendationRow
   };
 }
 
+function applyFinancialTruthGuardrail(
+  row: SafeAiRecommendationRow,
+  currentCostDataMissing: boolean
+): SafeAiRecommendationRow {
+  if (!currentCostDataMissing) {
+    return row;
+  }
+
+  const isScaleOrGrowth = isScaleOrGrowthRecommendation(row);
+
+  return {
+    ...row,
+    confidenceScore: isScaleOrGrowth ? Math.min(row.confidenceScore, 40) : row.confidenceScore,
+    confidenceLabel: isScaleOrGrowth ? "LOW" : row.confidenceLabel,
+    riskLevel: isScaleOrGrowth && row.riskLevel === "LOW" ? "MEDIUM" : row.riskLevel,
+    approvalTier: isScaleOrGrowth ? "TIER_2" : row.approvalTier,
+    requiresApproval: true,
+    profitEvidence: {
+      ...(row.profitEvidence ?? {}),
+      profitDataStatus: "MISSING_COST_DATA",
+      profitStatus: "NEEDS_COST_DATA",
+      targetAcos: null,
+      breakEvenAcos: null,
+      reason: "Product cost data is missing. Profit-safe PPC decisions are blocked until landed cost is added."
+    },
+    safeWarning: "Stale recommendation profit evidence was blocked because current cost data is missing."
+  };
+}
+
+async function currentCostDataIsMissing(sellerId: string): Promise<boolean> {
+  const { data, error } = await supabase
+    .from("amazon_product_economics")
+    .select("selling_price, landed_cost, amazon_fee_estimate, shipping_fee_estimate, non_ad_cost, created_at")
+    .eq("seller_id", sellerId)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle<ProductEconomicsRow>();
+
+  if (error) {
+    logger.warn("Could not load product economics for recommendation safety guardrail.", {
+      message: sanitizeErrorMessage(error.message),
+      code: sanitizeErrorMessage(error.code)
+    });
+    return true;
+  }
+
+  return hasMissingCostData(data);
+}
+
 export async function listAiRecommendations(input: {
   sellerId: string;
   status?: AiRecommendationStatus;
@@ -99,7 +178,10 @@ export async function listAiRecommendations(input: {
     throw new Error("Could not load recommendations from Supabase.");
   }
 
-  return ((data ?? []) as AiRecommendationRow[]).map(toSafeRecommendation);
+  const costDataMissing = await currentCostDataIsMissing(input.sellerId);
+  return ((data ?? []) as AiRecommendationRow[])
+    .map(toSafeRecommendation)
+    .map((row) => applyFinancialTruthGuardrail(row, costDataMissing));
 }
 
 export function isAllowedRecommendationStatus(status: string): status is AiRecommendationStatus {
@@ -121,7 +203,12 @@ export async function getAiRecommendationById(id: string): Promise<SafeAiRecomme
     throw new Error("Could not load recommendation from Supabase.");
   }
 
-  return data ? toSafeRecommendation(data) : null;
+  if (!data) {
+    return null;
+  }
+
+  const costDataMissing = await currentCostDataIsMissing(data.seller_id);
+  return applyFinancialTruthGuardrail(toSafeRecommendation(data), costDataMissing);
 }
 
 export async function updateAiRecommendationStatus(input: {
