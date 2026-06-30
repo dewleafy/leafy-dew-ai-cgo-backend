@@ -1,6 +1,7 @@
 import { supabase } from "../../db/supabase";
 import { env } from "../../config/env";
 import { logger } from "../../utils/logger";
+import { getAmazonSpSalesSummary } from "../amazon-sp/amazon-sp.service";
 import { ProductEconomicsRow, ProductProfitStatus } from "../product-economics/product-economics.types";
 import { AiRecommendationRow, AiRecommendationStatus } from "../recommendations/recommendations.types";
 
@@ -73,6 +74,9 @@ type ProfitRiskAlert = {
   message: string;
   currentAcos?: number;
   targetAcos?: number;
+  cancelledSales?: number;
+  rawSales?: number;
+  cancelledSalesShare?: number;
 };
 
 type RecommendationSummary = {
@@ -81,6 +85,20 @@ type RecommendationSummary = {
   rejectedCount: number;
   monitoringCount: number;
   completedManuallyCount: number;
+};
+
+type AmazonSalesSummaryForCeo = {
+  days: number;
+  confirmedSales: number;
+  confirmedOrders: number;
+  confirmedUnits: number;
+  pendingSales: number;
+  pendingOrders: number;
+  cancelledSales: number;
+  cancelledOrders: number;
+  rawSales: number;
+  rawOrders: number;
+  statusNote: string;
 };
 
 function toNumber(value: unknown): number {
@@ -219,9 +237,12 @@ function buildProfitGuardrail(productEconomics: ProductEconomicsRow | null) {
 function buildExecutiveSummary(input: {
   productEconomics: ProductEconomicsRow | null;
   ppcSnapshot: MetricSummary;
+  amazonSalesSummary: AmazonSalesSummaryForCeo;
 }) {
   const profitStatus = input.productEconomics?.profit_status ?? "UNKNOWN";
   const targetAcos = toNumber(input.productEconomics?.target_acos);
+  const hasConfirmedSales = input.amazonSalesSummary.confirmedSales > 0;
+  const hasPendingSales = input.amazonSalesSummary.pendingSales > 0;
   let businessStatus: BusinessStatus = "WATCH";
   let oneLineAdvice = "Keep monitoring until more data is available.";
   let headline = "WATCH: Keep monitoring until more data is available.";
@@ -234,6 +255,32 @@ function buildExecutiveSummary(input: {
     businessStatus = "RISK";
     oneLineAdvice = "Do not scale ads until price, cost, bundle, or charges are fixed.";
     headline = "RISK: Product economics fail the profit guardrail.";
+  } else if (
+    hasConfirmedSales &&
+    input.ppcSnapshot.acos !== null &&
+    targetAcos > 0 &&
+    input.ppcSnapshot.acos > targetAcos
+  ) {
+    businessStatus = "WATCH";
+    oneLineAdvice = "Amazon confirmed sales exist, but PPC ACOS/profit risk still needs review.";
+    headline = "WATCH: Amazon confirmed sales exist, but PPC efficiency needs review.";
+  } else if (
+    hasConfirmedSales &&
+    input.ppcSnapshot.acos !== null &&
+    targetAcos > 0 &&
+    input.ppcSnapshot.acos <= targetAcos
+  ) {
+    businessStatus = "GOOD";
+    oneLineAdvice = "Amazon confirmed sales exist and PPC is within the profit-safe target, but keep approval-first shadow mode.";
+    headline = "GOOD: Amazon confirmed sales exist and PPC is within target.";
+  } else if (hasConfirmedSales) {
+    businessStatus = "WATCH";
+    oneLineAdvice = "Amazon confirmed sales exist, but PPC/profit data still needs review before scaling.";
+    headline = "WATCH: Amazon confirmed sales exist; review PPC and profit guardrails.";
+  } else if (hasPendingSales) {
+    businessStatus = "WATCH";
+    oneLineAdvice = "Sales are mostly pending or unconfirmed; avoid scaling until confirmed orders improve.";
+    headline = "WATCH: Pending Amazon sales exist, but confirmed sales are still zero.";
   } else if (
     input.ppcSnapshot.sales > 0 &&
     input.ppcSnapshot.acos !== null &&
@@ -335,6 +382,32 @@ function buildMetricProfitRiskAlerts(input: {
   }
 
   return alerts;
+}
+
+function buildAmazonSalesRiskAlerts(input: {
+  amazonSalesSummary: AmazonSalesSummaryForCeo;
+}): ProfitRiskAlert[] {
+  if (input.amazonSalesSummary.rawSales <= 0 || input.amazonSalesSummary.cancelledSales <= 0) {
+    return [];
+  }
+
+  const cancelledSalesShare = roundTwo((input.amazonSalesSummary.cancelledSales / input.amazonSalesSummary.rawSales) * 100);
+
+  if (cancelledSalesShare < 30) {
+    return [];
+  }
+
+  return [
+    {
+      type: "CANCELLED_ORDER_RISK",
+      severity: "HIGH",
+      title: "Cancelled order risk",
+      message: `Cancelled sales are ${cancelledSalesShare}% of raw Amazon sales. Do not count cancelled sales as real revenue, and review fulfilment/listing issues before scaling.`,
+      cancelledSales: input.amazonSalesSummary.cancelledSales,
+      rawSales: input.amazonSalesSummary.rawSales,
+      cancelledSalesShare
+    }
+  ];
 }
 
 function getRecommendationSummary(rows: AiRecommendationRow[]): RecommendationSummary {
@@ -487,16 +560,58 @@ async function loadRecommendations(sellerId: string): Promise<AiRecommendationRo
   return (data ?? []) as AiRecommendationRow[];
 }
 
+function emptyAmazonSalesSummary(days: number): AmazonSalesSummaryForCeo {
+  return {
+    days,
+    confirmedSales: 0,
+    confirmedOrders: 0,
+    confirmedUnits: 0,
+    pendingSales: 0,
+    pendingOrders: 0,
+    cancelledSales: 0,
+    cancelledOrders: 0,
+    rawSales: 0,
+    rawOrders: 0,
+    statusNote: "Confirmed sales exclude cancelled, pending, and unknown-status orders."
+  };
+}
+
+async function loadAmazonSalesSummaryForCeo(sellerId: string, days: number): Promise<AmazonSalesSummaryForCeo> {
+  const summary = await getAmazonSpSalesSummary(sellerId, days) as Partial<AmazonSalesSummaryForCeo>;
+
+  return {
+    ...emptyAmazonSalesSummary(days),
+    days: toNumber(summary.days) || days,
+    confirmedSales: roundTwo(toNumber(summary.confirmedSales)),
+    confirmedOrders: toNumber(summary.confirmedOrders),
+    confirmedUnits: toNumber(summary.confirmedUnits),
+    pendingSales: roundTwo(toNumber(summary.pendingSales)),
+    pendingOrders: toNumber(summary.pendingOrders),
+    cancelledSales: roundTwo(toNumber(summary.cancelledSales)),
+    cancelledOrders: toNumber(summary.cancelledOrders),
+    rawSales: roundTwo(toNumber(summary.rawSales)),
+    rawOrders: toNumber(summary.rawOrders),
+    statusNote: summary.statusNote ?? "Confirmed sales exclude cancelled, pending, and unknown-status orders."
+  };
+}
+
 export async function getDailyCeoReport(input: { sellerId: string; days: number }) {
   const endDate = getDateDaysAgo(1);
   const startDate = getDateDaysAgo(input.days);
   const reportDate = new Date().toISOString().slice(0, 10);
   const warnings: string[] = [];
-  const [productEconomics, campaignRows, searchTermRows, recommendations] = await Promise.all([
+  const [productEconomics, campaignRows, searchTermRows, recommendations, amazonSalesSummary] = await Promise.all([
     loadLatestProductEconomics(input.sellerId),
     loadCampaignMetrics({ sellerId: input.sellerId, startDate, endDate }),
     loadSearchTermMetrics({ sellerId: input.sellerId, startDate, endDate }),
-    loadRecommendations(input.sellerId)
+    loadRecommendations(input.sellerId),
+    loadAmazonSalesSummaryForCeo(input.sellerId, input.days).catch((error) => {
+      logger.warn("Could not load Amazon SP-API sales summary for CEO report.", {
+        message: sanitizeErrorMessage(error instanceof Error ? error.message : "Unknown error")
+      });
+      warnings.push("Amazon SP-API sales summary unavailable. CEO report is using PPC-only context for sales.");
+      return emptyAmazonSalesSummary(input.days);
+    })
   ]);
 
   if (!productEconomics) {
@@ -539,6 +654,18 @@ export async function getDailyCeoReport(input: { sellerId: string; days: number 
     ppcSnapshot,
     targetAcos: profitGuardrail.targetAcos
   });
+  const amazonSalesRiskAlerts = buildAmazonSalesRiskAlerts({ amazonSalesSummary });
+  const executiveSummary = buildExecutiveSummary({
+    productEconomics,
+    ppcSnapshot,
+    amazonSalesSummary
+  });
+  const nextBestAction = buildNextBestAction({
+    newRecommendations,
+    profitStatus: profitGuardrail.profitStatus,
+    listingCheckWarnings,
+    monitoringItems
+  });
 
   return {
     ok: true,
@@ -546,10 +673,20 @@ export async function getDailyCeoReport(input: { sellerId: string; days: number 
     days: input.days,
     mode: "CEO_REPORT_SHADOW_MODE",
     reportDate,
-    executiveSummary: buildExecutiveSummary({
-      productEconomics,
-      ppcSnapshot
-    }),
+    totalSpend: ppcSnapshot.cost,
+    totalSales: amazonSalesSummary.confirmedSales,
+    orders: amazonSalesSummary.confirmedOrders,
+    acosOverall: ppcSnapshot.acos,
+    ppcSales: ppcSnapshot.sales,
+    adsSales: ppcSnapshot.sales,
+    ppcSpend: ppcSnapshot.cost,
+    adSpend: ppcSnapshot.cost,
+    amazonSalesSummary,
+    headline: executiveSummary.headline,
+    businessStatus: executiveSummary.businessStatus,
+    profitStatus: executiveSummary.profitStatus,
+    oneLineAdvice: executiveSummary.oneLineAdvice,
+    executiveSummary,
     profitGuardrail,
     ppcSnapshot,
     searchTermHighlights: {
@@ -575,16 +712,11 @@ export async function getDailyCeoReport(input: { sellerId: string; days: number 
     scaleOpportunities,
     watchlistRisks,
     listingCheckWarnings,
-    profitRiskAlerts: [...metricProfitRiskAlerts, ...profitRiskAlerts],
+    profitRiskAlerts: [...metricProfitRiskAlerts, ...amazonSalesRiskAlerts, ...profitRiskAlerts],
     pendingApprovals,
     approvedShadowActions,
     monitoringItems,
-    nextBestAction: buildNextBestAction({
-      newRecommendations,
-      profitStatus: profitGuardrail.profitStatus,
-      listingCheckWarnings,
-      monitoringItems
-    }),
+    nextBestAction,
     warnings
   };
 }
