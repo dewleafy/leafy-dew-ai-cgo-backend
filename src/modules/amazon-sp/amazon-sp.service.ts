@@ -1846,13 +1846,33 @@ export async function listAmazonSpOrders(sellerIdInput: string, daysInput: numbe
   return ((data ?? []) as AmazonSpOrderRow[]).map(toSafeOrder);
 }
 
+type OrderSalesStatus = "confirmed" | "pending" | "cancelled" | "unknown";
+
+function classifyOrderSalesStatus(status: string | null): OrderSalesStatus {
+  const normalized = status?.toLowerCase() ?? "";
+
+  if (normalized.includes("cancelled") || normalized.includes("canceled")) {
+    return "cancelled";
+  }
+
+  if (normalized.includes("pending") || normalized.includes("waiting") || normalized.includes("unshipped")) {
+    return "pending";
+  }
+
+  if (normalized.includes("shipped") || normalized.includes("delivered") || normalized.includes("completed")) {
+    return "confirmed";
+  }
+
+  return "unknown";
+}
+
 export async function getAmazonSpSalesSummary(sellerIdInput: string, daysInput: number) {
   const sellerId = sellerIdOrDefault(sellerIdInput);
   const days = Math.min(Math.max(Math.floor(daysInput), 1), 90);
   const createdAfter = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
   const { data: ordersData, error: ordersError } = await supabase
     .from("amazon_sp_orders")
-    .select("amazon_order_id, order_total_amount")
+    .select("amazon_order_id, order_total_amount, order_status")
     .eq("seller_id", sellerId)
     .gte("purchase_date", createdAfter);
 
@@ -1861,20 +1881,41 @@ export async function getAmazonSpSalesSummary(sellerIdInput: string, daysInput: 
     throw new Error("Could not load Amazon SP-API sales summary from Supabase.");
   }
 
-  const orderIds = ((ordersData ?? []) as Array<{ amazon_order_id: string; order_total_amount: number | string | null }>)
-    .map((order) => order.amazon_order_id);
-  const totalSales = ((ordersData ?? []) as Array<{ order_total_amount: number | string | null }>)
-    .reduce((sum, order) => sum + (toNumberOrNull(order.order_total_amount) ?? 0), 0);
+  const statusNote = "Confirmed sales exclude cancelled, pending, and unknown-status orders.";
+  const emptyResponse = {
+    days,
+    rawSales: 0,
+    rawOrders: 0,
+    rawUnits: 0,
+    confirmedSales: 0,
+    confirmedOrders: 0,
+    confirmedUnits: 0,
+    pendingSales: 0,
+    pendingOrders: 0,
+    pendingUnits: 0,
+    cancelledSales: 0,
+    cancelledOrders: 0,
+    cancelledUnits: 0,
+    unknownSales: 0,
+    unknownOrders: 0,
+    unknownUnits: 0,
+    totalSales: 0,
+    totalOrders: 0,
+    totalUnits: 0,
+    averageConfirmedOrderValue: 0,
+    averageOrderValue: 0,
+    bySku: [],
+    statusNote
+  };
+  const orderRows = (ordersData ?? []) as Array<{
+    amazon_order_id: string;
+    order_total_amount: number | string | null;
+    order_status: string | null;
+  }>;
+  const orderIds = orderRows.map((order) => order.amazon_order_id);
 
   if (orderIds.length === 0) {
-    return {
-      days,
-      totalSales: 0,
-      totalOrders: 0,
-      totalUnits: 0,
-      averageOrderValue: 0,
-      bySku: []
-    };
+    return emptyResponse;
   }
 
   const { data: itemData, error: itemError } = await supabase
@@ -1888,40 +1929,164 @@ export async function getAmazonSpSalesSummary(sellerIdInput: string, daysInput: 
     throw new Error("Could not load Amazon SP-API sales summary from Supabase.");
   }
 
-  const bySku = new Map<string, { sku: string | null; asin: string | null; title: string | null; units: number; sales: number; orders: Set<string> }>();
+  const orderStatusById = new Map<string, OrderSalesStatus>();
+  const orderTotals = {
+    rawSales: 0,
+    rawOrders: orderRows.length,
+    confirmedSales: 0,
+    confirmedOrders: 0,
+    pendingSales: 0,
+    pendingOrders: 0,
+    cancelledSales: 0,
+    cancelledOrders: 0,
+    unknownSales: 0,
+    unknownOrders: 0
+  };
+
+  for (const order of orderRows) {
+    const status = classifyOrderSalesStatus(order.order_status);
+    const amount = toNumberOrNull(order.order_total_amount) ?? 0;
+    orderStatusById.set(order.amazon_order_id, status);
+    orderTotals.rawSales += amount;
+
+    if (status === "confirmed") {
+      orderTotals.confirmedSales += amount;
+      orderTotals.confirmedOrders += 1;
+    } else if (status === "pending") {
+      orderTotals.pendingSales += amount;
+      orderTotals.pendingOrders += 1;
+    } else if (status === "cancelled") {
+      orderTotals.cancelledSales += amount;
+      orderTotals.cancelledOrders += 1;
+    } else {
+      orderTotals.unknownSales += amount;
+      orderTotals.unknownOrders += 1;
+    }
+  }
+
+  const unitTotals = {
+    rawUnits: 0,
+    confirmedUnits: 0,
+    pendingUnits: 0,
+    cancelledUnits: 0,
+    unknownUnits: 0
+  };
+  const bySku = new Map<string, {
+    sku: string | null;
+    asin: string | null;
+    title: string | null;
+    confirmedUnits: number;
+    confirmedSales: number;
+    confirmedOrders: Set<string>;
+    pendingUnits: number;
+    pendingSales: number;
+    pendingOrders: Set<string>;
+    cancelledUnits: number;
+    cancelledSales: number;
+    cancelledOrders: Set<string>;
+    unknownUnits: number;
+    unknownSales: number;
+    unknownOrders: Set<string>;
+  }>();
+
   for (const item of (itemData ?? []) as AmazonSpOrderItemRow[]) {
     const key = item.sku ?? item.asin ?? "UNKNOWN";
     const current = bySku.get(key) ?? {
       sku: item.sku,
       asin: item.asin,
       title: item.title,
-      units: 0,
-      sales: 0,
-      orders: new Set<string>()
+      confirmedUnits: 0,
+      confirmedSales: 0,
+      confirmedOrders: new Set<string>(),
+      pendingUnits: 0,
+      pendingSales: 0,
+      pendingOrders: new Set<string>(),
+      cancelledUnits: 0,
+      cancelledSales: 0,
+      cancelledOrders: new Set<string>(),
+      unknownUnits: 0,
+      unknownSales: 0,
+      unknownOrders: new Set<string>()
     };
-    current.units += item.quantity_ordered ?? 0;
-    current.sales += toNumberOrNull(item.item_price_amount) ?? 0;
-    current.orders.add(item.amazon_order_id);
+
+    const status = orderStatusById.get(item.amazon_order_id) ?? "unknown";
+    const units = item.quantity_ordered ?? 0;
+    const sales = toNumberOrNull(item.item_price_amount) ?? 0;
+    unitTotals.rawUnits += units;
+
+    if (status === "confirmed") {
+      unitTotals.confirmedUnits += units;
+      current.confirmedUnits += units;
+      current.confirmedSales += sales;
+      current.confirmedOrders.add(item.amazon_order_id);
+    } else if (status === "pending") {
+      unitTotals.pendingUnits += units;
+      current.pendingUnits += units;
+      current.pendingSales += sales;
+      current.pendingOrders.add(item.amazon_order_id);
+    } else if (status === "cancelled") {
+      unitTotals.cancelledUnits += units;
+      current.cancelledUnits += units;
+      current.cancelledSales += sales;
+      current.cancelledOrders.add(item.amazon_order_id);
+    } else {
+      unitTotals.unknownUnits += units;
+      current.unknownUnits += units;
+      current.unknownSales += sales;
+      current.unknownOrders.add(item.amazon_order_id);
+    }
+
     bySku.set(key, current);
   }
 
-  const totalUnits = Array.from(bySku.values()).reduce((sum, row) => sum + row.units, 0);
-
   return {
     days,
-    totalSales,
-    totalOrders: orderIds.length,
-    totalUnits,
-    averageOrderValue: orderIds.length > 0 ? totalSales / orderIds.length : 0,
+    rawSales: orderTotals.rawSales,
+    rawOrders: orderTotals.rawOrders,
+    rawUnits: unitTotals.rawUnits,
+    confirmedSales: orderTotals.confirmedSales,
+    confirmedOrders: orderTotals.confirmedOrders,
+    confirmedUnits: unitTotals.confirmedUnits,
+    pendingSales: orderTotals.pendingSales,
+    pendingOrders: orderTotals.pendingOrders,
+    pendingUnits: unitTotals.pendingUnits,
+    cancelledSales: orderTotals.cancelledSales,
+    cancelledOrders: orderTotals.cancelledOrders,
+    cancelledUnits: unitTotals.cancelledUnits,
+    unknownSales: orderTotals.unknownSales,
+    unknownOrders: orderTotals.unknownOrders,
+    unknownUnits: unitTotals.unknownUnits,
+    totalSales: orderTotals.confirmedSales,
+    totalOrders: orderTotals.confirmedOrders,
+    totalUnits: unitTotals.confirmedUnits,
+    averageConfirmedOrderValue: orderTotals.confirmedOrders > 0
+      ? orderTotals.confirmedSales / orderTotals.confirmedOrders
+      : 0,
+    averageOrderValue: orderTotals.confirmedOrders > 0
+      ? orderTotals.confirmedSales / orderTotals.confirmedOrders
+      : 0,
     bySku: Array.from(bySku.values())
       .map((row) => ({
         sku: row.sku,
         asin: row.asin,
         title: row.title,
-        units: row.units,
-        sales: row.sales,
-        orders: row.orders.size
+        units: row.confirmedUnits,
+        sales: row.confirmedSales,
+        orders: row.confirmedOrders.size,
+        confirmedUnits: row.confirmedUnits,
+        confirmedSales: row.confirmedSales,
+        confirmedOrders: row.confirmedOrders.size,
+        pendingUnits: row.pendingUnits,
+        pendingSales: row.pendingSales,
+        pendingOrders: row.pendingOrders.size,
+        cancelledUnits: row.cancelledUnits,
+        cancelledSales: row.cancelledSales,
+        cancelledOrders: row.cancelledOrders.size,
+        unknownUnits: row.unknownUnits,
+        unknownSales: row.unknownSales,
+        unknownOrders: row.unknownOrders.size
       }))
-      .sort((left, right) => right.sales - left.sales)
+      .sort((left, right) => right.confirmedSales - left.confirmedSales),
+    statusNote
   };
 }
