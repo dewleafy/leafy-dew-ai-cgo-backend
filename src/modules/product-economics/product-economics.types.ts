@@ -15,6 +15,10 @@ export type ProductEconomicsInput = {
   categoryException?: boolean | null;
   weightKg?: number | null;
   volumeCuFt?: number | null;
+  productGstRatePercent?: number;
+  amazonFeeGstRatePercent?: number;
+  minimumApprovedProfit?: number;
+  profitFlexEnabled?: boolean;
   sellingPrice: number;
   productCost?: number;
   buyingCost?: number;
@@ -33,6 +37,28 @@ export type ProductEconomicsInput = {
   otherCostPerUnit: number;
   targetProfit?: number;
   notes?: string | null;
+};
+
+export type ProfitBand = {
+  bandLabel: string;
+  minProfit: number;
+  maxProfit: number;
+  targetAcos: number | null;
+  maxAllowableAdSpend: number | null;
+  riskLevel: "LOW" | "MEDIUM" | "HIGH" | "VERY_HIGH";
+  approvalRequired: boolean;
+  approvalTier: "PROFIT_BAND_APPROVAL" | "HIGH_RISK_APPROVAL" | "FOUNDER_OVERRIDE_REQUIRED";
+  warning: string | null;
+};
+
+export type ProfitBandApproval = {
+  approvalType: "PROFIT_BAND_APPROVAL";
+  sku: string | null;
+  currentRequiredProfit: number;
+  requestedProfitBand: ProfitBand | null;
+  riskLevel: ProfitBand["riskLevel"] | null;
+  reason: string;
+  expiresInDays: 7;
 };
 
 export type ProductEconomicsCalculation = {
@@ -58,6 +84,19 @@ export type ProductEconomicsCalculation = {
   grossProfit: number | null;
   netProfit: number | null;
   profitMarginPercent: number | null;
+  productGstRatePercent: number;
+  amazonFeeGstRatePercent: number;
+  netRevenueBeforeGst: number | null;
+  outputGstOnSale: number | null;
+  returnCostProvision: number;
+  hiddenOtherFee: number;
+  netProfitBeforeAds: number | null;
+  minimumApprovedProfit: number;
+  profitFlexEnabled: boolean;
+  profitBands: ProfitBand[];
+  recommendedProfitBand: ProfitBand | null;
+  recommendedProfitBandReason: string;
+  approval: ProfitBandApproval | null;
   feeRulesVersion: string;
   reason: string;
 };
@@ -128,6 +167,19 @@ export type SafeProductEconomicsRow = {
   grossProfit: number | null;
   netProfit: number | null;
   profitMarginPercent: number | null;
+  productGstRatePercent: number;
+  amazonFeeGstRatePercent: number;
+  netRevenueBeforeGst: number | null;
+  outputGstOnSale: number | null;
+  returnCostProvision: number;
+  hiddenOtherFee: number;
+  netProfitBeforeAds: number | null;
+  minimumApprovedProfit: number;
+  profitFlexEnabled: boolean;
+  profitBands: ProfitBand[];
+  recommendedProfitBand: ProfitBand | null;
+  recommendedProfitBandReason: string;
+  approval: ProfitBandApproval | null;
   referralFeePercent: number | null;
   referralFeeSource: "REFERRAL_FEE_TABLE" | "MISSING_SUBCATEGORY" | "NO_MATCH";
   feeRulesVersion: string;

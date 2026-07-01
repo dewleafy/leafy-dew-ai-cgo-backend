@@ -28,9 +28,7 @@ function hasMissingCostData(productEconomics: ProductEconomicsRow | null): boole
   return (
     toNumber(productEconomics.selling_price) <= 0 ||
     toNumber(productEconomics.non_ad_cost) <= 0 ||
-    toNumber(productEconomics.landed_cost) <= 0 ||
-    toNumber(productEconomics.amazon_fee_estimate) <= 0 ||
-    toNumber(productEconomics.shipping_fee_estimate) <= 0
+    toNumber(productEconomics.landed_cost) <= 0
   );
 }
 

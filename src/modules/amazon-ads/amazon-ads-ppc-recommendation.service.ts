@@ -211,9 +211,7 @@ function hasMissingCostData(productEconomics: ProductEconomicsRow | null): boole
   return (
     toNumber(productEconomics.selling_price) <= 0 ||
     toNumber(productEconomics.non_ad_cost) <= 0 ||
-    toNumber(productEconomics.landed_cost) <= 0 ||
-    toNumber(productEconomics.amazon_fee_estimate) <= 0 ||
-    toNumber(productEconomics.shipping_fee_estimate) <= 0
+    toNumber(productEconomics.landed_cost) <= 0
   );
 }
 
@@ -327,7 +325,12 @@ function getRecommendationDetails(input: {
     };
   }
 
-  if (productEconomics?.profit_status === "FAIL" || productEconomics?.profit_status === "NEEDS_COST_DATA" || productEconomics?.profit_status === "BLOCKED") {
+  if (
+    productEconomics?.profit_status === "FAIL" ||
+    productEconomics?.profit_status === "NEEDS_COST_DATA" ||
+    productEconomics?.profit_status === "NEEDS_INPUT" ||
+    productEconomics?.profit_status === "BLOCKED"
+  ) {
     return {
       category: "profitRiskWarnings",
       recommendedAction: "DO_NOT_SCALE_FIX_PRICE_COST_OR_BUNDLE",

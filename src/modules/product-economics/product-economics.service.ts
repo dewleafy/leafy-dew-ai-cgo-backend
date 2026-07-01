@@ -8,6 +8,8 @@ import {
   ProductEconomicsExplanation,
   ProductEconomicsInput,
   ProductEconomicsRow,
+  ProfitBand,
+  ProfitBandApproval,
   ProductProfitStatus,
   SafeProductEconomicsRow
 } from "./product-economics.types";
@@ -41,6 +43,11 @@ function noteValue(notes: string | null | undefined, label: string): string | nu
 
 function noteNumber(notes: string | null | undefined, label: string): number {
   return toNumber(noteValue(notes, label));
+}
+
+function noteBoolean(notes: string | null | undefined, label: string): boolean {
+  const value = noteValue(notes, label)?.toLowerCase();
+  return value === "true" || value === "yes";
 }
 
 function parseWeightKg(weight: string | null | undefined): number {
@@ -132,6 +139,136 @@ function getStorageFee(input: ProductEconomicsInput): number {
   return roundTwo(toNumber(input.volumeCuFt) * 5);
 }
 
+function getRiskLevel(index: number): ProfitBand["riskLevel"] {
+  if (index === 0) return "LOW";
+  if (index === 1) return "MEDIUM";
+  if (index === 2) return "HIGH";
+  return "VERY_HIGH";
+}
+
+function getApprovalTier(requiredProfit: number, minProfit: number, riskLevel: ProfitBand["riskLevel"]): ProfitBand["approvalTier"] {
+  const dropPercent = requiredProfit > 0 ? ((requiredProfit - minProfit) / requiredProfit) * 100 : 0;
+  if (dropPercent >= 40) return "FOUNDER_OVERRIDE_REQUIRED";
+  if (dropPercent > 20 || riskLevel === "HIGH" || riskLevel === "VERY_HIGH") return "HIGH_RISK_APPROVAL";
+  return "PROFIT_BAND_APPROVAL";
+}
+
+function getProfitBandWarning(requiredProfit: number, minProfit: number): string | null {
+  const dropPercent = requiredProfit > 0 ? ((requiredProfit - minProfit) / requiredProfit) * 100 : 0;
+  if (dropPercent >= 40) return "Suggested profit band is too far below target profit and requires founder override.";
+  if (dropPercent > 20) return "Suggested profit band is significantly below target profit.";
+  return null;
+}
+
+function buildProfitBands(input: {
+  requiredProfit: number;
+  sellingPrice: number;
+  netProfitBeforeAds: number | null;
+}): ProfitBand[] {
+  const bands: ProfitBand[] = [];
+
+  for (let index = 0; index < 5; index += 1) {
+    const maxProfit = roundTwo(input.requiredProfit - index * 10);
+    const minProfit = roundTwo(maxProfit - 10);
+    if (maxProfit <= 0 || minProfit < 0) continue;
+
+    const maxAllowableAdSpend = input.netProfitBeforeAds === null ? null : roundTwo(input.netProfitBeforeAds - minProfit);
+    const targetAcos =
+      input.netProfitBeforeAds === null || input.sellingPrice <= 0
+        ? null
+        : roundTwo(((input.netProfitBeforeAds - minProfit) / input.sellingPrice) * 100);
+    const riskLevel = getRiskLevel(index);
+
+    bands.push({
+      bandLabel: `${minProfit}-${maxProfit}`,
+      minProfit,
+      maxProfit,
+      targetAcos,
+      maxAllowableAdSpend,
+      riskLevel,
+      approvalRequired: true,
+      approvalTier: getApprovalTier(input.requiredProfit, minProfit, riskLevel),
+      warning: getProfitBandWarning(input.requiredProfit, minProfit)
+    });
+  }
+
+  return bands;
+}
+
+function getRecommendedProfitBand(input: {
+  sku: string | null;
+  requiredProfit: number;
+  profitStatus: ProductProfitStatus;
+  bands: ProfitBand[];
+}): {
+  recommendedProfitBand: ProfitBand | null;
+  recommendedProfitBandReason: string;
+  approval: ProfitBandApproval | null;
+} {
+  if (input.profitStatus === "PASS") {
+    return {
+      recommendedProfitBand: null,
+      recommendedProfitBandReason: "Required profit is protected.",
+      approval: null
+    };
+  }
+
+  const positiveBands = input.bands.filter((band) => (band.maxAllowableAdSpend ?? 0) > 0);
+  const closestBand = positiveBands[0] ?? null;
+
+  if (!closestBand) {
+    return {
+      recommendedProfitBand: null,
+      recommendedProfitBandReason: "Do not scale. No profit band gives safe ad spend room.",
+      approval: null
+    };
+  }
+
+  if (closestBand.approvalTier === "FOUNDER_OVERRIDE_REQUIRED") {
+    return {
+      recommendedProfitBand: closestBand,
+      recommendedProfitBandReason: "Do not scale. Profit drop is too high.",
+      approval: {
+        approvalType: "PROFIT_BAND_APPROVAL",
+        sku: input.sku,
+        currentRequiredProfit: input.requiredProfit,
+        requestedProfitBand: closestBand,
+        riskLevel: closestBand.riskLevel,
+        reason: "Lower profit band requires founder override before PPC scaling.",
+        expiresInDays: 7
+      }
+    };
+  }
+
+  return {
+    recommendedProfitBand: closestBand,
+    recommendedProfitBandReason: `Profit flex available, but requires approval for ${closestBand.bandLabel}.`,
+    approval: {
+      approvalType: "PROFIT_BAND_APPROVAL",
+      sku: input.sku,
+      currentRequiredProfit: input.requiredProfit,
+      requestedProfitBand: closestBand,
+      riskLevel: closestBand.riskLevel,
+      reason: "Lower profit band must be approved before use.",
+      expiresInDays: 7
+    }
+  };
+}
+
+function stringifyJson(value: unknown): string {
+  return JSON.stringify(value).replace(/\n/g, " ");
+}
+
+function parseNoteJson<T>(notes: string | null | undefined, label: string, fallback: T): T {
+  const value = noteValue(notes, label);
+  if (!value) return fallback;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+}
+
 function buildCalculationNotes(input: ProductEconomicsInput, calculation: ProductEconomicsCalculation): string | null {
   const lines = [
     cleanText(input.notes),
@@ -142,6 +279,10 @@ function buildCalculationNotes(input: ProductEconomicsInput, calculation: Produc
     cleanText(input.subcategoryOverride ?? input.subCategory) ? `Subcategory: ${cleanText(input.subcategoryOverride ?? input.subCategory)}` : "",
     input.weightKg !== undefined ? `Weight kg: ${toNumber(input.weightKg)}` : "",
     input.volumeCuFt !== undefined ? `Volume cu ft: ${toNumber(input.volumeCuFt)}` : "",
+    `Product GST Rate Percent: ${calculation.productGstRatePercent}`,
+    `Amazon Fee GST Rate Percent: ${calculation.amazonFeeGstRatePercent}`,
+    `Minimum Approved Profit: ${calculation.minimumApprovedProfit}`,
+    `Profit Flex Enabled: ${calculation.profitFlexEnabled ? "Yes" : "No"}`,
     `Referral Fee Source: ${calculation.referralFeeSource}`,
     calculation.referralFeePercent !== null ? `Referral Fee Percent: ${calculation.referralFeePercent}` : "",
     `Referral Fee: ${calculation.referralFee}`,
@@ -152,9 +293,18 @@ function buildCalculationNotes(input: ProductEconomicsInput, calculation: Produc
     `Other Fees: ${calculation.otherFees}`,
     `Total Amazon Fees: ${calculation.totalAmazonFees}`,
     `GST on Amazon Fees: ${calculation.gstOnAmazonFees}`,
+    calculation.netRevenueBeforeGst !== null ? `Net Revenue Before GST: ${calculation.netRevenueBeforeGst}` : "",
+    calculation.outputGstOnSale !== null ? `Output GST On Sale: ${calculation.outputGstOnSale}` : "",
+    `Return Cost Provision: ${calculation.returnCostProvision}`,
+    `Hidden Other Fee: ${calculation.hiddenOtherFee}`,
+    calculation.netProfitBeforeAds !== null ? `Net Profit Before Ads: ${calculation.netProfitBeforeAds}` : "",
     calculation.grossProfit !== null ? `Gross Profit: ${calculation.grossProfit}` : "",
     calculation.netProfit !== null ? `Net Profit: ${calculation.netProfit}` : "",
     calculation.profitMarginPercent !== null ? `Profit Margin Percent: ${calculation.profitMarginPercent}` : "",
+    `Profit Bands: ${stringifyJson(calculation.profitBands)}`,
+    calculation.recommendedProfitBand ? `Recommended Profit Band: ${stringifyJson(calculation.recommendedProfitBand)}` : "",
+    `Recommended Profit Band Reason: ${calculation.recommendedProfitBandReason}`,
+    calculation.approval ? `Profit Band Approval: ${stringifyJson(calculation.approval)}` : "",
     `Fee Rules Version: ${calculation.feeRulesVersion}`
   ].filter(Boolean);
 
@@ -236,6 +386,10 @@ function getTargetProfit(input: ProductEconomicsInput): { targetProfit: number; 
 export function calculateProductEconomics(input: ProductEconomicsInput): ProductEconomicsCalculation {
   const sellingPrice = toNumber(input.sellingPrice);
   const { targetProfit, targetProfitRule } = getTargetProfit(input);
+  const productGstRatePercent = toNumber(input.productGstRatePercent ?? 18);
+  const amazonFeeGstRatePercent = toNumber(input.amazonFeeGstRatePercent ?? 18);
+  const minimumApprovedProfit = toNumber(input.minimumApprovedProfit ?? targetProfit);
+  const profitFlexEnabled = Boolean(input.profitFlexEnabled);
   const referralFee = getReferralFee(input, sellingPrice);
   const closingFee = getClosingFee(sellingPrice, input.categoryException);
   const shippingFee = getShippingFee(input);
@@ -243,7 +397,9 @@ export function calculateProductEconomics(input: ProductEconomicsInput): Product
   const storageFee = getStorageFee(input);
   const otherFees = toNumber(input.otherFees ?? input.otherCostPerUnit);
   const totalAmazonFees = roundTwo(referralFee.amount + closingFee + shippingFee + pickAndPackFee + storageFee + otherFees);
-  const gstOnAmazonFees = roundTwo(totalAmazonFees * 0.18);
+  const gstOnAmazonFees = roundTwo(totalAmazonFees * (amazonFeeGstRatePercent / 100));
+  const netRevenueBeforeGst = sellingPrice > 0 ? roundTwo(sellingPrice / (1 + productGstRatePercent / 100)) : null;
+  const outputGstOnSale = netRevenueBeforeGst === null ? null : roundTwo(sellingPrice - netRevenueBeforeGst);
   const hasMissingCostBasis =
     sellingPrice <= 0 ||
     toNumber(input.landedCost) <= 0;
@@ -254,18 +410,20 @@ export function calculateProductEconomics(input: ProductEconomicsInput): Product
     providedReturnReserve > 0
       ? providedReturnReserve
       : (toNumber(input.returnRatePercent) / 100) * toNumber(input.returnCostPerReturn);
-  const nonAdCost =
-    toNumber(input.landedCost) +
-    totalAmazonFees +
-    gstOnAmazonFees +
+  const hiddenOtherFee = roundTwo(
     toNumber(input.packagingCost) +
-    returnReservePerUnit +
     toNumber(input.influencerCostAllocationPerUnit) +
     toNumber(input.socialMarketingCostPerUnit) +
-    toNumber(input.couponDiscountEstimate);
-  const maxAllowableAdSpend = sellingPrice - nonAdCost - targetProfit;
-  const breakEvenAcos = sellingPrice > 0 ? ((sellingPrice - nonAdCost) / sellingPrice) * 100 : 0;
-  const targetAcos = sellingPrice > 0 ? (maxAllowableAdSpend / sellingPrice) * 100 : 0;
+    toNumber(input.couponDiscountEstimate)
+  );
+  const netProfitBeforeAds =
+    netRevenueBeforeGst === null
+      ? null
+      : roundTwo(netRevenueBeforeGst - toNumber(input.landedCost) - totalAmazonFees - gstOnAmazonFees - returnReservePerUnit);
+  const nonAdCost = netRevenueBeforeGst === null ? 0 : roundTwo(sellingPrice - netProfitBeforeAds!);
+  const maxAllowableAdSpend = netProfitBeforeAds === null ? 0 : netProfitBeforeAds - targetProfit;
+  const breakEvenAcos = sellingPrice > 0 && netProfitBeforeAds !== null ? (netProfitBeforeAds / sellingPrice) * 100 : 0;
+  const targetAcos = sellingPrice > 0 && netProfitBeforeAds !== null ? (maxAllowableAdSpend / sellingPrice) * 100 : 0;
   const profitStatus: ProductProfitStatus =
     hasMissingSubcategory || hasReferralNoMatch
       ? "NEEDS_INPUT"
@@ -286,8 +444,19 @@ export function calculateProductEconomics(input: ProductEconomicsInput): Product
       ? "Subcategory does not match the referral fee table, so referral fee cannot be calculated."
       : getProfitReason(profitStatus);
   const shouldBlockMetrics = hasMissingSubcategory || hasReferralNoMatch || hasMissingCostBasis;
-  const grossProfit = sellingPrice > 0 ? roundTwo(sellingPrice - toNumber(input.landedCost) - totalAmazonFees) : null;
-  const netProfit = sellingPrice > 0 ? roundTwo(sellingPrice - nonAdCost) : null;
+  const grossProfit = netRevenueBeforeGst !== null ? roundTwo(netRevenueBeforeGst - toNumber(input.landedCost) - totalAmazonFees) : null;
+  const netProfit = netProfitBeforeAds;
+  const profitBands = buildProfitBands({
+    requiredProfit: targetProfit,
+    sellingPrice,
+    netProfitBeforeAds: shouldBlockMetrics ? null : netProfitBeforeAds
+  });
+  const recommendation = getRecommendedProfitBand({
+    sku: cleanText(input.sku),
+    requiredProfit: targetProfit,
+    profitStatus,
+    bands: profitBands
+  });
 
   return {
     targetProfit,
@@ -312,6 +481,19 @@ export function calculateProductEconomics(input: ProductEconomicsInput): Product
     grossProfit,
     netProfit,
     profitMarginPercent: netProfit !== null && sellingPrice > 0 ? roundTwo((netProfit / sellingPrice) * 100) : null,
+    productGstRatePercent,
+    amazonFeeGstRatePercent,
+    netRevenueBeforeGst,
+    outputGstOnSale,
+    returnCostProvision: roundTwo(returnReservePerUnit),
+    hiddenOtherFee,
+    netProfitBeforeAds,
+    minimumApprovedProfit,
+    profitFlexEnabled,
+    profitBands,
+    recommendedProfitBand: recommendation.recommendedProfitBand,
+    recommendedProfitBandReason: recommendation.recommendedProfitBandReason,
+    approval: recommendation.approval,
     feeRulesVersion: FEE_RULES_VERSION,
     reason
   };
@@ -332,6 +514,9 @@ export function toSafeProductEconomicsRow(row: ProductEconomicsRow): SafeProduct
   const incompleteFeeData = hasIncompleteFeeData(row);
   const referralFeeSource = (noteValue(row.notes, "Referral Fee Source") ?? "REFERRAL_FEE_TABLE") as SafeProductEconomicsRow["referralFeeSource"];
   const netProfit = noteValue(row.notes, "Net Profit") !== null ? noteNumber(row.notes, "Net Profit") : null;
+  const profitBands = parseNoteJson(row.notes, "Profit Bands", [] as SafeProductEconomicsRow["profitBands"]);
+  const recommendedProfitBand = parseNoteJson(row.notes, "Recommended Profit Band", null as SafeProductEconomicsRow["recommendedProfitBand"]);
+  const approval = parseNoteJson(row.notes, "Profit Band Approval", null as SafeProductEconomicsRow["approval"]);
   return {
     id: row.id,
     sellerId: row.seller_id,
@@ -355,6 +540,19 @@ export function toSafeProductEconomicsRow(row: ProductEconomicsRow): SafeProduct
     grossProfit: noteValue(row.notes, "Gross Profit") !== null ? noteNumber(row.notes, "Gross Profit") : null,
     netProfit,
     profitMarginPercent: noteValue(row.notes, "Profit Margin Percent") !== null ? noteNumber(row.notes, "Profit Margin Percent") : null,
+    productGstRatePercent: noteNumber(row.notes, "Product GST Rate Percent") || 18,
+    amazonFeeGstRatePercent: noteNumber(row.notes, "Amazon Fee GST Rate Percent") || 18,
+    netRevenueBeforeGst: noteValue(row.notes, "Net Revenue Before GST") !== null ? noteNumber(row.notes, "Net Revenue Before GST") : null,
+    outputGstOnSale: noteValue(row.notes, "Output GST On Sale") !== null ? noteNumber(row.notes, "Output GST On Sale") : null,
+    returnCostProvision: noteNumber(row.notes, "Return Cost Provision"),
+    hiddenOtherFee: noteNumber(row.notes, "Hidden Other Fee"),
+    netProfitBeforeAds: noteValue(row.notes, "Net Profit Before Ads") !== null ? noteNumber(row.notes, "Net Profit Before Ads") : null,
+    minimumApprovedProfit: noteNumber(row.notes, "Minimum Approved Profit") || toNumber(row.target_profit),
+    profitFlexEnabled: noteBoolean(row.notes, "Profit Flex Enabled"),
+    profitBands,
+    recommendedProfitBand,
+    recommendedProfitBandReason: noteValue(row.notes, "Recommended Profit Band Reason") ?? "",
+    approval,
     referralFeePercent: noteValue(row.notes, "Referral Fee Percent") !== null ? noteNumber(row.notes, "Referral Fee Percent") : null,
     referralFeeSource,
     feeRulesVersion: noteValue(row.notes, "Fee Rules Version") ?? FEE_RULES_VERSION,

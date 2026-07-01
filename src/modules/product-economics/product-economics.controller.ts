@@ -34,6 +34,16 @@ const categoryExceptionSchema = z.preprocess((value) => {
   return value;
 }, z.boolean().default(false));
 
+const booleanSchema = z.preprocess((value) => {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["yes", "y", "true", "1"].includes(normalized)) return true;
+    if (["no", "n", "false", "0", ""].includes(normalized)) return false;
+  }
+  return value;
+}, z.boolean().default(false));
+
 const productEconomicsBodySchema = z.object({
   sellerId: z.string().trim().min(1).default("default"),
   marketplaceId: nullableTextSchema,
@@ -48,6 +58,10 @@ const productEconomicsBodySchema = z.object({
   categoryException: categoryExceptionSchema,
   weightKg: z.coerce.number().min(0).optional(),
   volumeCuFt: z.coerce.number().min(0).optional(),
+  productGstRatePercent: z.coerce.number().min(0).default(18),
+  amazonFeeGstRatePercent: z.coerce.number().min(0).default(18),
+  minimumApprovedProfit: z.coerce.number().min(0).optional(),
+  profitFlexEnabled: booleanSchema,
   sellingPrice: z.coerce.number().min(0, "sellingPrice must be 0 or higher."),
   productCost: z.coerce.number().min(0).optional(),
   buyingCost: z.coerce.number().min(0).optional(),
@@ -106,6 +120,20 @@ function toFounderEconomics(row: Awaited<ReturnType<typeof saveProductEconomics>
     grossProfit: row.grossProfit,
     netProfit: row.netProfit,
     profitMarginPercent: row.profitMarginPercent,
+    productGstRatePercent: row.productGstRatePercent,
+    amazonFeeGstRatePercent: row.amazonFeeGstRatePercent,
+    netRevenueBeforeGst: row.netRevenueBeforeGst,
+    outputGstOnSale: row.outputGstOnSale,
+    returnRatePercent: row.returnRatePercent,
+    returnCostProvision: row.returnCostProvision,
+    hiddenOtherFee: row.hiddenOtherFee,
+    netProfitBeforeAds: row.netProfitBeforeAds,
+    minimumApprovedProfit: row.minimumApprovedProfit,
+    profitBands: row.profitBands,
+    recommendedProfitBand: row.recommendedProfitBand,
+    recommendedProfitBandReason: row.recommendedProfitBandReason,
+    profitFlexEnabled: row.profitFlexEnabled,
+    approval: row.approval,
     referralFeePercent: row.referralFeePercent,
     referralFeeSource: row.referralFeeSource,
     requiredProfit: row.requiredProfit,

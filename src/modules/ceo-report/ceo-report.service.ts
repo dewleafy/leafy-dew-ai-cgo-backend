@@ -213,6 +213,10 @@ function getProfitReason(productEconomics: ProductEconomicsRow | null): string {
     return "Product cost data is missing, so profit-safe decisions are blocked.";
   }
 
+  if (productEconomics.profit_status === "NEEDS_INPUT") {
+    return "Product economics need fee or category inputs before profit-safe PPC decisions.";
+  }
+
   if (productEconomics.profit_status === "PASS") {
     return "Product economics currently protect the required net profit.";
   }
@@ -228,15 +232,25 @@ function getProfitReason(productEconomics: ProductEconomicsRow | null): string {
   return "Product economics are available but profit status is unknown.";
 }
 
+function noteValue(notes: string | null | undefined, label: string): string | null {
+  if (!notes) return null;
+  const match = notes.match(new RegExp(`^${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*:\\s*(.+)$`, "im"));
+  const trimmed = match?.[1]?.trim();
+  return trimmed ? trimmed : null;
+}
+
+function hasProfitFlexOpportunity(productEconomics: ProductEconomicsRow | null): boolean {
+  if (!productEconomics) return false;
+  return Boolean(noteValue(productEconomics.notes, "Recommended Profit Band"));
+}
+
 function hasMissingCostData(productEconomics: ProductEconomicsRow | null): boolean {
   if (!productEconomics) return true;
 
   return (
     toNumber(productEconomics.selling_price) <= 0 ||
     toNumber(productEconomics.non_ad_cost) <= 0 ||
-    toNumber(productEconomics.landed_cost) <= 0 ||
-    toNumber(productEconomics.amazon_fee_estimate) <= 0 ||
-    toNumber(productEconomics.shipping_fee_estimate) <= 0
+    toNumber(productEconomics.landed_cost) <= 0
   );
 }
 
@@ -761,6 +775,12 @@ export async function getDailyCeoReport(input: { sellerId: string; days: number 
   if (productCostCoverage.hasPartialCostData) {
     warnings.push("Product cost data is partial. Add landed cost for every synced SKU before broad PPC scaling.");
   }
+
+  const profitFlexAvailable = hasProfitFlexOpportunity(productEconomics);
+  if (profitFlexAvailable) {
+    warnings.push("Profit flex available, but requires approval.");
+  }
+
   const metricProfitRiskAlerts = buildMetricProfitRiskAlerts({
     ppcSnapshot,
     targetAcos: profitGuardrail.targetAcos ?? 0
@@ -823,7 +843,19 @@ export async function getDailyCeoReport(input: { sellerId: string; days: number 
     scaleOpportunities,
     watchlistRisks,
     listingCheckWarnings,
-    profitRiskAlerts: [...metricProfitRiskAlerts, ...amazonSalesRiskAlerts, ...profitRiskAlerts],
+    profitRiskAlerts: [
+      ...metricProfitRiskAlerts,
+      ...amazonSalesRiskAlerts,
+      ...(profitFlexAvailable
+        ? [{
+            type: "PROFIT_FLEX_REQUIRES_APPROVAL",
+            severity: "MEDIUM",
+            title: "Profit flex available",
+            message: "Profit flex available, but requires approval."
+          } as ProfitRiskAlert]
+        : []),
+      ...profitRiskAlerts
+    ],
     pendingApprovals,
     approvedShadowActions,
     monitoringItems,
