@@ -22,7 +22,15 @@ const productEconomicsBodySchema = z.object({
   asin: nullableTextSchema,
   sku: z.string().trim().min(1, "SKU is required."),
   productName: nullableTextSchema,
+  subCategory: nullableTextSchema,
+  fulfillmentType: nullableTextSchema,
+  productType: nullableTextSchema,
+  shippingRegion: nullableTextSchema,
+  categoryException: nullableTextSchema,
+  weightKg: z.coerce.number().min(0).optional(),
+  volumeCuFt: z.coerce.number().min(0).optional(),
   sellingPrice: z.coerce.number().min(0, "sellingPrice must be 0 or higher."),
+  productCost: z.coerce.number().min(0).optional(),
   buyingCost: z.coerce.number().min(0).optional(),
   landedCost: z.coerce.number().min(0).default(0),
   packagingCost: z.coerce.number().min(0).default(0),
@@ -38,6 +46,7 @@ const productEconomicsBodySchema = z.object({
   influencerCostAllocationPerUnit: z.coerce.number().min(0).default(0),
   socialMarketingCostPerUnit: z.coerce.number().min(0).default(0),
   couponDiscountEstimate: z.coerce.number().min(0).default(0),
+  otherFees: z.coerce.number().min(0).optional(),
   otherCostPerUnit: z.coerce.number().min(0).default(0),
   requiredProfit: z.coerce.number().min(0).optional(),
   targetProfit: z.coerce.number().min(0).optional(),
@@ -99,10 +108,10 @@ export async function postProductEconomics(req: Request, res: Response): Promise
     const body = parsed.data;
     const row = await saveProductEconomics({
       ...body,
-      landedCost: body.buyingCost ?? body.landedCost,
+      landedCost: body.productCost ?? body.buyingCost ?? body.landedCost,
       shippingFeeEstimate: body.shippingCost ?? body.shippingFeeEstimate,
       amazonFeeEstimate: body.referralFee ?? body.amazonFeeEstimate,
-      otherCostPerUnit: body.closingFee ?? body.otherCostPerUnit,
+      otherCostPerUnit: body.otherFees ?? body.closingFee ?? body.otherCostPerUnit,
       targetProfit: body.requiredProfit ?? body.targetProfit
     });
     const explanation = buildProductEconomicsExplanation(row);

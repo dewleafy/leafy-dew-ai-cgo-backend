@@ -6,7 +6,16 @@ export type ProductEconomicsInput = {
   asin?: string | null;
   sku?: string | null;
   productName?: string | null;
+  subCategory?: string | null;
+  fulfillmentType?: string | null;
+  productType?: string | null;
+  shippingRegion?: string | null;
+  categoryException?: string | null;
+  weightKg?: number | null;
+  volumeCuFt?: number | null;
   sellingPrice: number;
+  productCost?: number;
+  buyingCost?: number;
   landedCost: number;
   packagingCost: number;
   amazonFeeEstimate: number;
@@ -18,6 +27,7 @@ export type ProductEconomicsInput = {
   influencerCostAllocationPerUnit: number;
   socialMarketingCostPerUnit: number;
   couponDiscountEstimate: number;
+  otherFees?: number;
   otherCostPerUnit: number;
   targetProfit?: number;
   notes?: string | null;
