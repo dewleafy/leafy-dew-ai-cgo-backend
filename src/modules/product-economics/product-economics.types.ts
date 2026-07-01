@@ -15,6 +15,7 @@ export type ProductEconomicsInput = {
   categoryException?: boolean | null;
   weightKg?: number | null;
   volumeCuFt?: number | null;
+  hiddenOtherFee?: number;
   productGstRatePercent?: number;
   amazonFeeGstRatePercent?: number;
   minimumApprovedProfit?: number;
@@ -78,6 +79,7 @@ export type ProductEconomicsCalculation = {
   shippingFee: number;
   pickAndPackFee: number;
   storageFee: number;
+  manualOtherFees: number;
   otherFees: number;
   totalAmazonFees: number;
   gstOnAmazonFees: number;
@@ -161,6 +163,7 @@ export type SafeProductEconomicsRow = {
   shippingFee: number;
   pickAndPackFee: number;
   storageFee: number;
+  manualOtherFees: number;
   otherFees: number;
   totalAmazonFees: number;
   gstOnAmazonFees: number;

@@ -25,6 +25,10 @@ function roundTwo(value: number): number {
   return Math.round(value * 100) / 100;
 }
 
+function floorTwo(value: number): number {
+  return Math.floor(value * 100) / 100;
+}
+
 function cleanText(value: string | null | undefined): string | null {
   const trimmed = value?.trim();
   return trimmed ? trimmed : null;
@@ -118,25 +122,39 @@ function getClosingFee(sellingPrice: number, categoryException?: boolean | null)
 }
 
 function getShippingFee(input: ProductEconomicsInput): number {
-  const fulfillmentType = normalizeCategory(input.fulfillmentType);
-  const shippingRegion = normalizeCategory(input.shippingRegion) ?? "national";
+  const fulfillmentType = normalizeFulfillmentType(input.fulfillmentType);
   const weightKg = toNumber(input.weightKg);
 
-  if (fulfillmentType !== "fc") return 0;
-  if (shippingRegion !== "national") return weightKg <= 0.5 ? 45 : 55;
+  if (fulfillmentType === "self_ship") return 0;
   if (weightKg <= 0.5) return 50;
-  if (weightKg <= 1) return 60;
-  return 60 + Math.ceil(weightKg - 1) * 25;
+  if (weightKg <= 1) return 70;
+  return 100;
 }
 
 function getPickAndPackFee(input: ProductEconomicsInput): number {
-  if (normalizeCategory(input.fulfillmentType) !== "fc") return 0;
+  if (normalizeFulfillmentType(input.fulfillmentType) !== "fc") return 0;
   return normalizeCategory(input.productType) === "oversize" ? 25 : 17;
 }
 
 function getStorageFee(input: ProductEconomicsInput): number {
-  if (normalizeCategory(input.fulfillmentType) !== "fc") return 0;
+  if (normalizeFulfillmentType(input.fulfillmentType) !== "fc") return 0;
   return roundTwo(toNumber(input.volumeCuFt) * 5);
+}
+
+function normalizeFulfillmentType(value: string | null | undefined): string | null {
+  const normalized = cleanText(value)
+    ?.toLowerCase()
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!normalized) return null;
+  if (["fc", "fba", "amazon fulfilled"].includes(normalized)) return "fc";
+  if (normalized === "easy ship") return "easy_ship";
+  if (normalized === "easy ship prime") return "easy_ship_prime";
+  if (normalized === "seller flex") return "seller_flex";
+  if (normalized === "self ship") return "self_ship";
+  return normalized.replace(/\s+/g, "_");
 }
 
 function getRiskLevel(index: number): ProfitBand["riskLevel"] {
@@ -176,7 +194,7 @@ function buildProfitBands(input: {
     const targetAcos =
       input.netProfitBeforeAds === null || input.sellingPrice <= 0
         ? null
-        : roundTwo(((input.netProfitBeforeAds - minProfit) / input.sellingPrice) * 100);
+        : floorTwo(((input.netProfitBeforeAds - minProfit) / input.sellingPrice) * 100);
     const riskLevel = getRiskLevel(index);
 
     bands.push({
@@ -290,6 +308,7 @@ function buildCalculationNotes(input: ProductEconomicsInput, calculation: Produc
     `Shipping Fee: ${calculation.shippingFee}`,
     `Pick & Pack Fee: ${calculation.pickAndPackFee}`,
     `Storage Fee: ${calculation.storageFee}`,
+    `Manual Other Fees: ${calculation.manualOtherFees}`,
     `Other Fees: ${calculation.otherFees}`,
     `Total Amazon Fees: ${calculation.totalAmazonFees}`,
     `GST on Amazon Fees: ${calculation.gstOnAmazonFees}`,
@@ -385,9 +404,11 @@ function getTargetProfit(input: ProductEconomicsInput): { targetProfit: number; 
 
 export function calculateProductEconomics(input: ProductEconomicsInput): ProductEconomicsCalculation {
   const sellingPrice = toNumber(input.sellingPrice);
+  const productCost = toNumber(input.landedCost);
   const { targetProfit, targetProfitRule } = getTargetProfit(input);
   const productGstRatePercent = toNumber(input.productGstRatePercent ?? 18);
   const amazonFeeGstRatePercent = toNumber(input.amazonFeeGstRatePercent ?? 18);
+  const returnRatePercent = toNumber(input.returnRatePercent ?? 10);
   const minimumApprovedProfit = toNumber(input.minimumApprovedProfit ?? targetProfit);
   const profitFlexEnabled = Boolean(input.profitFlexEnabled);
   const referralFee = getReferralFee(input, sellingPrice);
@@ -395,32 +416,24 @@ export function calculateProductEconomics(input: ProductEconomicsInput): Product
   const shippingFee = getShippingFee(input);
   const pickAndPackFee = getPickAndPackFee(input);
   const storageFee = getStorageFee(input);
-  const otherFees = toNumber(input.otherFees ?? input.otherCostPerUnit);
+  const manualOtherFees = toNumber(input.otherFees ?? input.otherCostPerUnit);
+  const hiddenOtherFee = toNumber(input.hiddenOtherFee ?? 10);
+  const otherFees = roundTwo(manualOtherFees + hiddenOtherFee);
   const totalAmazonFees = roundTwo(referralFee.amount + closingFee + shippingFee + pickAndPackFee + storageFee + otherFees);
   const gstOnAmazonFees = roundTwo(totalAmazonFees * (amazonFeeGstRatePercent / 100));
   const netRevenueBeforeGst = sellingPrice > 0 ? roundTwo(sellingPrice / (1 + productGstRatePercent / 100)) : null;
   const outputGstOnSale = netRevenueBeforeGst === null ? null : roundTwo(sellingPrice - netRevenueBeforeGst);
   const hasMissingCostBasis =
     sellingPrice <= 0 ||
-    toNumber(input.landedCost) <= 0;
+    productCost <= 0;
   const hasMissingSubcategory = referralFee.source === "MISSING_SUBCATEGORY";
   const hasReferralNoMatch = referralFee.source === "NO_MATCH";
-  const providedReturnReserve = toNumber(input.returnReservePerUnit);
-  const returnReservePerUnit =
-    providedReturnReserve > 0
-      ? providedReturnReserve
-      : (toNumber(input.returnRatePercent) / 100) * toNumber(input.returnCostPerReturn);
-  const hiddenOtherFee = roundTwo(
-    toNumber(input.packagingCost) +
-    toNumber(input.influencerCostAllocationPerUnit) +
-    toNumber(input.socialMarketingCostPerUnit) +
-    toNumber(input.couponDiscountEstimate)
-  );
+  const returnReservePerUnit = roundTwo(sellingPrice * (returnRatePercent / 100));
   const netProfitBeforeAds =
     netRevenueBeforeGst === null
       ? null
-      : roundTwo(netRevenueBeforeGst - toNumber(input.landedCost) - totalAmazonFees - gstOnAmazonFees - returnReservePerUnit);
-  const nonAdCost = netRevenueBeforeGst === null ? 0 : roundTwo(sellingPrice - netProfitBeforeAds!);
+      : roundTwo(netRevenueBeforeGst - productCost - totalAmazonFees - gstOnAmazonFees - returnReservePerUnit);
+  const nonAdCost = roundTwo(productCost + totalAmazonFees + gstOnAmazonFees + returnReservePerUnit);
   const maxAllowableAdSpend = netProfitBeforeAds === null ? 0 : netProfitBeforeAds - targetProfit;
   const breakEvenAcos = sellingPrice > 0 && netProfitBeforeAds !== null ? (netProfitBeforeAds / sellingPrice) * 100 : 0;
   const targetAcos = sellingPrice > 0 && netProfitBeforeAds !== null ? (maxAllowableAdSpend / sellingPrice) * 100 : 0;
@@ -444,7 +457,7 @@ export function calculateProductEconomics(input: ProductEconomicsInput): Product
       ? "Subcategory does not match the referral fee table, so referral fee cannot be calculated."
       : getProfitReason(profitStatus);
   const shouldBlockMetrics = hasMissingSubcategory || hasReferralNoMatch || hasMissingCostBasis;
-  const grossProfit = netRevenueBeforeGst !== null ? roundTwo(netRevenueBeforeGst - toNumber(input.landedCost) - totalAmazonFees) : null;
+  const grossProfit = netRevenueBeforeGst !== null ? roundTwo(netRevenueBeforeGst - productCost - totalAmazonFees) : null;
   const netProfit = netProfitBeforeAds;
   const profitBands = buildProfitBands({
     requiredProfit: targetProfit,
@@ -465,7 +478,7 @@ export function calculateProductEconomics(input: ProductEconomicsInput): Product
     nonAdCost: roundTwo(nonAdCost),
     maxAllowableAdSpend: shouldBlockMetrics ? null : roundTwo(maxAllowableAdSpend),
     breakEvenAcos: shouldBlockMetrics ? null : roundTwo(breakEvenAcos),
-    targetAcos: shouldBlockMetrics ? null : roundTwo(targetAcos),
+    targetAcos: shouldBlockMetrics ? null : floorTwo(targetAcos),
     profitStatus,
     profitDataStatus,
     referralFeeSource: referralFee.source,
@@ -475,6 +488,7 @@ export function calculateProductEconomics(input: ProductEconomicsInput): Product
     shippingFee,
     pickAndPackFee,
     storageFee,
+    manualOtherFees,
     otherFees,
     totalAmazonFees,
     gstOnAmazonFees,
@@ -496,6 +510,77 @@ export function calculateProductEconomics(input: ProductEconomicsInput): Product
     approval: recommendation.approval,
     feeRulesVersion: FEE_RULES_VERSION,
     reason
+  };
+}
+
+export function getProductEconomicsFormulaCheckExample(): Pick<
+  ProductEconomicsCalculation,
+  | "netRevenueBeforeGst"
+  | "outputGstOnSale"
+  | "referralFeePercent"
+  | "referralFee"
+  | "closingFee"
+  | "shippingFee"
+  | "pickAndPackFee"
+  | "storageFee"
+  | "hiddenOtherFee"
+  | "manualOtherFees"
+  | "otherFees"
+  | "totalAmazonFees"
+  | "gstOnAmazonFees"
+  | "returnCostProvision"
+  | "netProfitBeforeAds"
+  | "maxAllowableAdSpend"
+  | "targetAcos"
+  | "breakEvenAcos"
+> {
+  const calculation = calculateProductEconomics({
+    sellerId: "default",
+    sku: "FORMULA_CHECK",
+    sellingPrice: 449,
+    landedCost: 110,
+    packagingCost: 0,
+    amazonFeeEstimate: 0,
+    shippingFeeEstimate: 0,
+    taxEstimate: 0,
+    returnRatePercent: 10,
+    returnCostPerReturn: 0,
+    influencerCostAllocationPerUnit: 0,
+    socialMarketingCostPerUnit: 0,
+    couponDiscountEstimate: 0,
+    otherFees: 0,
+    otherCostPerUnit: 0,
+    targetProfit: 100,
+    fulfillmentType: "Easy Ship Prime",
+    productType: "Standard",
+    weightKg: 0.5,
+    volumeCuFt: 0.5,
+    subcategoryOverride: "Home Decor Products",
+    productGstRatePercent: 18,
+    amazonFeeGstRatePercent: 18,
+    hiddenOtherFee: 10,
+    categoryException: false
+  });
+
+  return {
+    netRevenueBeforeGst: calculation.netRevenueBeforeGst,
+    outputGstOnSale: calculation.outputGstOnSale,
+    referralFeePercent: calculation.referralFeePercent,
+    referralFee: calculation.referralFee,
+    closingFee: calculation.closingFee,
+    shippingFee: calculation.shippingFee,
+    pickAndPackFee: calculation.pickAndPackFee,
+    storageFee: calculation.storageFee,
+    hiddenOtherFee: calculation.hiddenOtherFee,
+    manualOtherFees: calculation.manualOtherFees,
+    otherFees: calculation.otherFees,
+    totalAmazonFees: calculation.totalAmazonFees,
+    gstOnAmazonFees: calculation.gstOnAmazonFees,
+    returnCostProvision: calculation.returnCostProvision,
+    netProfitBeforeAds: calculation.netProfitBeforeAds,
+    maxAllowableAdSpend: calculation.maxAllowableAdSpend,
+    targetAcos: calculation.targetAcos,
+    breakEvenAcos: calculation.breakEvenAcos
   };
 }
 
@@ -534,6 +619,7 @@ export function toSafeProductEconomicsRow(row: ProductEconomicsRow): SafeProduct
     shippingFee: toNumber(row.shipping_fee_estimate),
     pickAndPackFee: noteNumber(row.notes, "Pick & Pack Fee"),
     storageFee: noteNumber(row.notes, "Storage Fee"),
+    manualOtherFees: noteNumber(row.notes, "Manual Other Fees"),
     otherFees: noteNumber(row.notes, "Other Fees"),
     totalAmazonFees: noteNumber(row.notes, "Total Amazon Fees"),
     gstOnAmazonFees: toNumber(row.tax_estimate),
@@ -624,7 +710,7 @@ export async function saveProductEconomics(input: ProductEconomicsInput): Promis
     influencer_cost_allocation_per_unit: roundTwo(input.influencerCostAllocationPerUnit),
     social_marketing_cost_per_unit: roundTwo(input.socialMarketingCostPerUnit),
     coupon_discount_estimate: roundTwo(input.couponDiscountEstimate),
-    other_cost_per_unit: roundTwo(calculation.closingFee + calculation.pickAndPackFee + calculation.storageFee + calculation.otherFees),
+    other_cost_per_unit: calculation.otherFees,
     target_profit: calculation.targetProfit,
     target_profit_rule: calculation.targetProfitRule,
     non_ad_cost: calculation.nonAdCost,
