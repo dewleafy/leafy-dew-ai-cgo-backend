@@ -1,4 +1,4 @@
-export type ProductProfitStatus = "PASS" | "RISK" | "FAIL" | "UNKNOWN" | "NEEDS_COST_DATA" | "BLOCKED";
+export type ProductProfitStatus = "PASS" | "RISK" | "FAIL" | "UNKNOWN" | "NEEDS_COST_DATA" | "NEEDS_INPUT" | "BLOCKED";
 export type CostCompletionStatus = "MISSING_COST_DATA" | "INCOMPLETE" | "COMPLETE" | "BLOCKED";
 
 export type ProductEconomicsInput = {
@@ -44,13 +44,27 @@ export type ProductEconomicsCalculation = {
   breakEvenAcos: number | null;
   targetAcos: number | null;
   profitStatus: ProductProfitStatus;
-  profitDataStatus: "AVAILABLE" | "MISSING_COST_DATA";
+  profitDataStatus: "AVAILABLE" | "MISSING_COST_DATA" | "INCOMPLETE";
+  referralFeeSource: "REFERRAL_FEE_TABLE" | "MISSING_SUBCATEGORY" | "NO_MATCH";
+  referralFeePercent: number | null;
+  referralFee: number;
+  closingFee: number;
+  shippingFee: number;
+  pickAndPackFee: number;
+  storageFee: number;
+  otherFees: number;
+  totalAmazonFees: number;
+  gstOnAmazonFees: number;
+  grossProfit: number | null;
+  netProfit: number | null;
+  profitMarginPercent: number | null;
+  feeRulesVersion: string;
   reason: string;
 };
 
 export type ProductEconomicsExplanation = {
   profitStatus: ProductProfitStatus;
-  profitDataStatus: "AVAILABLE" | "MISSING_COST_DATA";
+  profitDataStatus: "AVAILABLE" | "MISSING_COST_DATA" | "INCOMPLETE";
   targetProfit: number;
   nonAdCost: number;
   maxAllowableAdSpend: number | null;
@@ -105,6 +119,18 @@ export type SafeProductEconomicsRow = {
   shippingCost: number;
   referralFee: number;
   closingFee: number;
+  shippingFee: number;
+  pickAndPackFee: number;
+  storageFee: number;
+  otherFees: number;
+  totalAmazonFees: number;
+  gstOnAmazonFees: number;
+  grossProfit: number | null;
+  netProfit: number | null;
+  profitMarginPercent: number | null;
+  referralFeePercent: number | null;
+  referralFeeSource: "REFERRAL_FEE_TABLE" | "MISSING_SUBCATEGORY" | "NO_MATCH";
+  feeRulesVersion: string;
   amazonFeeEstimate: number;
   shippingFeeEstimate: number;
   taxEstimate: number;
@@ -123,7 +149,7 @@ export type SafeProductEconomicsRow = {
   breakEvenAcos: number | null;
   targetAcos: number | null;
   profitStatus: ProductProfitStatus;
-  profitDataStatus: "AVAILABLE" | "MISSING_COST_DATA";
+  profitDataStatus: "AVAILABLE" | "MISSING_COST_DATA" | "INCOMPLETE";
   reason: string;
   notes: string | null;
   createdAt: string | null;
@@ -140,7 +166,7 @@ export type CostCompletionQueueRow = {
   sellingPrice: number | null;
   costStatus: CostCompletionStatus;
   profitStatus: ProductProfitStatus | null;
-  profitDataStatus: SafeProductEconomicsRow["profitDataStatus"] | "INCOMPLETE" | null;
+  profitDataStatus: SafeProductEconomicsRow["profitDataStatus"] | null;
   missingFields: string[];
   targetAcos: number | null;
   breakEvenAcos: number | null;

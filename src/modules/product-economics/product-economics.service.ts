@@ -39,9 +39,126 @@ function noteValue(notes: string | null | undefined, label: string): string | nu
   return cleanText(match?.[1]);
 }
 
+function noteNumber(notes: string | null | undefined, label: string): number {
+  return toNumber(noteValue(notes, label));
+}
+
 function parseWeightKg(weight: string | null | undefined): number {
   const match = weight?.match(/(\d+(?:\.\d+)?)/);
   return match ? toNumber(match[1]) : 0;
+}
+
+const FEE_RULES_VERSION = "amazon_fee_engine_v1_strict";
+
+const referralFeeRules: Record<string, Array<{ maxPrice: number; percent: number }>> = {
+  "home decor products": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "home - other products": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "home improvement - other products": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "home improvement - accessories": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "home storage": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "home furnishing": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "home - fragrance & candles": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "kitchen - glassware & ceramicware": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "cookware, tableware & dinnerware": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "rugs and doormats": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "clocks": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "wall art": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "bedsheets, blankets and covers": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "containers, boxes, bottles": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "curtains and accessories": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "cushion covers": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "indoor lighting": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "indoor lighting - others": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "led bulbs and battens": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "wall paints and tools": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "craft materials": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "safes and lockers": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "mattresses": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 18 }]
+};
+
+function normalizeCategory(value: string | null | undefined): string | null {
+  const cleaned = cleanText(value);
+  return cleaned ? cleaned.toLowerCase() : null;
+}
+
+function getReferralFee(input: ProductEconomicsInput, sellingPrice: number): {
+  source: "REFERRAL_FEE_TABLE" | "MISSING_SUBCATEGORY" | "NO_MATCH";
+  percent: number | null;
+  amount: number;
+} {
+  const subcategory = normalizeCategory(input.subcategoryOverride ?? input.subCategory);
+  if (!subcategory) return { source: "MISSING_SUBCATEGORY", percent: null, amount: 0 };
+
+  const rules = referralFeeRules[subcategory];
+  if (!rules) return { source: "NO_MATCH", percent: null, amount: 0 };
+
+  const rule = rules.find((item) => sellingPrice <= item.maxPrice);
+  if (!rule) return { source: "NO_MATCH", percent: null, amount: 0 };
+
+  return {
+    source: "REFERRAL_FEE_TABLE",
+    percent: rule.percent,
+    amount: roundTwo((sellingPrice * rule.percent) / 100)
+  };
+}
+
+function getClosingFee(sellingPrice: number, categoryException?: boolean | null): number {
+  if (categoryException) return 0;
+  if (sellingPrice <= 250) return 5;
+  if (sellingPrice <= 500) return 22;
+  if (sellingPrice <= 1000) return 25;
+  return 50;
+}
+
+function getShippingFee(input: ProductEconomicsInput): number {
+  const fulfillmentType = normalizeCategory(input.fulfillmentType);
+  const shippingRegion = normalizeCategory(input.shippingRegion) ?? "national";
+  const weightKg = toNumber(input.weightKg);
+
+  if (fulfillmentType !== "fc") return 0;
+  if (shippingRegion !== "national") return weightKg <= 0.5 ? 45 : 55;
+  if (weightKg <= 0.5) return 50;
+  if (weightKg <= 1) return 60;
+  return 60 + Math.ceil(weightKg - 1) * 25;
+}
+
+function getPickAndPackFee(input: ProductEconomicsInput): number {
+  if (normalizeCategory(input.fulfillmentType) !== "fc") return 0;
+  return normalizeCategory(input.productType) === "oversize" ? 25 : 17;
+}
+
+function getStorageFee(input: ProductEconomicsInput): number {
+  if (normalizeCategory(input.fulfillmentType) !== "fc") return 0;
+  return roundTwo(toNumber(input.volumeCuFt) * 5);
+}
+
+function buildCalculationNotes(input: ProductEconomicsInput, calculation: ProductEconomicsCalculation): string | null {
+  const lines = [
+    cleanText(input.notes),
+    `Shipping Region: ${cleanText(input.shippingRegion) ?? "National"}`,
+    `Category Exception: ${input.categoryException ? "Yes" : "No"}`,
+    cleanText(input.fulfillmentType) ? `Fulfillment Type: ${cleanText(input.fulfillmentType)}` : "",
+    cleanText(input.productType) ? `Product Type: ${cleanText(input.productType)}` : "",
+    cleanText(input.subcategoryOverride ?? input.subCategory) ? `Subcategory: ${cleanText(input.subcategoryOverride ?? input.subCategory)}` : "",
+    input.weightKg !== undefined ? `Weight kg: ${toNumber(input.weightKg)}` : "",
+    input.volumeCuFt !== undefined ? `Volume cu ft: ${toNumber(input.volumeCuFt)}` : "",
+    `Referral Fee Source: ${calculation.referralFeeSource}`,
+    calculation.referralFeePercent !== null ? `Referral Fee Percent: ${calculation.referralFeePercent}` : "",
+    `Referral Fee: ${calculation.referralFee}`,
+    `Closing Fee: ${calculation.closingFee}`,
+    `Shipping Fee: ${calculation.shippingFee}`,
+    `Pick & Pack Fee: ${calculation.pickAndPackFee}`,
+    `Storage Fee: ${calculation.storageFee}`,
+    `Other Fees: ${calculation.otherFees}`,
+    `Total Amazon Fees: ${calculation.totalAmazonFees}`,
+    `GST on Amazon Fees: ${calculation.gstOnAmazonFees}`,
+    calculation.grossProfit !== null ? `Gross Profit: ${calculation.grossProfit}` : "",
+    calculation.netProfit !== null ? `Net Profit: ${calculation.netProfit}` : "",
+    calculation.profitMarginPercent !== null ? `Profit Margin Percent: ${calculation.profitMarginPercent}` : "",
+    `Fee Rules Version: ${calculation.feeRulesVersion}`
+  ].filter(Boolean);
+
+  return lines.length ? lines.join("\n") : null;
 }
 
 function sanitizeErrorMessage(message: string): string {
@@ -60,6 +177,10 @@ function sanitizeErrorMessage(message: string): string {
 }
 
 function getProfitReason(status: ProductProfitStatus): string {
+  if (status === "NEEDS_INPUT") {
+    return "Required fee inputs are missing, so profit-safe decisions are blocked.";
+  }
+
   if (status === "NEEDS_COST_DATA" || status === "BLOCKED") {
     return status === "BLOCKED"
       ? "Costs and required profit leave no room for PPC spend."
@@ -115,9 +236,19 @@ function getTargetProfit(input: ProductEconomicsInput): { targetProfit: number; 
 export function calculateProductEconomics(input: ProductEconomicsInput): ProductEconomicsCalculation {
   const sellingPrice = toNumber(input.sellingPrice);
   const { targetProfit, targetProfitRule } = getTargetProfit(input);
+  const referralFee = getReferralFee(input, sellingPrice);
+  const closingFee = getClosingFee(sellingPrice, input.categoryException);
+  const shippingFee = getShippingFee(input);
+  const pickAndPackFee = getPickAndPackFee(input);
+  const storageFee = getStorageFee(input);
+  const otherFees = toNumber(input.otherFees ?? input.otherCostPerUnit);
+  const totalAmazonFees = roundTwo(referralFee.amount + closingFee + shippingFee + pickAndPackFee + storageFee + otherFees);
+  const gstOnAmazonFees = roundTwo(totalAmazonFees * 0.18);
   const hasMissingCostBasis =
     sellingPrice <= 0 ||
     toNumber(input.landedCost) <= 0;
+  const hasMissingSubcategory = referralFee.source === "MISSING_SUBCATEGORY";
+  const hasReferralNoMatch = referralFee.source === "NO_MATCH";
   const providedReturnReserve = toNumber(input.returnReservePerUnit);
   const returnReservePerUnit =
     providedReturnReserve > 0
@@ -125,32 +256,63 @@ export function calculateProductEconomics(input: ProductEconomicsInput): Product
       : (toNumber(input.returnRatePercent) / 100) * toNumber(input.returnCostPerReturn);
   const nonAdCost =
     toNumber(input.landedCost) +
+    totalAmazonFees +
+    gstOnAmazonFees +
     toNumber(input.packagingCost) +
-    toNumber(input.amazonFeeEstimate) +
-    toNumber(input.shippingFeeEstimate) +
-    toNumber(input.taxEstimate) +
     returnReservePerUnit +
     toNumber(input.influencerCostAllocationPerUnit) +
     toNumber(input.socialMarketingCostPerUnit) +
-    toNumber(input.couponDiscountEstimate) +
-    toNumber(input.otherCostPerUnit);
+    toNumber(input.couponDiscountEstimate);
   const maxAllowableAdSpend = sellingPrice - nonAdCost - targetProfit;
   const breakEvenAcos = sellingPrice > 0 ? ((sellingPrice - nonAdCost) / sellingPrice) * 100 : 0;
   const targetAcos = sellingPrice > 0 ? (maxAllowableAdSpend / sellingPrice) * 100 : 0;
   const profitStatus: ProductProfitStatus =
-    hasMissingCostBasis ? "NEEDS_COST_DATA" : maxAllowableAdSpend <= 0 ? "BLOCKED" : "PASS";
-  const reason = getProfitReason(profitStatus);
+    hasMissingSubcategory || hasReferralNoMatch
+      ? "NEEDS_INPUT"
+      : hasMissingCostBasis
+        ? "NEEDS_COST_DATA"
+        : maxAllowableAdSpend <= 0
+          ? "BLOCKED"
+          : "PASS";
+  const profitDataStatus =
+    hasMissingSubcategory || hasReferralNoMatch
+      ? "INCOMPLETE"
+      : hasMissingCostBasis
+        ? "MISSING_COST_DATA"
+        : "AVAILABLE";
+  const reason = hasMissingSubcategory
+    ? "Subcategory is missing, so referral fee cannot be calculated."
+    : hasReferralNoMatch
+      ? "Subcategory does not match the referral fee table, so referral fee cannot be calculated."
+      : getProfitReason(profitStatus);
+  const shouldBlockMetrics = hasMissingSubcategory || hasReferralNoMatch || hasMissingCostBasis;
+  const grossProfit = sellingPrice > 0 ? roundTwo(sellingPrice - toNumber(input.landedCost) - totalAmazonFees) : null;
+  const netProfit = sellingPrice > 0 ? roundTwo(sellingPrice - nonAdCost) : null;
 
   return {
     targetProfit,
     targetProfitRule,
     returnReservePerUnit: roundTwo(returnReservePerUnit),
     nonAdCost: roundTwo(nonAdCost),
-    maxAllowableAdSpend: hasMissingCostBasis ? null : roundTwo(maxAllowableAdSpend),
-    breakEvenAcos: hasMissingCostBasis ? null : roundTwo(breakEvenAcos),
-    targetAcos: hasMissingCostBasis ? null : roundTwo(targetAcos),
+    maxAllowableAdSpend: shouldBlockMetrics ? null : roundTwo(maxAllowableAdSpend),
+    breakEvenAcos: shouldBlockMetrics ? null : roundTwo(breakEvenAcos),
+    targetAcos: shouldBlockMetrics ? null : roundTwo(targetAcos),
     profitStatus,
-    profitDataStatus: hasMissingCostBasis ? "MISSING_COST_DATA" : "AVAILABLE",
+    profitDataStatus,
+    referralFeeSource: referralFee.source,
+    referralFeePercent: referralFee.percent,
+    referralFee: referralFee.amount,
+    closingFee,
+    shippingFee,
+    pickAndPackFee,
+    storageFee,
+    otherFees,
+    totalAmazonFees,
+    gstOnAmazonFees,
+    grossProfit,
+    netProfit,
+    profitMarginPercent: netProfit !== null && sellingPrice > 0 ? roundTwo((netProfit / sellingPrice) * 100) : null,
+    feeRulesVersion: FEE_RULES_VERSION,
     reason
   };
 }
@@ -162,7 +324,14 @@ function hasMissingCostData(row: ProductEconomicsRow | SafeProductEconomicsRow):
   return toNumber(sellingPrice) <= 0 || toNumber(landedCost) <= 0;
 }
 
+function hasIncompleteFeeData(row: ProductEconomicsRow): boolean {
+  return noteValue(row.notes, "Referral Fee Source") === "MISSING_SUBCATEGORY" || noteValue(row.notes, "Referral Fee Source") === "NO_MATCH";
+}
+
 export function toSafeProductEconomicsRow(row: ProductEconomicsRow): SafeProductEconomicsRow {
+  const incompleteFeeData = hasIncompleteFeeData(row);
+  const referralFeeSource = (noteValue(row.notes, "Referral Fee Source") ?? "REFERRAL_FEE_TABLE") as SafeProductEconomicsRow["referralFeeSource"];
+  const netProfit = noteValue(row.notes, "Net Profit") !== null ? noteNumber(row.notes, "Net Profit") : null;
   return {
     id: row.id,
     sellerId: row.seller_id,
@@ -176,7 +345,19 @@ export function toSafeProductEconomicsRow(row: ProductEconomicsRow): SafeProduct
     packagingCost: toNumber(row.packaging_cost),
     shippingCost: toNumber(row.shipping_fee_estimate),
     referralFee: toNumber(row.amazon_fee_estimate),
-    closingFee: toNumber(row.other_cost_per_unit),
+    closingFee: noteNumber(row.notes, "Closing Fee"),
+    shippingFee: toNumber(row.shipping_fee_estimate),
+    pickAndPackFee: noteNumber(row.notes, "Pick & Pack Fee"),
+    storageFee: noteNumber(row.notes, "Storage Fee"),
+    otherFees: noteNumber(row.notes, "Other Fees"),
+    totalAmazonFees: noteNumber(row.notes, "Total Amazon Fees"),
+    gstOnAmazonFees: toNumber(row.tax_estimate),
+    grossProfit: noteValue(row.notes, "Gross Profit") !== null ? noteNumber(row.notes, "Gross Profit") : null,
+    netProfit,
+    profitMarginPercent: noteValue(row.notes, "Profit Margin Percent") !== null ? noteNumber(row.notes, "Profit Margin Percent") : null,
+    referralFeePercent: noteValue(row.notes, "Referral Fee Percent") !== null ? noteNumber(row.notes, "Referral Fee Percent") : null,
+    referralFeeSource,
+    feeRulesVersion: noteValue(row.notes, "Fee Rules Version") ?? FEE_RULES_VERSION,
     amazonFeeEstimate: toNumber(row.amazon_fee_estimate),
     shippingFeeEstimate: toNumber(row.shipping_fee_estimate),
     taxEstimate: toNumber(row.tax_estimate),
@@ -191,12 +372,18 @@ export function toSafeProductEconomicsRow(row: ProductEconomicsRow): SafeProduct
     targetProfit: toNumber(row.target_profit),
     targetProfitRule: row.target_profit_rule,
     nonAdCost: toNumber(row.non_ad_cost),
-    maxAllowableAdSpend: hasMissingCostData(row) ? null : toNumber(row.max_allowable_ad_spend),
-    breakEvenAcos: hasMissingCostData(row) ? null : toNumber(row.break_even_acos),
-    targetAcos: hasMissingCostData(row) ? null : toNumber(row.target_acos),
-    profitStatus: hasMissingCostData(row) ? "NEEDS_COST_DATA" : row.profit_status,
-    profitDataStatus: hasMissingCostData(row) ? "MISSING_COST_DATA" : "AVAILABLE",
-    reason: hasMissingCostData(row) ? getProfitReason("NEEDS_COST_DATA") : getProfitReason(row.profit_status),
+    maxAllowableAdSpend: hasMissingCostData(row) || incompleteFeeData ? null : toNumber(row.max_allowable_ad_spend),
+    breakEvenAcos: hasMissingCostData(row) || incompleteFeeData ? null : toNumber(row.break_even_acos),
+    targetAcos: hasMissingCostData(row) || incompleteFeeData ? null : toNumber(row.target_acos),
+    profitStatus: incompleteFeeData ? "NEEDS_INPUT" : hasMissingCostData(row) ? "NEEDS_COST_DATA" : row.profit_status,
+    profitDataStatus: incompleteFeeData ? "INCOMPLETE" : hasMissingCostData(row) ? "MISSING_COST_DATA" : "AVAILABLE",
+    reason: incompleteFeeData
+      ? referralFeeSource === "MISSING_SUBCATEGORY"
+        ? "Subcategory is missing, so referral fee cannot be calculated."
+        : "Subcategory does not match the referral fee table, so referral fee cannot be calculated."
+      : hasMissingCostData(row)
+        ? getProfitReason("NEEDS_COST_DATA")
+        : getProfitReason(row.profit_status),
     notes: row.notes,
     createdAt: row.created_at,
     updatedAt: row.updated_at
@@ -230,16 +417,16 @@ export async function saveProductEconomics(input: ProductEconomicsInput): Promis
     selling_price: roundTwo(input.sellingPrice),
     landed_cost: roundTwo(input.landedCost),
     packaging_cost: roundTwo(input.packagingCost),
-    amazon_fee_estimate: roundTwo(input.amazonFeeEstimate),
-    shipping_fee_estimate: roundTwo(input.shippingFeeEstimate),
-    tax_estimate: roundTwo(input.taxEstimate),
+    amazon_fee_estimate: calculation.referralFee,
+    shipping_fee_estimate: calculation.shippingFee,
+    tax_estimate: calculation.gstOnAmazonFees,
     return_rate_percent: roundTwo(input.returnRatePercent),
     return_cost_per_return: roundTwo(input.returnCostPerReturn),
     return_reserve_per_unit: calculation.returnReservePerUnit,
     influencer_cost_allocation_per_unit: roundTwo(input.influencerCostAllocationPerUnit),
     social_marketing_cost_per_unit: roundTwo(input.socialMarketingCostPerUnit),
     coupon_discount_estimate: roundTwo(input.couponDiscountEstimate),
-    other_cost_per_unit: roundTwo(input.otherCostPerUnit),
+    other_cost_per_unit: roundTwo(calculation.closingFee + calculation.pickAndPackFee + calculation.storageFee + calculation.otherFees),
     target_profit: calculation.targetProfit,
     target_profit_rule: calculation.targetProfitRule,
     non_ad_cost: calculation.nonAdCost,
@@ -247,7 +434,7 @@ export async function saveProductEconomics(input: ProductEconomicsInput): Promis
     break_even_acos: calculation.breakEvenAcos,
     target_acos: calculation.targetAcos,
     profit_status: calculation.profitStatus,
-    notes: cleanText(input.notes),
+    notes: buildCalculationNotes(input, calculation),
     updated_at: now
   };
 
@@ -415,7 +602,9 @@ export async function getCostCompletionQueue(sellerIdInput: string): Promise<Cos
     const productType = noteValue(notes, "Product Type") ?? cleanText(passport?.product_type) ?? cleanText(input.listingProductType);
     const weightKg = toNumber(noteValue(notes, "Weight kg")) || parseWeightKg(passport?.weight);
     const missingFields: string[] = [];
+    const hasSubcategoryMatch = Boolean(subcategory && referralFeeRules[normalizeCategory(subcategory) ?? ""]);
 
+    if (!subcategory || !hasSubcategoryMatch) missingFields.push("subcategory");
     if (!existingEconomics || productCost <= 0) missingFields.push("productCost");
     if (!existingEconomics || requiredProfit <= 0) missingFields.push("requiredProfit");
     if (!fulfillmentType) missingFields.push("fulfillmentType");
@@ -425,7 +614,10 @@ export async function getCostCompletionQueue(sellerIdInput: string): Promise<Cos
     let costStatus: CostCompletionStatus = "INCOMPLETE";
     let nextActionLabel = "Complete missing inputs";
 
-    if (!existingEconomics || productCost <= 0) {
+    if (!subcategory || !hasSubcategoryMatch || existingEconomics?.profitStatus === "NEEDS_INPUT") {
+      costStatus = "INCOMPLETE";
+      nextActionLabel = "Select subcategory";
+    } else if (!existingEconomics || productCost <= 0) {
       costStatus = "MISSING_COST_DATA";
       nextActionLabel = "Add buying cost";
     } else if (weightKg <= 0) {
