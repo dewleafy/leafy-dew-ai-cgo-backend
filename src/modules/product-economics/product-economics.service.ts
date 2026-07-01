@@ -2,6 +2,8 @@ import { supabase } from "../../db/supabase";
 import { env } from "../../config/env";
 import { logger } from "../../utils/logger";
 import {
+  CostCompletionQueueRow,
+  CostCompletionStatus,
   ProductEconomicsCalculation,
   ProductEconomicsExplanation,
   ProductEconomicsInput,
@@ -9,6 +11,8 @@ import {
   ProductProfitStatus,
   SafeProductEconomicsRow
 } from "./product-economics.types";
+import { AmazonSpListingRow } from "../amazon-sp/amazon-sp.types";
+import { ProductPassportRow } from "../product-passports/product-passports.types";
 
 function toNumber(value: unknown): number {
   const numeric = Number(value ?? 0);
@@ -22,6 +26,22 @@ function roundTwo(value: number): number {
 function cleanText(value: string | null | undefined): string | null {
   const trimmed = value?.trim();
   return trimmed ? trimmed : null;
+}
+
+function normalizeKey(value: string | null | undefined): string | null {
+  const cleaned = cleanText(value);
+  return cleaned ? cleaned.toLowerCase() : null;
+}
+
+function noteValue(notes: string | null | undefined, label: string): string | null {
+  if (!notes) return null;
+  const match = notes.match(new RegExp(`^${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*:\\s*(.+)$`, "im"));
+  return cleanText(match?.[1]);
+}
+
+function parseWeightKg(weight: string | null | undefined): number {
+  const match = weight?.match(/(\d+(?:\.\d+)?)/);
+  return match ? toNumber(match[1]) : 0;
 }
 
 function sanitizeErrorMessage(message: string): string {
@@ -306,4 +326,187 @@ export async function getProductEconomicsById(id: string): Promise<SafeProductEc
   }
 
   return data ? toSafeProductEconomicsRow(data) : null;
+}
+
+export async function getCostCompletionQueue(sellerIdInput: string): Promise<CostCompletionQueueRow[]> {
+  const sellerId = cleanText(sellerIdInput) ?? "default";
+
+  const [listingsResult, passportsResult, economicsResult] = await Promise.all([
+    supabase
+      .from("amazon_sp_listings")
+      .select("*")
+      .eq("seller_id", sellerId)
+      .order("last_synced_at", { ascending: false })
+      .limit(500),
+    supabase
+      .from("product_passports")
+      .select("*")
+      .eq("seller_id", sellerId)
+      .neq("status", "ARCHIVED")
+      .limit(500),
+    supabase
+      .from("amazon_product_economics")
+      .select("*")
+      .eq("seller_id", sellerId)
+      .order("created_at", { ascending: false })
+      .limit(500)
+  ]);
+
+  if (listingsResult.error) {
+    logger.warn("Could not load Amazon listings for cost completion queue.", {
+      message: sanitizeErrorMessage(listingsResult.error.message)
+    });
+    throw new Error("Could not load cost completion queue from Supabase.");
+  }
+
+  if (passportsResult.error) {
+    logger.warn("Could not load product passports for cost completion queue.", {
+      message: sanitizeErrorMessage(passportsResult.error.message)
+    });
+    throw new Error("Could not load cost completion queue from Supabase.");
+  }
+
+  if (economicsResult.error) {
+    logger.warn("Could not load product economics for cost completion queue.", {
+      message: sanitizeErrorMessage(economicsResult.error.message)
+    });
+    throw new Error("Could not load cost completion queue from Supabase.");
+  }
+
+  const passports = (passportsResult.data ?? []) as ProductPassportRow[];
+  const economicsRows = (economicsResult.data ?? []) as ProductEconomicsRow[];
+  const safeEconomicsRows = economicsRows.map(toSafeProductEconomicsRow);
+  const passportBySku = new Map(passports.map((row) => [normalizeKey(row.sku), row]).filter((entry): entry is [string, ProductPassportRow] => Boolean(entry[0])));
+  const passportByAsin = new Map(passports.map((row) => [normalizeKey(row.asin), row]).filter((entry): entry is [string, ProductPassportRow] => Boolean(entry[0])));
+  const economicsBySku = new Map(safeEconomicsRows.map((row) => [normalizeKey(row.sku), row]).filter((entry): entry is [string, SafeProductEconomicsRow] => Boolean(entry[0])));
+  const economicsByAsin = new Map(safeEconomicsRows.map((row) => [normalizeKey(row.asin), row]).filter((entry): entry is [string, SafeProductEconomicsRow] => Boolean(entry[0])));
+  const queue = new Map<string, CostCompletionQueueRow>();
+
+  function buildQueueRow(input: {
+    sku: string | null;
+    asin: string | null;
+    productName: string | null;
+    listingPrice?: unknown;
+    listingProductType?: string | null;
+    listingFulfillmentType?: string | null;
+  }): CostCompletionQueueRow | null {
+    const skuKey = normalizeKey(input.sku);
+    const asinKey = normalizeKey(input.asin);
+    const key = skuKey ? `sku:${skuKey}` : asinKey ? `asin:${asinKey}` : null;
+    if (!key) return null;
+
+    const passport = (skuKey ? passportBySku.get(skuKey) : undefined) ?? (asinKey ? passportByAsin.get(asinKey) : undefined) ?? null;
+    const existingEconomics = (skuKey ? economicsBySku.get(skuKey) : undefined) ?? (asinKey ? economicsByAsin.get(asinKey) : undefined) ?? null;
+    const notes = existingEconomics?.notes ?? null;
+    const noteSubcategory = noteValue(notes, "Subcategory");
+    const subcategory = cleanText(passport?.sub_category) ?? noteSubcategory ?? cleanText(input.listingProductType);
+    const subcategorySource: CostCompletionQueueRow["subcategorySource"] =
+      cleanText(passport?.sub_category)
+        ? "PRODUCT_PASSPORT"
+        : noteSubcategory
+          ? "ECONOMICS_NOTES"
+          : cleanText(input.listingProductType)
+            ? "AMAZON_LISTING"
+            : "MISSING";
+    const sellingPrice = existingEconomics?.sellingPrice || toNumber(passport?.selling_price) || toNumber(input.listingPrice) || null;
+    const productCost = existingEconomics?.buyingCost ?? 0;
+    const requiredProfit = existingEconomics?.requiredProfit ?? 0;
+    const fulfillmentType = noteValue(notes, "Fulfillment Type") ?? cleanText(input.listingFulfillmentType);
+    const productType = noteValue(notes, "Product Type") ?? cleanText(passport?.product_type) ?? cleanText(input.listingProductType);
+    const weightKg = toNumber(noteValue(notes, "Weight kg")) || parseWeightKg(passport?.weight);
+    const missingFields: string[] = [];
+
+    if (!existingEconomics || productCost <= 0) missingFields.push("productCost");
+    if (!existingEconomics || requiredProfit <= 0) missingFields.push("requiredProfit");
+    if (!fulfillmentType) missingFields.push("fulfillmentType");
+    if (!productType) missingFields.push("productType");
+    if (weightKg <= 0) missingFields.push("weightKg");
+
+    let costStatus: CostCompletionStatus = "INCOMPLETE";
+    let nextActionLabel = "Complete missing inputs";
+
+    if (!existingEconomics || productCost <= 0) {
+      costStatus = "MISSING_COST_DATA";
+      nextActionLabel = "Add buying cost";
+    } else if (weightKg <= 0) {
+      costStatus = "INCOMPLETE";
+      nextActionLabel = "Add weight";
+    } else if (requiredProfit <= 0 || !fulfillmentType || !productType) {
+      costStatus = "INCOMPLETE";
+      nextActionLabel = requiredProfit <= 0 ? "Add required profit" : "Complete fee inputs";
+    } else if ((existingEconomics.maxAllowableAdSpend ?? 0) <= 0 || existingEconomics.profitStatus === "BLOCKED") {
+      costStatus = "BLOCKED";
+      nextActionLabel = "Blocked: no ad spend room";
+    } else if (existingEconomics.profitStatus === "PASS") {
+      costStatus = "COMPLETE";
+      nextActionLabel = "Ready for profit-safe PPC";
+    }
+
+    return {
+      sku: cleanText(input.sku),
+      asin: cleanText(input.asin),
+      productName: cleanText(input.productName) ?? existingEconomics?.productName ?? passport?.product_name ?? null,
+      subcategory,
+      subCategory: subcategory,
+      subcategorySource,
+      sellingPrice,
+      costStatus,
+      profitStatus: existingEconomics?.profitStatus ?? null,
+      profitDataStatus: existingEconomics?.profitDataStatus ?? (costStatus === "INCOMPLETE" ? "INCOMPLETE" : null),
+      missingFields,
+      targetAcos: existingEconomics?.targetAcos ?? null,
+      breakEvenAcos: existingEconomics?.breakEvenAcos ?? null,
+      existingEconomics,
+      nextActionLabel
+    };
+  }
+
+  ((listingsResult.data ?? []) as AmazonSpListingRow[]).forEach((listing) => {
+    const row = buildQueueRow({
+      sku: listing.sku,
+      asin: listing.asin,
+      productName: listing.product_name,
+      listingPrice: listing.price,
+      listingProductType: listing.product_type,
+      listingFulfillmentType: listing.fulfillment_channel
+    });
+
+    if (row) queue.set(normalizeKey(row.sku) ? `sku:${normalizeKey(row.sku)}` : `asin:${normalizeKey(row.asin)}`, row);
+  });
+
+  passports.forEach((passport) => {
+    const key = normalizeKey(passport.sku) ? `sku:${normalizeKey(passport.sku)}` : normalizeKey(passport.asin) ? `asin:${normalizeKey(passport.asin)}` : null;
+    if (!key || queue.has(key)) return;
+    const row = buildQueueRow({
+      sku: passport.sku,
+      asin: passport.asin,
+      productName: passport.product_name,
+      listingPrice: passport.selling_price,
+      listingProductType: passport.product_type
+    });
+    if (row) queue.set(key, row);
+  });
+
+  safeEconomicsRows.forEach((economics) => {
+    const key = normalizeKey(economics.sku) ? `sku:${normalizeKey(economics.sku)}` : normalizeKey(economics.asin) ? `asin:${normalizeKey(economics.asin)}` : null;
+    if (!key || queue.has(key)) return;
+    const row = buildQueueRow({
+      sku: economics.sku,
+      asin: economics.asin,
+      productName: economics.productName,
+      listingPrice: economics.sellingPrice
+    });
+    if (row) queue.set(key, row);
+  });
+
+  return Array.from(queue.values()).sort((a, b) => {
+    const statusOrder: Record<CostCompletionStatus, number> = {
+      MISSING_COST_DATA: 0,
+      INCOMPLETE: 1,
+      BLOCKED: 2,
+      COMPLETE: 3
+    };
+
+    return statusOrder[a.costStatus] - statusOrder[b.costStatus] || (a.productName ?? a.sku ?? "").localeCompare(b.productName ?? b.sku ?? "");
+  });
 }

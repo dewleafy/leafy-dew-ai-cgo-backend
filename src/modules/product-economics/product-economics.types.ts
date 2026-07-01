@@ -1,4 +1,5 @@
 export type ProductProfitStatus = "PASS" | "RISK" | "FAIL" | "UNKNOWN" | "NEEDS_COST_DATA" | "BLOCKED";
+export type CostCompletionStatus = "MISSING_COST_DATA" | "INCOMPLETE" | "COMPLETE" | "BLOCKED";
 
 export type ProductEconomicsInput = {
   sellerId: string;
@@ -7,10 +8,11 @@ export type ProductEconomicsInput = {
   sku?: string | null;
   productName?: string | null;
   subCategory?: string | null;
+  subcategoryOverride?: string | null;
   fulfillmentType?: string | null;
   productType?: string | null;
   shippingRegion?: string | null;
-  categoryException?: string | null;
+  categoryException?: boolean | null;
   weightKg?: number | null;
   volumeCuFt?: number | null;
   sellingPrice: number;
@@ -126,4 +128,22 @@ export type SafeProductEconomicsRow = {
   notes: string | null;
   createdAt: string | null;
   updatedAt: string | null;
+};
+
+export type CostCompletionQueueRow = {
+  sku: string | null;
+  asin: string | null;
+  productName: string | null;
+  subcategory: string | null;
+  subCategory: string | null;
+  subcategorySource: "PRODUCT_PASSPORT" | "AMAZON_LISTING" | "ECONOMICS_NOTES" | "MISSING";
+  sellingPrice: number | null;
+  costStatus: CostCompletionStatus;
+  profitStatus: ProductProfitStatus | null;
+  profitDataStatus: SafeProductEconomicsRow["profitDataStatus"] | "INCOMPLETE" | null;
+  missingFields: string[];
+  targetAcos: number | null;
+  breakEvenAcos: number | null;
+  existingEconomics: SafeProductEconomicsRow | null;
+  nextActionLabel: string;
 };

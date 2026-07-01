@@ -2,6 +2,7 @@ import { Request, Response } from "express";
 import { z } from "zod";
 import {
   buildProductEconomicsExplanation,
+  getCostCompletionQueue,
   getProductEconomicsById,
   listProductEconomics,
   saveProductEconomics
@@ -16,6 +17,23 @@ const nullableTextSchema = z
     return trimmed ? trimmed : null;
   });
 
+const shippingRegionSchema = z
+  .preprocess((value) => value ?? "National", z.string())
+  .transform((value) => {
+    const trimmed = value.trim();
+    return trimmed ? trimmed : "National";
+  });
+
+const categoryExceptionSchema = z.preprocess((value) => {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["yes", "y", "true"].includes(normalized)) return true;
+    if (["no", "n", "false", ""].includes(normalized)) return false;
+  }
+  return value;
+}, z.boolean().default(false));
+
 const productEconomicsBodySchema = z.object({
   sellerId: z.string().trim().min(1).default("default"),
   marketplaceId: nullableTextSchema,
@@ -23,10 +41,11 @@ const productEconomicsBodySchema = z.object({
   sku: z.string().trim().min(1, "SKU is required."),
   productName: nullableTextSchema,
   subCategory: nullableTextSchema,
+  subcategoryOverride: nullableTextSchema,
   fulfillmentType: nullableTextSchema,
   productType: nullableTextSchema,
-  shippingRegion: nullableTextSchema,
-  categoryException: nullableTextSchema,
+  shippingRegion: shippingRegionSchema.default("National"),
+  categoryException: categoryExceptionSchema,
   weightKg: z.coerce.number().min(0).optional(),
   volumeCuFt: z.coerce.number().min(0).optional(),
   sellingPrice: z.coerce.number().min(0, "sellingPrice must be 0 or higher."),
@@ -78,6 +97,16 @@ function toFounderEconomics(row: Awaited<ReturnType<typeof saveProductEconomics>
     shippingCost: row.shippingCost,
     referralFee: row.referralFee,
     closingFee: row.closingFee,
+    shippingFee: row.shippingCost,
+    pickAndPackFee: 0,
+    storageFee: 0,
+    otherFees: row.otherCostPerUnit,
+    totalAmazonFees: row.referralFee + row.shippingCost + row.closingFee,
+    gstOnAmazonFees: row.taxEstimate,
+    grossProfit: row.sellingPrice - row.buyingCost,
+    netProfit: row.sellingPrice - row.nonAdCost,
+    profitMarginPercent: row.sellingPrice > 0 ? Math.round(((row.sellingPrice - row.nonAdCost) / row.sellingPrice) * 10000) / 100 : null,
+    referralFeePercent: row.sellingPrice > 0 ? Math.round((row.referralFee / row.sellingPrice) * 10000) / 100 : null,
     requiredProfit: row.requiredProfit,
     nonAdCost: row.nonAdCost,
     maxAllowableAdSpend: row.maxAllowableAdSpend,
@@ -85,8 +114,24 @@ function toFounderEconomics(row: Awaited<ReturnType<typeof saveProductEconomics>
     breakEvenAcos: row.breakEvenAcos,
     profitStatus: row.profitStatus,
     profitDataStatus: row.profitDataStatus,
+    feeRulesVersion: "legacy_product_economics_v1",
     reason: row.reason
   };
+}
+
+function buildContextNotes(body: z.infer<typeof productEconomicsBodySchema>): string | null {
+  const lines = [
+    body.notes,
+    `Shipping Region: ${body.shippingRegion}`,
+    `Category Exception: ${body.categoryException ? "Yes" : "No"}`,
+    body.fulfillmentType ? `Fulfillment Type: ${body.fulfillmentType}` : "",
+    body.productType ? `Product Type: ${body.productType}` : "",
+    (body.subcategoryOverride ?? body.subCategory) ? `Subcategory: ${body.subcategoryOverride ?? body.subCategory}` : "",
+    body.weightKg !== undefined ? `Weight kg: ${body.weightKg}` : "",
+    body.volumeCuFt !== undefined ? `Volume cu ft: ${body.volumeCuFt}` : ""
+  ].filter(Boolean);
+
+  return lines.length ? lines.join("\n") : null;
 }
 
 export async function postProductEconomics(req: Request, res: Response): Promise<void> {
@@ -108,11 +153,13 @@ export async function postProductEconomics(req: Request, res: Response): Promise
     const body = parsed.data;
     const row = await saveProductEconomics({
       ...body,
+      subCategory: body.subcategoryOverride ?? body.subCategory,
       landedCost: body.productCost ?? body.buyingCost ?? body.landedCost,
       shippingFeeEstimate: body.shippingCost ?? body.shippingFeeEstimate,
       amazonFeeEstimate: body.referralFee ?? body.amazonFeeEstimate,
       otherCostPerUnit: body.otherFees ?? body.closingFee ?? body.otherCostPerUnit,
-      targetProfit: body.requiredProfit ?? body.targetProfit
+      targetProfit: body.requiredProfit ?? body.targetProfit,
+      notes: buildContextNotes(body)
     });
     const explanation = buildProductEconomicsExplanation(row);
 
@@ -124,6 +171,23 @@ export async function postProductEconomics(req: Request, res: Response): Promise
     });
   } catch {
     sendProductEconomicsError(res, "Could not save product economics in Supabase.");
+  }
+}
+
+export async function getProductEconomicsCostCompletionQueue(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+
+  try {
+    const rows = await getCostCompletionQueue(sellerId);
+
+    res.json({
+      ok: true,
+      sellerId,
+      count: rows.length,
+      rows
+    });
+  } catch {
+    sendProductEconomicsError(res, "Could not load cost completion queue from Supabase.");
   }
 }
 
