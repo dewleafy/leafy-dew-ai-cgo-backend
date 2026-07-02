@@ -2,6 +2,7 @@ import express, { NextFunction, Request, Response } from "express";
 import { ZodError } from "zod";
 import { env } from "./config/env";
 import { supabase } from "./db/supabase";
+import { actionLedgerRoutes } from "./modules/action-ledger/action-ledger.routes";
 import { activityLogRoutes } from "./modules/activity-logs/activity-logs.routes";
 import { amazonAdsRouter } from "./modules/amazon-ads/amazon-ads.routes";
 import { amazonSpRouter } from "./modules/amazon-sp/amazon-sp.routes";
@@ -156,6 +157,7 @@ app.get("/api/system/db-health", async (_req: Request, res: Response) => {
 app.use("/api/amazon", amazonRouter);
 app.use("/api/amazon-ads", amazonAdsRouter);
 app.use("/api/amazon-sp", amazonSpRouter);
+app.use("/api/action-ledger", actionLedgerRoutes);
 app.use("/api/activity-logs", activityLogRoutes);
 app.use("/api/automation-settings", automationSettingsRoutes);
 app.use("/api/brand-readiness", brandReadinessRoutes);
