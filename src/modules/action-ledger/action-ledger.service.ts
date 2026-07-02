@@ -99,6 +99,10 @@ function cleanText(value: string | null | undefined): string | null {
   return trimmed ? trimmed : null;
 }
 
+function normalizeActionLedgerId(id: unknown): string {
+  return String(id || "").trim().replace(/^"+|"+$/g, "");
+}
+
 function toNumberOrNull(value: unknown): number | null {
   if (value === null || value === undefined || value === "") return null;
   const numeric = Number(value);
@@ -283,10 +287,12 @@ export async function listActionLedgerRows(input: {
 }
 
 export async function getActionLedgerRowById(id: string): Promise<SafeActionLedgerRow | null> {
+  const cleanId = normalizeActionLedgerId(id);
+
   const { data, error } = await supabase
     .from("action_ledger")
     .select("*")
-    .eq("id", id)
+    .eq("id", cleanId)
     .maybeSingle<ActionLedgerRow>();
 
   if (error) {
@@ -319,6 +325,7 @@ export async function updateActionLedgerApprovalState(input: {
   note?: string | null;
   approvedBy?: string | null;
 }): Promise<SafeActionLedgerRow | null> {
+  const cleanId = normalizeActionLedgerId(input.id);
   const now = new Date().toISOString();
   const updateRow: Record<string, unknown> = {
     approval_status: input.approvalStatus,
@@ -339,7 +346,7 @@ export async function updateActionLedgerApprovalState(input: {
   const { data, error } = await supabase
     .from("action_ledger")
     .update(updateRow)
-    .eq("id", input.id)
+    .eq("id", cleanId)
     .select("*")
     .single<ActionLedgerRow>();
 

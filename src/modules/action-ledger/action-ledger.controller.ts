@@ -107,6 +107,26 @@ const noteSchema = z.object({
   approvedBy: nullableTextSchema
 });
 
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function normalizeActionLedgerId(id: unknown): string {
+  return String(id || "").trim().replace(/^"+|"+$/g, "");
+}
+
+function getValidActionLedgerId(req: Request, res: Response): string | null {
+  const cleanId = normalizeActionLedgerId(req.params.id);
+
+  if (!uuidPattern.test(cleanId)) {
+    res.status(400).json({
+      ok: false,
+      message: "Invalid action ledger id."
+    });
+    return null;
+  }
+
+  return cleanId;
+}
+
 function getSellerIdFromQuery(req: Request): string {
   return typeof req.query.sellerId === "string" && req.query.sellerId.trim()
     ? req.query.sellerId.trim()
@@ -205,8 +225,11 @@ export async function getActionLedgerSummaryRoute(req: Request, res: Response): 
 }
 
 export async function getActionLedgerRow(req: Request, res: Response): Promise<void> {
+  const cleanId = getValidActionLedgerId(req, res);
+  if (!cleanId) return;
+
   try {
-    const row = await getActionLedgerRowById(req.params.id);
+    const row = await getActionLedgerRowById(cleanId);
 
     if (!row) {
       res.status(404).json({ ok: false, message: "Action ledger row not found." });
@@ -242,6 +265,9 @@ async function updateState(
   state: ActionLedgerState,
   message: string
 ): Promise<void> {
+  const cleanId = getValidActionLedgerId(req, res);
+  if (!cleanId) return;
+
   const parsed = noteSchema.safeParse(req.body ?? {});
 
   if (!parsed.success) {
@@ -251,7 +277,7 @@ async function updateState(
 
   try {
     const row = await updateActionLedgerApprovalState({
-      id: req.params.id,
+      id: cleanId,
       approvalStatus,
       state,
       note: parsed.data.note,
