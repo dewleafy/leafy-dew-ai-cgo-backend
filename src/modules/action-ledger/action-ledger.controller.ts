@@ -237,7 +237,11 @@ export async function getActionLedgerRow(req: Request, res: Response): Promise<v
     const row = await getActionLedgerRowById(cleanId);
 
     if (!row) {
-      res.status(404).json({ ok: false, message: "Action ledger row not found." });
+      res.status(404).json({
+        ok: false,
+        message: "Action ledger row not found.",
+        idUsed: cleanId
+      });
       return;
     }
 
@@ -290,7 +294,11 @@ async function updateState(
     });
 
     if (!row) {
-      res.status(404).json({ ok: false, message: "Action ledger row not found." });
+      res.status(404).json({
+        ok: false,
+        message: "Action ledger row not found.",
+        idUsed: cleanId
+      });
       return;
     }
 

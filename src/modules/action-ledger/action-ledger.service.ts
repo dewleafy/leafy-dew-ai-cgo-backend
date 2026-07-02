@@ -99,8 +99,18 @@ function cleanText(value: string | null | undefined): string | null {
   return trimmed ? trimmed : null;
 }
 
-function normalizeActionLedgerId(id: unknown): string {
-  return String(id || "").trim().replace(/^"+|"+$/g, "");
+function normalizeLedgerId(input: unknown): string {
+  const raw =
+    typeof input === "string"
+      ? input
+      : typeof input === "object" && input !== null && "id" in input
+        ? String((input as { id?: unknown }).id || "")
+        : "";
+
+  return raw
+    .trim()
+    .replace(/^"+|"+$/g, "")
+    .replace(/^'+|'+$/g, "");
 }
 
 function toNumberOrNull(value: unknown): number | null {
@@ -286,8 +296,8 @@ export async function listActionLedgerRows(input: {
   return ((data ?? []) as ActionLedgerRow[]).map(toSafeActionLedgerRow);
 }
 
-export async function getActionLedgerRowById(id: string): Promise<SafeActionLedgerRow | null> {
-  const cleanId = normalizeActionLedgerId(id);
+export async function getActionLedgerRowById(input: unknown): Promise<SafeActionLedgerRow | null> {
+  const cleanId = normalizeLedgerId(input);
 
   const { data, error } = await supabase
     .from("action_ledger")
@@ -325,7 +335,7 @@ export async function updateActionLedgerApprovalState(input: {
   note?: string | null;
   approvedBy?: string | null;
 }): Promise<SafeActionLedgerRow | null> {
-  const cleanId = normalizeActionLedgerId(input.id);
+  const cleanId = normalizeLedgerId(input.id);
   const now = new Date().toISOString();
   const updateRow: Record<string, unknown> = {
     approval_status: input.approvalStatus,
@@ -348,7 +358,7 @@ export async function updateActionLedgerApprovalState(input: {
     .update(updateRow)
     .eq("id", cleanId)
     .select("*")
-    .single<ActionLedgerRow>();
+    .maybeSingle<ActionLedgerRow>();
 
   if (error || !data) {
     if (error?.code === "PGRST116") {
@@ -360,7 +370,7 @@ export async function updateActionLedgerApprovalState(input: {
       throw new ActionLedgerUpdateError(sanitizeErrorMessage(error.message));
     }
 
-    throw new ActionLedgerUpdateError("No row returned from Supabase.");
+    return null;
   }
 
   return toSafeActionLedgerRow(data);
