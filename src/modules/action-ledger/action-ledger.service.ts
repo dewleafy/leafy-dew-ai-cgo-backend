@@ -105,10 +105,6 @@ function canonicalizeActionId(input: unknown): string {
     .replace(/[\u200B-\u200D\uFEFF]/g, "");
 }
 
-function sameActionId(a: unknown, b: unknown): boolean {
-  return canonicalizeActionId(a).toLowerCase() === canonicalizeActionId(b).toLowerCase();
-}
-
 function toNumberOrNull(value: unknown): number | null {
   if (value === null || value === undefined || value === "") return null;
   const numeric = Number(value);
@@ -296,54 +292,29 @@ export async function listActionLedgerRows(input: {
   return ((data ?? []) as ActionLedgerRow[]).map(toSafeActionLedgerRow);
 }
 
-async function resolveActionLedgerRowById(id: unknown): Promise<{ row: ActionLedgerRow | null; idUsed: string }> {
+export async function getActionLedgerById(id: unknown): Promise<SafeActionLedgerRow | null> {
   const cleanId = canonicalizeActionId(id);
 
   if (!cleanId) {
-    return { row: null, idUsed: cleanId };
+    return null;
   }
 
-  const direct = await supabase
-    .from("action_ledger")
-    .select("*")
-    .eq("id", cleanId)
-    .maybeSingle();
+  const { data, error } = await supabase.rpc(
+    "get_action_ledger_by_id_text",
+    { p_id: cleanId }
+  );
 
-  if (direct.error) {
-    console.warn("Direct action ledger id lookup failed.", {
+  if (error) {
+    console.warn("Could not load action ledger row by RPC.", {
       id: cleanId,
-      message: direct.error.message,
-      code: direct.error.code
+      message: error.message,
+      code: error.code
     });
+    throw new Error(error.message);
   }
 
-  if (direct.data) {
-    return { row: direct.data as ActionLedgerRow, idUsed: cleanId };
-  }
-
-  const fallback = await supabase
-    .from("action_ledger")
-    .select("*")
-    .order("created_at", { ascending: false })
-    .limit(500);
-
-  if (fallback.error) {
-    console.warn("Fallback action ledger lookup failed.", {
-      id: cleanId,
-      message: fallback.error.message,
-      code: fallback.error.code
-    });
-    throw new Error(fallback.error.message);
-  }
-
-  const row = ((fallback.data ?? []) as ActionLedgerRow[]).find((item) => sameActionId(item.id, cleanId)) ?? null;
-
-  return { row, idUsed: cleanId };
-}
-
-export async function getActionLedgerById(id: unknown): Promise<SafeActionLedgerRow | null> {
-  const { row } = await resolveActionLedgerRowById(id);
-  return row ? mapActionLedgerRow(row) : null;
+  const row = Array.isArray(data) ? data[0] : data;
+  return row ? mapActionLedgerRow(row as ActionLedgerRow) : null;
 }
 
 export const getActionLedgerRowById = getActionLedgerById;
@@ -370,47 +341,34 @@ export async function updateActionLedgerApprovalState(input: {
   note?: string | null;
   approvedBy?: string | null;
 }): Promise<SafeActionLedgerRow | null> {
-  const { row } = await resolveActionLedgerRowById(input.id);
+  const cleanId = canonicalizeActionId(input.id);
 
-  if (!row) {
+  if (!cleanId) {
     return null;
   }
 
-  const canonicalDbId = row.id;
-  const now = new Date().toISOString();
-  const patch: Record<string, unknown> = {
-    approval_status: input.approvalStatus,
-    state: input.state,
-    approval_note: input.note || null,
-    updated_at: now
-  };
-
-  if (input.approvalStatus === "APPROVED") {
-    patch.approved_at = now;
-    patch.approved_by = input.approvedBy || "founder";
-  }
-
-  if (input.approvalStatus === "REJECTED") {
-    patch.rejected_at = now;
-  }
-
-  const { data, error } = await supabase
-    .from("action_ledger")
-    .update(patch)
-    .eq("id", canonicalDbId)
-    .select("*")
-    .maybeSingle();
+  const { data, error } = await supabase.rpc(
+    "update_action_ledger_state_by_id_text",
+    {
+      p_id: cleanId,
+      p_approval_status: input.approvalStatus,
+      p_state: input.state,
+      p_note: input.note || null,
+      p_approved_by: input.approvedBy || "founder"
+    }
+  );
 
   if (error) {
-    console.warn("Could not update action ledger row.", {
-      id: canonicalDbId,
+    console.warn("Could not update action ledger row by RPC.", {
+      id: cleanId,
       message: error.message,
       code: error.code
     });
     throw new Error(error.message);
   }
 
-  return data ? mapActionLedgerRow(data as ActionLedgerRow) : null;
+  const row = Array.isArray(data) ? data[0] : data;
+  return row ? mapActionLedgerRow(row as ActionLedgerRow) : null;
 }
 
 async function countRows(input: {
