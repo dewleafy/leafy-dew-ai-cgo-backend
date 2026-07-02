@@ -1,9 +1,8 @@
 import { Request, Response } from "express";
 import { z } from "zod";
 import {
-  ActionLedgerUpdateError,
   createActionLedgerRow,
-  getActionLedgerRowById,
+  getActionLedgerById,
   getActionLedgerSummary,
   isActionLedgerActionType,
   isActionLedgerApprovalStatus,
@@ -234,7 +233,7 @@ export async function getActionLedgerRow(req: Request, res: Response): Promise<v
   if (!cleanId) return;
 
   try {
-    const row = await getActionLedgerRowById(cleanId);
+    const row = await getActionLedgerById(cleanId);
 
     if (!row) {
       res.status(404).json({
@@ -307,16 +306,7 @@ async function updateState(
       message,
       row
     });
-  } catch (error) {
-    if (error instanceof ActionLedgerUpdateError) {
-      res.status(503).json({
-        ok: false,
-        message: "Could not update action ledger row in Supabase.",
-        detail: error.detail
-      });
-      return;
-    }
-
+  } catch {
     sendDatabaseError(res, "Could not update action ledger row in Supabase.");
   }
 }

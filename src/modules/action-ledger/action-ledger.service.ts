@@ -84,16 +84,6 @@ export const ACTION_LEDGER_APPROVAL_STATUSES: ActionLedgerApprovalStatus[] = [
   "EXPIRED"
 ];
 
-export class ActionLedgerUpdateError extends Error {
-  detail: string;
-
-  constructor(detail: string) {
-    super("Could not update action ledger row in Supabase.");
-    this.name = "ActionLedgerUpdateError";
-    this.detail = detail;
-  }
-}
-
 function cleanText(value: string | null | undefined): string | null {
   const trimmed = value?.trim();
   return trimmed ? trimmed : null;
@@ -223,6 +213,10 @@ export function toSafeActionLedgerRow(row: ActionLedgerRow): SafeActionLedgerRow
   };
 }
 
+export function mapActionLedgerRow(row: ActionLedgerRow): SafeActionLedgerRow {
+  return toSafeActionLedgerRow(row);
+}
+
 function defaultStateForInput(input: ActionLedgerInput): ActionLedgerState {
   if (input.state) return input.state;
   return input.requiresApproval === false ? "VALIDATED" : "WAITING_FOR_APPROVAL";
@@ -296,22 +290,32 @@ export async function listActionLedgerRows(input: {
   return ((data ?? []) as ActionLedgerRow[]).map(toSafeActionLedgerRow);
 }
 
-export async function getActionLedgerRowById(input: unknown): Promise<SafeActionLedgerRow | null> {
+export async function getActionLedgerById(input: string | { id: string }): Promise<SafeActionLedgerRow | null> {
   const cleanId = normalizeLedgerId(input);
+
+  if (!cleanId) {
+    return null;
+  }
 
   const { data, error } = await supabase
     .from("action_ledger")
     .select("*")
     .eq("id", cleanId)
-    .maybeSingle<ActionLedgerRow>();
+    .maybeSingle();
 
   if (error) {
-    logActionLedgerError("Could not load action ledger row.", error);
-    throw new Error("Could not load action ledger row from Supabase.");
+    console.warn("Could not load action ledger by id.", {
+      id: cleanId,
+      message: error.message,
+      code: error.code
+    });
+    throw new Error(error.message);
   }
 
-  return data ? toSafeActionLedgerRow(data) : null;
+  return data ? mapActionLedgerRow(data as ActionLedgerRow) : null;
 }
+
+export const getActionLedgerRowById = getActionLedgerById;
 
 export async function createActionLedgerRow(input: ActionLedgerInput): Promise<SafeActionLedgerRow> {
   const { data, error } = await supabase
@@ -336,44 +340,45 @@ export async function updateActionLedgerApprovalState(input: {
   approvedBy?: string | null;
 }): Promise<SafeActionLedgerRow | null> {
   const cleanId = normalizeLedgerId(input.id);
+
+  if (!cleanId) {
+    return null;
+  }
+
   const now = new Date().toISOString();
-  const updateRow: Record<string, unknown> = {
+  const patch: Record<string, unknown> = {
     approval_status: input.approvalStatus,
     state: input.state,
-    approval_note: cleanText(input.note) ?? null,
+    approval_note: input.note || null,
     updated_at: now
   };
 
   if (input.approvalStatus === "APPROVED") {
-    updateRow.approved_at = now;
-    updateRow.approved_by = cleanText(input.approvedBy) ?? "founder";
+    patch.approved_at = now;
+    patch.approved_by = input.approvedBy || "founder";
   }
 
   if (input.approvalStatus === "REJECTED") {
-    updateRow.rejected_at = now;
+    patch.rejected_at = now;
   }
 
   const { data, error } = await supabase
     .from("action_ledger")
-    .update(updateRow)
+    .update(patch)
     .eq("id", cleanId)
     .select("*")
-    .maybeSingle<ActionLedgerRow>();
+    .maybeSingle();
 
-  if (error || !data) {
-    if (error?.code === "PGRST116") {
-      return null;
-    }
-
-    if (error) {
-      logActionLedgerError("Could not update action ledger row.", error);
-      throw new ActionLedgerUpdateError(sanitizeErrorMessage(error.message));
-    }
-
-    return null;
+  if (error) {
+    console.warn("Could not update action ledger row.", {
+      id: cleanId,
+      message: error.message,
+      code: error.code
+    });
+    throw new Error(error.message);
   }
 
-  return toSafeActionLedgerRow(data);
+  return data ? mapActionLedgerRow(data as ActionLedgerRow) : null;
 }
 
 async function countRows(input: {
