@@ -107,19 +107,24 @@ const noteSchema = z.object({
   approvedBy: nullableTextSchema
 });
 
-const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function normalizeActionLedgerId(id: unknown): string {
-  return String(id || "").trim().replace(/^"+|"+$/g, "");
+  return String(id || "")
+    .trim()
+    .replace(/^"+|"+$/g, "")
+    .replace(/^'+|'+$/g, "");
 }
 
 function getValidActionLedgerId(req: Request, res: Response): string | null {
-  const cleanId = normalizeActionLedgerId(req.params.id);
+  const rawId = req.params.id || req.params.actionId || req.params.actionLedgerId || "";
+  const cleanId = normalizeActionLedgerId(rawId);
 
-  if (!uuidPattern.test(cleanId)) {
+  if (!uuidRegex.test(cleanId)) {
     res.status(400).json({
       ok: false,
-      message: "Invalid action ledger id."
+      message: "Invalid action ledger id.",
+      receivedParamKeys: Object.keys(req.params || {})
     });
     return null;
   }
