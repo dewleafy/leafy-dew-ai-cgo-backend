@@ -112,7 +112,9 @@ function normalizeActionLedgerId(id: unknown): string {
   return String(id || "")
     .trim()
     .replace(/^"+|"+$/g, "")
-    .replace(/^'+|'+$/g, "");
+    .replace(/^'+|'+$/g, "")
+    .replace(/[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/g, "-")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "");
 }
 
 function getValidActionLedgerId(req: Request, res: Response): string | null {

@@ -89,7 +89,7 @@ function cleanText(value: string | null | undefined): string | null {
   return trimmed ? trimmed : null;
 }
 
-function normalizeLedgerId(input: unknown): string {
+function canonicalizeActionId(input: unknown): string {
   const raw =
     typeof input === "string"
       ? input
@@ -100,7 +100,13 @@ function normalizeLedgerId(input: unknown): string {
   return raw
     .trim()
     .replace(/^"+|"+$/g, "")
-    .replace(/^'+|'+$/g, "");
+    .replace(/^'+|'+$/g, "")
+    .replace(/[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/g, "-")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "");
+}
+
+function sameActionId(a: unknown, b: unknown): boolean {
+  return canonicalizeActionId(a).toLowerCase() === canonicalizeActionId(b).toLowerCase();
 }
 
 function toNumberOrNull(value: unknown): number | null {
@@ -290,29 +296,54 @@ export async function listActionLedgerRows(input: {
   return ((data ?? []) as ActionLedgerRow[]).map(toSafeActionLedgerRow);
 }
 
-export async function getActionLedgerById(input: string | { id: string }): Promise<SafeActionLedgerRow | null> {
-  const cleanId = normalizeLedgerId(input);
+async function resolveActionLedgerRowById(id: unknown): Promise<{ row: ActionLedgerRow | null; idUsed: string }> {
+  const cleanId = canonicalizeActionId(id);
 
   if (!cleanId) {
-    return null;
+    return { row: null, idUsed: cleanId };
   }
 
-  const { data, error } = await supabase
+  const direct = await supabase
     .from("action_ledger")
     .select("*")
     .eq("id", cleanId)
     .maybeSingle();
 
-  if (error) {
-    console.warn("Could not load action ledger by id.", {
+  if (direct.error) {
+    console.warn("Direct action ledger id lookup failed.", {
       id: cleanId,
-      message: error.message,
-      code: error.code
+      message: direct.error.message,
+      code: direct.error.code
     });
-    throw new Error(error.message);
   }
 
-  return data ? mapActionLedgerRow(data as ActionLedgerRow) : null;
+  if (direct.data) {
+    return { row: direct.data as ActionLedgerRow, idUsed: cleanId };
+  }
+
+  const fallback = await supabase
+    .from("action_ledger")
+    .select("*")
+    .order("created_at", { ascending: false })
+    .limit(500);
+
+  if (fallback.error) {
+    console.warn("Fallback action ledger lookup failed.", {
+      id: cleanId,
+      message: fallback.error.message,
+      code: fallback.error.code
+    });
+    throw new Error(fallback.error.message);
+  }
+
+  const row = ((fallback.data ?? []) as ActionLedgerRow[]).find((item) => sameActionId(item.id, cleanId)) ?? null;
+
+  return { row, idUsed: cleanId };
+}
+
+export async function getActionLedgerById(id: unknown): Promise<SafeActionLedgerRow | null> {
+  const { row } = await resolveActionLedgerRowById(id);
+  return row ? mapActionLedgerRow(row) : null;
 }
 
 export const getActionLedgerRowById = getActionLedgerById;
@@ -339,12 +370,13 @@ export async function updateActionLedgerApprovalState(input: {
   note?: string | null;
   approvedBy?: string | null;
 }): Promise<SafeActionLedgerRow | null> {
-  const cleanId = normalizeLedgerId(input.id);
+  const { row } = await resolveActionLedgerRowById(input.id);
 
-  if (!cleanId) {
+  if (!row) {
     return null;
   }
 
+  const canonicalDbId = row.id;
   const now = new Date().toISOString();
   const patch: Record<string, unknown> = {
     approval_status: input.approvalStatus,
@@ -365,13 +397,13 @@ export async function updateActionLedgerApprovalState(input: {
   const { data, error } = await supabase
     .from("action_ledger")
     .update(patch)
-    .eq("id", cleanId)
+    .eq("id", canonicalDbId)
     .select("*")
     .maybeSingle();
 
   if (error) {
     console.warn("Could not update action ledger row.", {
-      id: cleanId,
+      id: canonicalDbId,
       message: error.message,
       code: error.code
     });
