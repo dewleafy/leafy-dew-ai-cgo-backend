@@ -84,6 +84,16 @@ export const ACTION_LEDGER_APPROVAL_STATUSES: ActionLedgerApprovalStatus[] = [
   "EXPIRED"
 ];
 
+export class ActionLedgerUpdateError extends Error {
+  detail: string;
+
+  constructor(detail: string) {
+    super("Could not update action ledger row in Supabase.");
+    this.name = "ActionLedgerUpdateError";
+    this.detail = detail;
+  }
+}
+
 function cleanText(value: string | null | undefined): string | null {
   const trimmed = value?.trim();
   return trimmed ? trimmed : null;
@@ -309,17 +319,11 @@ export async function updateActionLedgerApprovalState(input: {
   note?: string | null;
   approvedBy?: string | null;
 }): Promise<SafeActionLedgerRow | null> {
-  const existing = await getActionLedgerRowById(input.id);
-
-  if (!existing) {
-    return null;
-  }
-
   const now = new Date().toISOString();
   const updateRow: Record<string, unknown> = {
     approval_status: input.approvalStatus,
     state: input.state,
-    approval_note: cleanText(input.note),
+    approval_note: cleanText(input.note) ?? null,
     updated_at: now
   };
 
@@ -340,8 +344,16 @@ export async function updateActionLedgerApprovalState(input: {
     .single<ActionLedgerRow>();
 
   if (error || !data) {
-    if (error) logActionLedgerError("Could not update action ledger row.", error);
-    throw new Error("Could not update action ledger row in Supabase.");
+    if (error?.code === "PGRST116") {
+      return null;
+    }
+
+    if (error) {
+      logActionLedgerError("Could not update action ledger row.", error);
+      throw new ActionLedgerUpdateError(sanitizeErrorMessage(error.message));
+    }
+
+    throw new ActionLedgerUpdateError("No row returned from Supabase.");
   }
 
   return toSafeActionLedgerRow(data);

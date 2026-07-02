@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import { z } from "zod";
 import {
+  ActionLedgerUpdateError,
   createActionLedgerRow,
   getActionLedgerRowById,
   getActionLedgerSummary,
@@ -208,7 +209,7 @@ export async function getActionLedgerRow(req: Request, res: Response): Promise<v
     const row = await getActionLedgerRowById(req.params.id);
 
     if (!row) {
-      res.status(404).json({ ok: false, message: "Action ledger row was not found." });
+      res.status(404).json({ ok: false, message: "Action ledger row not found." });
       return;
     }
 
@@ -258,7 +259,7 @@ async function updateState(
     });
 
     if (!row) {
-      res.status(404).json({ ok: false, message: "Action ledger row was not found." });
+      res.status(404).json({ ok: false, message: "Action ledger row not found." });
       return;
     }
 
@@ -267,7 +268,16 @@ async function updateState(
       message,
       row
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof ActionLedgerUpdateError) {
+      res.status(503).json({
+        ok: false,
+        message: "Could not update action ledger row in Supabase.",
+        detail: error.detail
+      });
+      return;
+    }
+
     sendDatabaseError(res, "Could not update action ledger row in Supabase.");
   }
 }
