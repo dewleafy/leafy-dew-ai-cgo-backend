@@ -19,6 +19,7 @@ import {
 export const ACTION_LEDGER_SOURCES: ActionLedgerSource[] = [
   "CEO_REPORT",
   "PPC_RECOMMENDATION",
+  "PPC_RECOMMENDATIONS",
   "PRODUCT_ECONOMICS",
   "LISTING_AI",
   "A_PLUS_AI",
@@ -30,7 +31,15 @@ export const ACTION_LEDGER_SOURCES: ActionLedgerSource[] = [
 
 export const ACTION_LEDGER_ACTION_TYPES: ActionLedgerActionType[] = [
   "PPC_ACTION",
+  "ADD_EXACT_KEYWORD_AFTER_APPROVAL",
+  "ADD_PRODUCT_TARGET_AFTER_APPROVAL",
+  "CHECK_LISTING_BEFORE_NEGATIVE",
+  "PAUSE_OR_REDUCE_SPEND_AFTER_APPROVAL",
+  "PPC_GUARDRAIL_REVIEW",
   "PROFIT_BAND_APPROVAL",
+  "COST_DATA_REQUIRED",
+  "PROFIT_RISK_REVIEW",
+  "ACCOUNT_HEALTH_REVIEW",
   "LISTING_UPDATE",
   "IMAGE_UPDATE",
   "A_PLUS_UPDATE",
@@ -44,7 +53,9 @@ export const ACTION_LEDGER_ACTION_TYPES: ActionLedgerActionType[] = [
 export const ACTION_LEDGER_ENTITY_TYPES: ActionLedgerEntityType[] = [
   "SKU",
   "ASIN",
+  "KEYWORD",
   "CAMPAIGN",
+  "AD_GROUP",
   "SEARCH_TERM",
   "BRAND_STORE",
   "SOCIAL_CHANNEL",
@@ -334,6 +345,55 @@ export async function createActionLedgerRow(input: ActionLedgerInput): Promise<S
   return toSafeActionLedgerRow(data);
 }
 
+function applyNullableDedupeFilter<T extends { eq: (column: string, value: string) => T; is: (column: string, value: null) => T }>(
+  query: T,
+  column: string,
+  value: string | null | undefined
+): T {
+  const cleaned = cleanText(value);
+  return cleaned ? query.eq(column, cleaned) : query.is(column, null);
+}
+
+export async function ensureActionLedgerAction(input: ActionLedgerInput): Promise<{ row: SafeActionLedgerRow; created: boolean }> {
+  const insertRow = toInsertRow(input);
+  const sellerId = String(insertRow.seller_id);
+  const source = String(insertRow.source);
+  const actionType = String(insertRow.action_type);
+
+  let query = supabase
+    .from("action_ledger")
+    .select("*")
+    .eq("seller_id", sellerId)
+    .eq("source", source)
+    .eq("action_type", actionType)
+    .limit(1);
+
+  query = applyNullableDedupeFilter(query, "source_id", insertRow.source_id as string | null);
+  query = applyNullableDedupeFilter(query, "entity_type", insertRow.entity_type as string | null);
+  query = applyNullableDedupeFilter(query, "entity_id", insertRow.entity_id as string | null);
+  query = applyNullableDedupeFilter(query, "sku", insertRow.sku as string | null);
+  query = applyNullableDedupeFilter(query, "asin", insertRow.asin as string | null);
+
+  const { data: existing, error: loadError } = await query.maybeSingle<ActionLedgerRow>();
+
+  if (loadError) {
+    logActionLedgerError("Could not check action ledger duplicate.", loadError);
+    throw new Error("Could not check action ledger duplicate in Supabase.");
+  }
+
+  if (existing) {
+    return {
+      row: toSafeActionLedgerRow(existing),
+      created: false
+    };
+  }
+
+  return {
+    row: await createActionLedgerRow(input),
+    created: true
+  };
+}
+
 export async function updateActionLedgerApprovalState(input: {
   id: string;
   approvalStatus: ActionLedgerApprovalStatus;
@@ -445,6 +505,36 @@ function mapRiskLevel(value: unknown): ActionLedgerRiskLevel {
   return "MEDIUM";
 }
 
+function normalizeSourcePart(value: unknown): string {
+  const cleaned = cleanText(value == null ? "" : String(value));
+  return cleaned?.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9_.:-]+/g, "-") ?? "unknown";
+}
+
+function isAsinLike(value: string | null | undefined): boolean {
+  return /^B0[A-Z0-9]{8}$/i.test(value ?? "");
+}
+
+function mapRecommendationActionType(value: string | null | undefined): ActionLedgerActionType {
+  const action = String(value ?? "").toUpperCase();
+  if (action === "ADD_EXACT_KEYWORD_AFTER_APPROVAL") return "ADD_EXACT_KEYWORD_AFTER_APPROVAL";
+  if (action === "ADD_PRODUCT_TARGET_AFTER_APPROVAL") return "ADD_PRODUCT_TARGET_AFTER_APPROVAL";
+  if (action === "CHECK_LISTING_BEFORE_NEGATIVE") return "CHECK_LISTING_BEFORE_NEGATIVE";
+  if (action === "LOWER_BID_AFTER_APPROVAL" || action === "ADD_NEGATIVE_AFTER_APPROVAL") return "PAUSE_OR_REDUCE_SPEND_AFTER_APPROVAL";
+  return "PPC_GUARDRAIL_REVIEW";
+}
+
+function getStableRecommendationSourceId(recommendation: Record<string, unknown>, entityValue: string | null, asin: string | null, recommendedAction: string | null): string {
+  const campaignId = recommendation.campaignId ?? recommendation.campaign_id;
+  const adGroupId = recommendation.adGroupId ?? recommendation.ad_group_id;
+  const actionType = mapRecommendationActionType(recommendedAction);
+
+  if (actionType === "ADD_PRODUCT_TARGET_AFTER_APPROVAL") {
+    return `ppc:product-target:${normalizeSourcePart(campaignId)}:${normalizeSourcePart(adGroupId)}:${normalizeSourcePart(asin ?? entityValue)}`;
+  }
+
+  return `ppc:keyword:${normalizeSourcePart(campaignId)}:${normalizeSourcePart(adGroupId)}:${normalizeSourcePart(entityValue)}:exact`;
+}
+
 export async function createProfitBandApprovalAction(input: {
   sellerId?: string;
   sourceId?: string | null;
@@ -458,7 +548,7 @@ export async function createProfitBandApprovalAction(input: {
   const bandLabel = String(input.profitBand.bandLabel ?? input.profitBand.band_label ?? "lower profit band");
   const approvalTier = mapProfitBandApprovalTier(String(input.profitBand.approvalTier ?? input.profitBand.approval_tier ?? ""));
 
-  return createActionLedgerRow({
+  const ensured = await ensureActionLedgerAction({
     sellerId: input.sellerId ?? "default",
     source: "PRODUCT_ECONOMICS",
     sourceId: input.sourceId ?? null,
@@ -491,6 +581,7 @@ export async function createProfitBandApprovalAction(input: {
       ...(input.guardrails ?? {})
     }
   });
+  return ensured.row;
 }
 
 export async function createActionFromRecommendation(recommendation: Record<string, unknown>): Promise<SafeActionLedgerRow> {
@@ -498,16 +589,23 @@ export async function createActionFromRecommendation(recommendation: Record<stri
   const entityValue = cleanText(String(recommendation.entityValue ?? recommendation.entity_value ?? ""));
   const recommendedAction = cleanText(String(recommendation.recommendedAction ?? recommendation.recommended_action ?? "REVIEW_RECOMMENDATION"));
   const title = cleanText(String(recommendation.title ?? recommendedAction ?? "Review recommendation")) ?? "Review recommendation";
+  const asin = cleanText(String(recommendation.asin ?? "")) ?? (isAsinLike(entityValue) ? entityValue?.toUpperCase() ?? null : null);
+  const actionType = mapRecommendationActionType(recommendedAction);
+  const entityType: ActionLedgerEntityType | null = asin || actionType === "ADD_PRODUCT_TARGET_AFTER_APPROVAL"
+    ? "ASIN"
+    : entityValue
+      ? "KEYWORD"
+      : null;
 
-  return createActionLedgerRow({
+  const ensured = await ensureActionLedgerAction({
     sellerId,
-    source: "PPC_RECOMMENDATION",
-    sourceId: cleanText(String(recommendation.id ?? "")),
-    actionType: "PPC_ACTION",
-    entityType: entityValue ? "SEARCH_TERM" : null,
-    entityId: entityValue,
+    source: "PPC_RECOMMENDATIONS",
+    sourceId: getStableRecommendationSourceId(recommendation, entityValue, asin, recommendedAction),
+    actionType,
+    entityType,
+    entityId: asin ?? entityValue,
     sku: cleanText(String(recommendation.sku ?? "")),
-    asin: cleanText(String(recommendation.asin ?? "")),
+    asin,
     title,
     summary: cleanText(String(recommendation.reason ?? recommendation.summary ?? "")),
     recommendedAction,
@@ -529,4 +627,5 @@ export async function createActionFromRecommendation(recommendation: Record<stri
       shadowMode: true
     }
   });
+  return ensured.row;
 }

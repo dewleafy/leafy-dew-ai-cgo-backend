@@ -25,6 +25,7 @@ import {
   ActionLedgerSource,
   ActionLedgerState
 } from "./action-ledger.types";
+import { syncRecommendationsToActionLedger } from "./action-ledger-bridge.service";
 
 const nullableTextSchema = z
   .string()
@@ -265,6 +266,17 @@ export async function postActionLedgerRow(req: Request, res: Response): Promise<
     res.json({ ok: true, row });
   } catch {
     sendDatabaseError(res, "Could not create action ledger row in Supabase.");
+  }
+}
+
+export async function syncRecommendationsToActionLedgerRoute(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+
+  try {
+    const result = await syncRecommendationsToActionLedger({ sellerId });
+    res.json(result);
+  } catch {
+    sendDatabaseError(res, "Could not sync recommendations into action ledger.");
   }
 }
 

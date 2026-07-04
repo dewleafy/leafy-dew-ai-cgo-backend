@@ -1,6 +1,7 @@
 export type ActionLedgerSource =
   | "CEO_REPORT"
   | "PPC_RECOMMENDATION"
+  | "PPC_RECOMMENDATIONS"
   | "PRODUCT_ECONOMICS"
   | "LISTING_AI"
   | "A_PLUS_AI"
@@ -11,7 +12,15 @@ export type ActionLedgerSource =
 
 export type ActionLedgerActionType =
   | "PPC_ACTION"
+  | "ADD_EXACT_KEYWORD_AFTER_APPROVAL"
+  | "ADD_PRODUCT_TARGET_AFTER_APPROVAL"
+  | "CHECK_LISTING_BEFORE_NEGATIVE"
+  | "PAUSE_OR_REDUCE_SPEND_AFTER_APPROVAL"
+  | "PPC_GUARDRAIL_REVIEW"
   | "PROFIT_BAND_APPROVAL"
+  | "COST_DATA_REQUIRED"
+  | "PROFIT_RISK_REVIEW"
+  | "ACCOUNT_HEALTH_REVIEW"
   | "LISTING_UPDATE"
   | "IMAGE_UPDATE"
   | "A_PLUS_UPDATE"
@@ -24,7 +33,9 @@ export type ActionLedgerActionType =
 export type ActionLedgerEntityType =
   | "SKU"
   | "ASIN"
+  | "KEYWORD"
   | "CAMPAIGN"
+  | "AD_GROUP"
   | "SEARCH_TERM"
   | "BRAND_STORE"
   | "SOCIAL_CHANNEL"

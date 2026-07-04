@@ -15,6 +15,7 @@ import {
 } from "./product-economics.types";
 import { AmazonSpListingRow } from "../amazon-sp/amazon-sp.types";
 import { ProductPassportRow } from "../product-passports/product-passports.types";
+import { ensureActionLedgerAction } from "../action-ledger/action-ledger.service";
 
 function toNumber(value: unknown): number {
   const numeric = Number(value ?? 0);
@@ -689,6 +690,132 @@ export function buildProductEconomicsExplanation(
   };
 }
 
+function normalizeActionSourcePart(value: unknown): string {
+  const cleaned = cleanText(value == null ? "" : String(value));
+  return cleaned?.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9_.:-]+/g, "-") ?? "unknown";
+}
+
+function mapActionLedgerRisk(value: unknown): "LOW" | "MEDIUM" | "HIGH" | "CRITICAL" {
+  const label = String(value ?? "MEDIUM").toUpperCase();
+  if (label === "VERY_HIGH" || label === "CRITICAL") return "CRITICAL";
+  if (label === "HIGH") return "HIGH";
+  if (label === "LOW") return "LOW";
+  return "MEDIUM";
+}
+
+async function ensureProductEconomicsAlerts(row: SafeProductEconomicsRow): Promise<void> {
+  const productKey = row.sku ?? row.asin;
+  const baseInput = {
+    sellerId: row.sellerId,
+    source: "PRODUCT_ECONOMICS" as const,
+    entityType: "SKU" as const,
+    entityId: row.sku ?? row.asin,
+    sku: row.sku,
+    asin: row.asin,
+    confidenceLabel: "MEDIUM" as const,
+    requiresApproval: true,
+    state: "WAITING_FOR_APPROVAL" as const,
+    approvalStatus: "PENDING" as const,
+    guardrails: {
+      shadowMode: true,
+      externalExecution: false,
+      requiresFounderApproval: true
+    }
+  };
+  const band = row.recommendedProfitBand ?? row.approval?.requestedProfitBand ?? null;
+
+  if (band) {
+    await ensureActionLedgerAction({
+      ...baseInput,
+      sourceId: `product-economics:${normalizeActionSourcePart(productKey)}:profit-band:${normalizeActionSourcePart(band.bandLabel)}`,
+      actionType: "PROFIT_BAND_APPROVAL",
+      title: `Approve profit band for ${row.sku ?? row.productName ?? row.asin ?? "product"}`,
+      summary: row.approval?.reason ?? row.recommendedProfitBandReason,
+      recommendedAction: "APPROVE_PROFIT_BAND",
+      expectedProfitImpact: band.minProfit,
+      riskLevel: mapActionLedgerRisk(band.riskLevel),
+      approvalTier: band.approvalTier === "FOUNDER_OVERRIDE_REQUIRED" ? "FOUNDER_OVERRIDE" : band.approvalTier === "HIGH_RISK_APPROVAL" ? "TIER_3" : "TIER_2",
+      payload: {
+        profitBand: band,
+        currentRequiredProfit: row.approval?.currentRequiredProfit ?? row.requiredProfit,
+        shadowMode: true,
+        externalExecution: false
+      },
+      evidence: {
+        productEconomicsId: row.id,
+        profitStatus: row.profitStatus,
+        profitDataStatus: row.profitDataStatus,
+        targetAcos: row.targetAcos,
+        breakEvenAcos: row.breakEvenAcos
+      }
+    });
+  }
+
+  if (row.profitDataStatus === "MISSING_COST_DATA" || row.profitDataStatus === "INCOMPLETE" || row.requiredProfit <= 0) {
+    await ensureActionLedgerAction({
+      ...baseInput,
+      sourceId: `product-economics:${normalizeActionSourcePart(productKey)}:missing-cost-data`,
+      actionType: "COST_DATA_REQUIRED",
+      title: `Complete product cost data for ${row.sku ?? row.productName ?? row.asin ?? "product"}`,
+      summary: row.reason,
+      recommendedAction: "COMPLETE_COST_DATA",
+      expectedProfitImpact: null,
+      riskLevel: "MEDIUM",
+      approvalTier: "TIER_2",
+      payload: {
+        profitDataStatus: row.profitDataStatus,
+        profitStatus: row.profitStatus,
+        requiredProfit: row.requiredProfit,
+        shadowMode: true,
+        externalExecution: false
+      },
+      evidence: {
+        productEconomicsId: row.id,
+        landedCost: row.landedCost,
+        sellingPrice: row.sellingPrice,
+        targetAcos: row.targetAcos,
+        breakEvenAcos: row.breakEvenAcos
+      }
+    });
+  }
+
+  const hasUnsafeProfitStatus = ["BLOCKED", "FAIL", "RISK"].includes(row.profitStatus);
+  const hasTargetAcosRisk = row.targetAcos !== null && (row.targetAcos <= 5 || row.targetAcos >= 80);
+
+  if (hasUnsafeProfitStatus || hasTargetAcosRisk) {
+    const riskReason = hasUnsafeProfitStatus ? row.profitStatus : "target-acos-risk";
+
+    await ensureActionLedgerAction({
+      ...baseInput,
+      sourceId: `product-economics:${normalizeActionSourcePart(productKey)}:profit-risk:${normalizeActionSourcePart(riskReason)}`,
+      actionType: "PROFIT_RISK_REVIEW",
+      title: `Review profit risk for ${row.sku ?? row.productName ?? row.asin ?? "product"}`,
+      summary: row.reason,
+      recommendedAction: "REVIEW_PROFIT_RISK",
+      expectedProfitImpact: row.netProfit,
+      riskLevel: row.profitStatus === "BLOCKED" || row.profitStatus === "FAIL" ? "HIGH" : "MEDIUM",
+      approvalTier: row.profitStatus === "BLOCKED" || row.profitStatus === "FAIL" ? "TIER_3" : "TIER_2",
+      payload: {
+        profitStatus: row.profitStatus,
+        profitDataStatus: row.profitDataStatus,
+        targetAcos: row.targetAcos,
+        breakEvenAcos: row.breakEvenAcos,
+        maxAllowableAdSpend: row.maxAllowableAdSpend,
+        requiredProfit: row.requiredProfit,
+        shadowMode: true,
+        externalExecution: false
+      },
+      evidence: {
+        productEconomicsId: row.id,
+        sellingPrice: row.sellingPrice,
+        nonAdCost: row.nonAdCost,
+        netProfit: row.netProfit,
+        netProfitBeforeAds: row.netProfitBeforeAds
+      }
+    });
+  }
+}
+
 export async function saveProductEconomics(input: ProductEconomicsInput): Promise<SafeProductEconomicsRow> {
   const calculation = calculateProductEconomics(input);
   const now = new Date().toISOString();
@@ -761,7 +888,16 @@ export async function saveProductEconomics(input: ProductEconomicsInput): Promis
     throw new Error("Could not save product economics in Supabase.");
   }
 
-  return toSafeProductEconomicsRow(data);
+  const safeRow = toSafeProductEconomicsRow(data);
+  await ensureProductEconomicsAlerts(safeRow).catch((ledgerError) => {
+    logger.warn("Could not sync product economics alerts to action ledger.", {
+      sellerId: safeRow.sellerId,
+      sku: safeRow.sku,
+      message: sanitizeErrorMessage(ledgerError instanceof Error ? ledgerError.message : "Unknown action ledger error")
+    });
+  });
+
+  return safeRow;
 }
 
 export async function listProductEconomics(sellerId: string): Promise<SafeProductEconomicsRow[]> {

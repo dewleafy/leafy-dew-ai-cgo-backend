@@ -30,6 +30,7 @@ import {
   getAmazonAdsPpcRecommendations as buildAmazonAdsPpcRecommendations,
   saveAmazonAdsPpcRecommendations
 } from "./amazon-ads-ppc-recommendation.service";
+import { syncRecommendationsToActionLedger } from "../action-ledger/action-ledger-bridge.service";
 import {
   downloadAndSaveCampaignReport,
   downloadAndSaveSearchTermReport,
@@ -1212,11 +1213,20 @@ export async function getAmazonAdsPpcRecommendations(req: Request, res: Response
         dataStartDate: dateRange.startDate,
         dataEndDate: dateRange.endDate
       });
+      const ledgerSync = await syncRecommendationsToActionLedger({ sellerId }).catch((error) => {
+        logger.warn("PPC recommendation bridge to action ledger failed safely.", {
+          sellerId,
+          message: getSafeAmazonAdsUnknownErrorMessage(error)
+        });
+        return null;
+      });
 
       res.json({
         ...recommendations,
         savedCount: saveResult.savedCount,
-        skippedDuplicateCount: saveResult.skippedDuplicateCount
+        skippedDuplicateCount: saveResult.skippedDuplicateCount,
+        actionLedgerCreatedCount: ledgerSync?.createdCount ?? 0,
+        actionLedgerExistingCount: ledgerSync?.existingCount ?? 0
       });
       return;
     }
