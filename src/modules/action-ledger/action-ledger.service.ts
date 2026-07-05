@@ -3,9 +3,11 @@ import { supabase } from "../../db/supabase";
 import { logger } from "../../utils/logger";
 import {
   ActionLedgerActionType,
+  ActionLedgerBatchUpdateResult,
   ActionLedgerApprovalStatus,
   ActionLedgerApprovalTier,
   ActionLedgerConfidenceLabel,
+  ActionLedgerDailyPriorities,
   ActionLedgerEntityType,
   ActionLedgerInput,
   ActionLedgerRiskLevel,
@@ -73,6 +75,7 @@ export const ACTION_LEDGER_STATES: ActionLedgerState[] = [
   "WAITING_FOR_APPROVAL",
   "APPROVED",
   "REJECTED",
+  "MONITOR",
   "MONITORING",
   "SUBMITTED",
   "PROCESSING",
@@ -429,6 +432,256 @@ export async function updateActionLedgerApprovalState(input: {
 
   const row = Array.isArray(data) ? data[0] : data;
   return row ? mapActionLedgerRow(row as ActionLedgerRow) : null;
+}
+
+function uniqueActionLedgerIds(ids: string[]): string[] {
+  return [...new Set(ids.map(canonicalizeActionId).filter(Boolean))];
+}
+
+function applyBatchSafetyFilters<T extends {
+  eq: (column: string, value: string) => T;
+  in: (column: string, values: string[]) => T;
+  neq: (column: string, value: string) => T;
+}>(
+  query: T,
+  input: {
+    onlyApprovalStatus?: ActionLedgerApprovalStatus;
+    allowedStates?: string[];
+    source?: ActionLedgerSource;
+    actionType?: ActionLedgerActionType;
+    excludeRiskLevels?: ActionLedgerRiskLevel[];
+    excludeApprovalTiers?: ActionLedgerApprovalTier[];
+  }
+): T {
+  let filteredQuery = query;
+
+  if (input.onlyApprovalStatus) filteredQuery = filteredQuery.eq("approval_status", input.onlyApprovalStatus);
+  if (input.allowedStates?.length) filteredQuery = filteredQuery.in("state", input.allowedStates);
+  if (input.source) filteredQuery = filteredQuery.eq("source", input.source);
+  if (input.actionType) filteredQuery = filteredQuery.eq("action_type", input.actionType);
+
+  for (const riskLevel of input.excludeRiskLevels ?? []) {
+    filteredQuery = filteredQuery.neq("risk_level", riskLevel);
+  }
+
+  for (const approvalTier of input.excludeApprovalTiers ?? []) {
+    filteredQuery = filteredQuery.neq("approval_tier", approvalTier);
+  }
+
+  return filteredQuery;
+}
+
+export async function batchUpdateActionLedgerState(input: {
+  sellerId: string;
+  ids: string[];
+  approvalStatus: ActionLedgerApprovalStatus;
+  state: ActionLedgerState;
+  note?: string | null;
+  markRejectedAt?: boolean;
+  onlyApprovalStatus?: ActionLedgerApprovalStatus;
+  allowedStates?: string[];
+  source?: ActionLedgerSource;
+  actionType?: ActionLedgerActionType;
+  excludeRiskLevels?: ActionLedgerRiskLevel[];
+  excludeApprovalTiers?: ActionLedgerApprovalTier[];
+}): Promise<ActionLedgerBatchUpdateResult> {
+  const sellerId = cleanText(input.sellerId) ?? "default";
+  const requestedCount = input.ids.length;
+  const ids = uniqueActionLedgerIds(input.ids);
+  const now = new Date().toISOString();
+  const updateRow: Record<string, unknown> = {
+    approval_status: input.approvalStatus,
+    state: input.state,
+    approval_note: cleanText(input.note),
+    updated_at: now
+  };
+
+  if (input.markRejectedAt) {
+    updateRow.rejected_at = now;
+  }
+
+  if (!ids.length) {
+    logger.info("Action ledger batch update completed.", {
+      sellerId,
+      requestedCount,
+      updatedCount: 0,
+      skippedCount: requestedCount
+    });
+
+    return {
+      sellerId,
+      requestedCount,
+      updatedCount: 0,
+      skippedCount: requestedCount,
+      rows: []
+    };
+  }
+
+  let query = supabase
+    .from("action_ledger")
+    .update(updateRow)
+    .eq("seller_id", sellerId)
+    .in("id", ids);
+
+  query = applyBatchSafetyFilters(query, input);
+
+  const { data, error } = await query.select("*");
+
+  if (error) {
+    logActionLedgerError("Could not batch update action ledger rows.", error);
+    throw new Error("Could not batch update action ledger rows in Supabase.");
+  }
+
+  const rows = ((data ?? []) as ActionLedgerRow[]).map(toSafeActionLedgerRow);
+  const updatedCount = rows.length;
+  const skippedCount = Math.max(requestedCount - updatedCount, 0);
+
+  logger.info("Action ledger batch update completed.", {
+    sellerId,
+    requestedCount,
+    updatedCount,
+    skippedCount
+  });
+
+  return {
+    sellerId,
+    requestedCount,
+    updatedCount,
+    skippedCount,
+    rows
+  };
+}
+
+async function listPendingActionLedgerRowsForPrioritySort(sellerId: string): Promise<SafeActionLedgerRow[]> {
+  const pageSize = 1000;
+  const rows: SafeActionLedgerRow[] = [];
+
+  for (let from = 0; ; from += pageSize) {
+    const to = from + pageSize - 1;
+    const { data, error } = await supabase
+      .from("action_ledger")
+      .select("*")
+      .eq("seller_id", sellerId)
+      .eq("approval_status", "PENDING")
+      .order("created_at", { ascending: false })
+      .range(from, to);
+
+    if (error) {
+      logActionLedgerError("Could not list pending action ledger rows for daily priorities.", error);
+      throw new Error("Could not load action ledger daily priorities from Supabase.");
+    }
+
+    const pageRows = ((data ?? []) as ActionLedgerRow[]).map(toSafeActionLedgerRow);
+    rows.push(...pageRows);
+
+    if (pageRows.length < pageSize) {
+      return rows;
+    }
+  }
+}
+
+export async function dismissLowPriorityActionLedgerRows(input: {
+  sellerId: string;
+  source?: ActionLedgerSource;
+  actionType?: ActionLedgerActionType;
+  limit: number;
+  note?: string | null;
+}): Promise<ActionLedgerBatchUpdateResult> {
+  const sellerId = cleanText(input.sellerId) ?? "default";
+  const limit = Math.min(Math.max(Math.floor(input.limit), 1), 100);
+
+  let query = supabase
+    .from("action_ledger")
+    .select("id")
+    .eq("seller_id", sellerId)
+    .eq("approval_status", "PENDING")
+    .neq("risk_level", "HIGH")
+    .neq("risk_level", "CRITICAL")
+    .neq("approval_tier", "FOUNDER_OVERRIDE")
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (input.source) query = query.eq("source", input.source);
+  if (input.actionType) query = query.eq("action_type", input.actionType);
+
+  const { data, error } = await query;
+
+  if (error) {
+    logActionLedgerError("Could not find low-priority action ledger rows to dismiss.", error);
+    throw new Error("Could not find low-priority action ledger rows in Supabase.");
+  }
+
+  const ids = ((data ?? []) as Array<{ id: string }>).map((row) => row.id);
+
+  return batchUpdateActionLedgerState({
+    sellerId,
+    ids,
+    approvalStatus: "REJECTED",
+    state: "REJECTED",
+    note: input.note,
+    markRejectedAt: true,
+    onlyApprovalStatus: "PENDING",
+    source: input.source,
+    actionType: input.actionType,
+    excludeRiskLevels: ["HIGH", "CRITICAL"],
+    excludeApprovalTiers: ["FOUNDER_OVERRIDE"]
+  });
+}
+
+function riskPriority(row: SafeActionLedgerRow): number {
+  if (row.riskLevel === "CRITICAL") return 0;
+  if (row.riskLevel === "HIGH") return 1;
+  return 2;
+}
+
+function approvalTierPriority(row: SafeActionLedgerRow): number {
+  return row.approvalTier === "FOUNDER_OVERRIDE" ? 0 : 1;
+}
+
+function sourcePriority(row: SafeActionLedgerRow): number {
+  if (row.source === "CEO_REPORT") return 0;
+  if (row.source === "PRODUCT_ECONOMICS") return 1;
+  if (row.source === "PPC_RECOMMENDATIONS" || row.source === "PPC_RECOMMENDATION") return 2;
+  return 3;
+}
+
+function createdAtMillis(row: SafeActionLedgerRow): number {
+  const value = row.createdAt ? Date.parse(row.createdAt) : 0;
+  return Number.isFinite(value) ? value : 0;
+}
+
+export async function getDailyPriorities(input: {
+  sellerId: string;
+  limit: number;
+}): Promise<ActionLedgerDailyPriorities> {
+  const sellerId = cleanText(input.sellerId) ?? "default";
+  const limit = Math.min(Math.max(Math.floor(input.limit), 1), 200);
+  const [totalPending, pendingRows] = await Promise.all([
+    countRows({ sellerId, approvalStatus: "PENDING" }),
+    listPendingActionLedgerRowsForPrioritySort(sellerId)
+  ]);
+
+  const rows = pendingRows
+    .sort((a, b) => {
+      const riskDiff = riskPriority(a) - riskPriority(b);
+      if (riskDiff) return riskDiff;
+
+      const approvalTierDiff = approvalTierPriority(a) - approvalTierPriority(b);
+      if (approvalTierDiff) return approvalTierDiff;
+
+      const sourceDiff = sourcePriority(a) - sourcePriority(b);
+      if (sourceDiff) return sourceDiff;
+
+      return createdAtMillis(b) - createdAtMillis(a);
+    })
+    .slice(0, limit);
+
+  return {
+    sellerId,
+    limit,
+    totalPending,
+    rows
+  };
 }
 
 async function countRows(input: {

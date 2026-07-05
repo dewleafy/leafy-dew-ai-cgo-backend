@@ -52,6 +52,7 @@ export type ActionLedgerState =
   | "WAITING_FOR_APPROVAL"
   | "APPROVED"
   | "REJECTED"
+  | "MONITOR"
   | "MONITORING"
   | "SUBMITTED"
   | "PROCESSING"
@@ -170,4 +171,19 @@ export type ActionLedgerSummary = {
   highRiskCount: number;
   founderOverrideCount: number;
   latestActions: SafeActionLedgerRow[];
+};
+
+export type ActionLedgerBatchUpdateResult = {
+  sellerId: string;
+  requestedCount: number;
+  updatedCount: number;
+  skippedCount: number;
+  rows: SafeActionLedgerRow[];
+};
+
+export type ActionLedgerDailyPriorities = {
+  sellerId: string;
+  limit: number;
+  totalPending: number;
+  rows: SafeActionLedgerRow[];
 };

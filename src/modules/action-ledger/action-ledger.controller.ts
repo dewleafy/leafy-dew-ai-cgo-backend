@@ -1,8 +1,11 @@
 import { Request, Response } from "express";
 import { z } from "zod";
 import {
+  batchUpdateActionLedgerState,
   createActionLedgerRow,
+  dismissLowPriorityActionLedgerRows,
   getActionLedgerById,
+  getDailyPriorities,
   getActionLedgerSummary,
   isActionLedgerActionType,
   isActionLedgerApprovalStatus,
@@ -151,6 +154,12 @@ function getLimitFromQuery(req: Request): number {
   return Math.min(Math.max(limit, 1), 200);
 }
 
+function getDismissLimitFromBody(value: unknown): number {
+  const rawLimit = Number(value ?? 50);
+  const limit = Number.isFinite(rawLimit) ? Math.floor(rawLimit) : 50;
+  return Math.min(Math.max(limit, 1), 100);
+}
+
 function normalizeQueryEnum<T extends string>(
   value: string | undefined,
   guard: (input: string) => input is T
@@ -176,6 +185,47 @@ function sendDatabaseError(res: Response, message: string): void {
     ok: false,
     message,
     safeHint: "Run action_ledger.sql in Supabase and check the service role key."
+  });
+}
+
+const batchIdSchema = z
+  .string()
+  .trim()
+  .transform(normalizeActionLedgerId)
+  .refine((value) => uuidRegex.test(value), "ids must contain valid action ledger ids.");
+
+const batchIdsSchema = z.object({
+  sellerId: z.string().trim().min(1).optional().default("default"),
+  ids: z.array(batchIdSchema).min(1, "ids must be a non-empty array.").max(100, "Batch requests are limited to 100 ids."),
+  note: nullableTextSchema,
+  rejectedBy: nullableTextSchema
+});
+
+const dismissLowPrioritySchema = z.object({
+  sellerId: z.string().trim().min(1).optional().default("default"),
+  source: sourceSchema.optional(),
+  actionType: actionTypeSchema.optional(),
+  limit: z.unknown().optional().transform(getDismissLimitFromBody),
+  note: nullableTextSchema
+});
+
+function sendBatchResult(
+  res: Response,
+  result: {
+    sellerId: string;
+    requestedCount: number;
+    updatedCount: number;
+    skippedCount: number;
+    rows: unknown[];
+  }
+): void {
+  res.json({
+    ok: true,
+    sellerId: result.sellerId,
+    requestedCount: result.requestedCount,
+    updatedCount: result.updatedCount,
+    skippedCount: result.skippedCount,
+    rows: result.rows
   });
 }
 
@@ -231,6 +281,25 @@ export async function getActionLedgerSummaryRoute(req: Request, res: Response): 
   }
 }
 
+export async function getActionLedgerDailyPrioritiesRoute(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+  const limit = getLimitFromQuery(req);
+
+  try {
+    const result = await getDailyPriorities({ sellerId, limit });
+
+    res.json({
+      ok: true,
+      sellerId: result.sellerId,
+      limit: result.limit,
+      totalPending: result.totalPending,
+      rows: result.rows
+    });
+  } catch {
+    sendDatabaseError(res, "Could not load action ledger daily priorities from Supabase.");
+  }
+}
+
 export async function getActionLedgerRow(req: Request, res: Response): Promise<void> {
   const cleanId = getValidActionLedgerId(req, res);
   if (!cleanId) return;
@@ -277,6 +346,102 @@ export async function syncRecommendationsToActionLedgerRoute(req: Request, res: 
     res.json(result);
   } catch {
     sendDatabaseError(res, "Could not sync recommendations into action ledger.");
+  }
+}
+
+export async function batchRejectActionLedgerRows(req: Request, res: Response): Promise<void> {
+  const parsed = batchIdsSchema.safeParse(req.body ?? {});
+
+  if (!parsed.success) {
+    sendValidationError(res, parsed.error.issues);
+    return;
+  }
+
+  try {
+    const result = await batchUpdateActionLedgerState({
+      sellerId: parsed.data.sellerId,
+      ids: parsed.data.ids,
+      approvalStatus: "REJECTED",
+      state: "REJECTED",
+      note: parsed.data.note,
+      markRejectedAt: true,
+      onlyApprovalStatus: "PENDING"
+    });
+
+    sendBatchResult(res, result);
+  } catch {
+    sendDatabaseError(res, "Could not batch reject action ledger rows in Supabase.");
+  }
+}
+
+export async function batchMonitorActionLedgerRows(req: Request, res: Response): Promise<void> {
+  const parsed = batchIdsSchema.safeParse(req.body ?? {});
+
+  if (!parsed.success) {
+    sendValidationError(res, parsed.error.issues);
+    return;
+  }
+
+  try {
+    const result = await batchUpdateActionLedgerState({
+      sellerId: parsed.data.sellerId,
+      ids: parsed.data.ids,
+      approvalStatus: "MONITOR",
+      state: "MONITORING",
+      note: parsed.data.note,
+      onlyApprovalStatus: "PENDING"
+    });
+
+    sendBatchResult(res, result);
+  } catch {
+    sendDatabaseError(res, "Could not batch move action ledger rows to monitoring in Supabase.");
+  }
+}
+
+export async function batchCompleteActionLedgerRows(req: Request, res: Response): Promise<void> {
+  const parsed = batchIdsSchema.safeParse(req.body ?? {});
+
+  if (!parsed.success) {
+    sendValidationError(res, parsed.error.issues);
+    return;
+  }
+
+  try {
+    const result = await batchUpdateActionLedgerState({
+      sellerId: parsed.data.sellerId,
+      ids: parsed.data.ids,
+      approvalStatus: "COMPLETED",
+      state: "COMPLETED",
+      note: parsed.data.note,
+      allowedStates: ["MONITOR", "MONITORING"]
+    });
+
+    sendBatchResult(res, result);
+  } catch {
+    sendDatabaseError(res, "Could not batch complete action ledger rows in Supabase.");
+  }
+}
+
+export async function dismissLowPriorityActionLedgerRowsRoute(req: Request, res: Response): Promise<void> {
+  const parsed = dismissLowPrioritySchema.safeParse(req.body ?? {});
+
+  if (!parsed.success) {
+    sendValidationError(res, parsed.error.issues);
+    return;
+  }
+
+  try {
+    const result = await dismissLowPriorityActionLedgerRows({
+      sellerId: parsed.data.sellerId,
+      source: parsed.data.source,
+      actionType: parsed.data.actionType,
+      limit: parsed.data.limit,
+      note: parsed.data.note
+    });
+
+    sendBatchResult(res, result);
+  } catch {
+    sendDatabaseError(res, "Could not dismiss low-priority action ledger rows in Supabase.");
   }
 }
 
