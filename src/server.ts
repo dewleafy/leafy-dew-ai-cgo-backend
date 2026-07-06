@@ -166,6 +166,7 @@ app.use("/api/experiments", experimentRoutes);
 app.use("/api/learning-summary", learningSummaryRoutes);
 app.use("/api/listing-readiness", listingReadinessRoutes);
 app.use("/api/product-economics", productEconomicsRouter);
+app.use("/api/product-passport", productPassportRoutes);
 app.use("/api/product-passports", productPassportRoutes);
 app.use("/api/recommendation-outcomes", recommendationOutcomeRoutes);
 app.use("/api/recommendations", recommendationsRouter);

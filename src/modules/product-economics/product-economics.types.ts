@@ -37,6 +37,7 @@ export type ProductEconomicsInput = {
   otherFees?: number;
   otherCostPerUnit: number;
   targetProfit?: number;
+  preserveMissingRequiredProfit?: boolean;
   notes?: string | null;
 };
 

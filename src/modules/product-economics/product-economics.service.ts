@@ -123,6 +123,12 @@ function getClosingFee(sellingPrice: number, categoryException?: boolean | null)
 }
 
 function getShippingFee(input: ProductEconomicsInput): number {
+  const manualShippingFee = toNumber(input.shippingFeeEstimate);
+
+  if (manualShippingFee > 0) {
+    return manualShippingFee;
+  }
+
   const fulfillmentType = normalizeFulfillmentType(input.fulfillmentType);
   const weightKg = toNumber(input.weightKg);
 
@@ -376,6 +382,13 @@ function getTargetProfit(input: ProductEconomicsInput): { targetProfit: number; 
   const sellingPrice = toNumber(input.sellingPrice);
   const providedTargetProfit = Math.max(toNumber(input.targetProfit), 0);
 
+  if (input.preserveMissingRequiredProfit && providedTargetProfit <= 0) {
+    return {
+      targetProfit: 0,
+      targetProfitRule: "MISSING_REQUIRED_PROFIT"
+    };
+  }
+
   if (providedTargetProfit > 0) {
     return {
       targetProfit: roundTwo(providedTargetProfit),
@@ -427,6 +440,7 @@ export function calculateProductEconomics(input: ProductEconomicsInput): Product
   const hasMissingCostBasis =
     sellingPrice <= 0 ||
     productCost <= 0;
+  const hasMissingRequiredProfit = input.preserveMissingRequiredProfit === true && targetProfit <= 0;
   const hasMissingSubcategory = referralFee.source === "MISSING_SUBCATEGORY";
   const hasReferralNoMatch = referralFee.source === "NO_MATCH";
   const returnReservePerUnit = roundTwo(sellingPrice * (returnRatePercent / 100));
@@ -441,7 +455,7 @@ export function calculateProductEconomics(input: ProductEconomicsInput): Product
   const profitStatus: ProductProfitStatus =
     hasMissingSubcategory || hasReferralNoMatch
       ? "NEEDS_INPUT"
-      : hasMissingCostBasis
+      : hasMissingCostBasis || hasMissingRequiredProfit
         ? "NEEDS_COST_DATA"
         : maxAllowableAdSpend <= 0
           ? "BLOCKED"
@@ -449,15 +463,17 @@ export function calculateProductEconomics(input: ProductEconomicsInput): Product
   const profitDataStatus =
     hasMissingSubcategory || hasReferralNoMatch
       ? "INCOMPLETE"
-      : hasMissingCostBasis
+      : hasMissingCostBasis || hasMissingRequiredProfit
         ? "MISSING_COST_DATA"
         : "AVAILABLE";
   const reason = hasMissingSubcategory
     ? "Subcategory is missing, so referral fee cannot be calculated."
     : hasReferralNoMatch
       ? "Subcategory does not match the referral fee table, so referral fee cannot be calculated."
+      : hasMissingRequiredProfit
+        ? "Required profit is missing, so profit-safe decisions are blocked."
       : getProfitReason(profitStatus);
-  const shouldBlockMetrics = hasMissingSubcategory || hasReferralNoMatch || hasMissingCostBasis;
+  const shouldBlockMetrics = hasMissingSubcategory || hasReferralNoMatch || hasMissingCostBasis || hasMissingRequiredProfit;
   const grossProfit = netRevenueBeforeGst !== null ? roundTwo(netRevenueBeforeGst - productCost - totalAmazonFees) : null;
   const netProfit = netProfitBeforeAds;
   const profitBands = buildProfitBands({
