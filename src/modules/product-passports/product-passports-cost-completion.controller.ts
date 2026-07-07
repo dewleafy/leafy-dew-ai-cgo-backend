@@ -6,6 +6,9 @@ import {
   listProductPassportCostCompletionRows,
   resolveProductPassportCostActions
 } from "./product-passports-cost-completion.service";
+import { ProductPassportCostStatus } from "./product-passports-cost-completion.types";
+
+type ProductPassportCostStatusFilter = ProductPassportCostStatus | "ALL";
 
 const nullableTextSchema = z
   .string()
@@ -57,6 +60,14 @@ function getLimitFromQuery(req: Request): number {
   return Number.isFinite(rawLimit) ? Math.min(Math.max(Math.floor(rawLimit), 1), 500) : 200;
 }
 
+function getStatusFromQuery(req: Request): ProductPassportCostStatusFilter {
+  if (typeof req.query.status !== "string") return "ALL";
+  const status = req.query.status.trim().toUpperCase();
+  return status === "COMPLETE" || status === "INCOMPLETE" || status === "PARTIAL" || status === "ALL"
+    ? status
+    : "ALL";
+}
+
 function sendValidationError(res: Response, issues: Array<{ path: PropertyKey[]; message: string }>): void {
   res.status(400).json({
     ok: false,
@@ -79,12 +90,13 @@ function sendCostCompletionError(res: Response, message: string): void {
 export async function getProductPassportCostCompletion(req: Request, res: Response): Promise<void> {
   const sellerId = getSellerIdFromQuery(req);
   const limit = getLimitFromQuery(req);
+  const status = getStatusFromQuery(req);
 
   try {
     const rows = await listProductPassportCostCompletionRows({
       sellerId,
       limit,
-      onlyNeedingCompletion: true
+      status
     });
 
     res.json({

@@ -371,16 +371,29 @@ function buildRowsFromContext(context: CostCompletionContext): ProductPassportCo
 export async function listProductPassportCostCompletionRows(input: {
   sellerId: string;
   limit?: number;
+  status?: ProductPassportCostStatus | "ALL";
   onlyNeedingCompletion?: boolean;
 }): Promise<ProductPassportCostCompletionRow[]> {
   const limit = Math.min(Math.max(input.limit ?? 200, 1), 500);
-  const context = await loadCostCompletionContext(input.sellerId, Math.max(limit, 500));
+  const context = await loadCostCompletionContext(input.sellerId, 1000);
   const rows = buildRowsFromContext(context);
-  const filteredRows = input.onlyNeedingCompletion
+  const filteredRows = input.status && input.status !== "ALL"
+    ? input.status === "INCOMPLETE"
+      ? rows.filter((row) => row.costStatus === "INCOMPLETE" || row.costStatus === "PARTIAL")
+      : rows.filter((row) => row.costStatus === input.status)
+    : input.onlyNeedingCompletion
     ? rows.filter((row) => row.costStatus !== "COMPLETE")
     : rows;
+  const returnedRows = filteredRows.slice(0, limit);
 
-  return filteredRows.slice(0, limit);
+  logger.info("Product Passport cost completion rows loaded.", {
+    sellerId: context.sellerId,
+    returnedCount: returnedRows.length,
+    completeCount: returnedRows.filter((row) => row.costStatus === "COMPLETE").length,
+    incompleteCount: returnedRows.filter((row) => row.costStatus === "INCOMPLETE").length
+  });
+
+  return returnedRows;
 }
 
 function uniqueSkusForAsin(context: CostCompletionContext, asin: string): string[] {
