@@ -15,8 +15,7 @@ import {
   isActionLedgerRiskLevel,
   isActionLedgerSource,
   isActionLedgerState,
-  listActionLedgerRows,
-  updateActionLedgerApprovalState
+  listActionLedgerRows
 } from "./action-ledger.service";
 import {
   ActionLedgerActionType,
@@ -29,6 +28,15 @@ import {
   ActionLedgerState
 } from "./action-ledger.types";
 import { syncRecommendationsToActionLedger } from "./action-ledger-bridge.service";
+import {
+  backfillWorkflowEvents,
+  getRollbackPreview,
+  getWorkflowEvents,
+  INVALID_WORKFLOW_TRANSITION_MESSAGE,
+  InvalidWorkflowTransitionError,
+  recordWorkflowEventsForUpdatedRows,
+  transitionActionState
+} from "./action-workflow.service";
 
 const nullableTextSchema = z
   .string()
@@ -106,8 +114,17 @@ const actionLedgerCreateSchema = z.object({
 });
 
 const noteSchema = z.object({
+  sellerId: z.string().trim().min(1).optional(),
   note: nullableTextSchema,
-  approvedBy: nullableTextSchema
+  approvedBy: nullableTextSchema,
+  rejectedBy: nullableTextSchema,
+  actor: nullableTextSchema
+});
+
+const reopenSchema = z.object({
+  sellerId: z.string().trim().min(1).optional().default("default"),
+  note: nullableTextSchema,
+  actor: nullableTextSchema.default("founder")
 });
 
 const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -184,8 +201,28 @@ function sendDatabaseError(res: Response, message: string): void {
   res.status(503).json({
     ok: false,
     message,
-    safeHint: "Run action_ledger.sql in Supabase and check the service role key."
+    safeHint: "Run action_ledger.sql and workflow_state_machine.sql in Supabase, then check the service role key."
   });
+}
+
+function isInvalidWorkflowTransition(error: unknown): boolean {
+  return error instanceof InvalidWorkflowTransitionError || error instanceof Error && error.message === INVALID_WORKFLOW_TRANSITION_MESSAGE;
+}
+
+function sendWorkflowTransitionError(res: Response): void {
+  res.status(400).json({
+    ok: false,
+    message: INVALID_WORKFLOW_TRANSITION_MESSAGE
+  });
+}
+
+function actorForAction(input: {
+  fallback?: string;
+  actor?: string | null;
+  approvedBy?: string | null;
+  rejectedBy?: string | null;
+}): string {
+  return input.actor ?? input.approvedBy ?? input.rejectedBy ?? input.fallback ?? "system";
 }
 
 const batchIdSchema = z
@@ -198,7 +235,9 @@ const batchIdsSchema = z.object({
   sellerId: z.string().trim().min(1).optional().default("default"),
   ids: z.array(batchIdSchema).min(1, "ids must be a non-empty array.").max(100, "Batch requests are limited to 100 ids."),
   note: nullableTextSchema,
-  rejectedBy: nullableTextSchema
+  rejectedBy: nullableTextSchema,
+  approvedBy: nullableTextSchema,
+  actor: nullableTextSchema
 });
 
 const dismissLowPrioritySchema = z.object({
@@ -206,7 +245,8 @@ const dismissLowPrioritySchema = z.object({
   source: sourceSchema.optional(),
   actionType: actionTypeSchema.optional(),
   limit: z.unknown().optional().transform(getDismissLimitFromBody),
-  note: nullableTextSchema
+  note: nullableTextSchema,
+  actor: nullableTextSchema
 });
 
 function sendBatchResult(
@@ -365,7 +405,22 @@ export async function batchRejectActionLedgerRows(req: Request, res: Response): 
       state: "REJECTED",
       note: parsed.data.note,
       markRejectedAt: true,
-      onlyApprovalStatus: "PENDING"
+      onlyApprovalStatus: "PENDING",
+      allowedStates: ["WAITING_FOR_APPROVAL"]
+    });
+
+    await recordWorkflowEventsForUpdatedRows({
+      sellerId: result.sellerId,
+      beforeRows: result.workflowBeforeRows ?? [],
+      afterRows: result.rows,
+      eventType: "BATCH_REJECTED",
+      actor: actorForAction({ actor: parsed.data.actor, rejectedBy: parsed.data.rejectedBy, fallback: "founder" }),
+      note: parsed.data.note,
+      metadata: {
+        batch: true,
+        requestedCount: result.requestedCount,
+        updatedCount: result.updatedCount
+      }
     });
 
     sendBatchResult(res, result);
@@ -389,7 +444,22 @@ export async function batchMonitorActionLedgerRows(req: Request, res: Response):
       approvalStatus: "MONITOR",
       state: "MONITORING",
       note: parsed.data.note,
-      onlyApprovalStatus: "PENDING"
+      allowedApprovalStatuses: ["PENDING", "APPROVED"],
+      allowedStates: ["WAITING_FOR_APPROVAL", "APPROVED"]
+    });
+
+    await recordWorkflowEventsForUpdatedRows({
+      sellerId: result.sellerId,
+      beforeRows: result.workflowBeforeRows ?? [],
+      afterRows: result.rows,
+      eventType: "BATCH_MONITORING",
+      actor: actorForAction({ actor: parsed.data.actor, approvedBy: parsed.data.approvedBy, fallback: "founder" }),
+      note: parsed.data.note,
+      metadata: {
+        batch: true,
+        requestedCount: result.requestedCount,
+        updatedCount: result.updatedCount
+      }
     });
 
     sendBatchResult(res, result);
@@ -413,7 +483,21 @@ export async function batchCompleteActionLedgerRows(req: Request, res: Response)
       approvalStatus: "COMPLETED",
       state: "COMPLETED",
       note: parsed.data.note,
-      allowedStates: ["MONITOR", "MONITORING"]
+      allowedStates: ["APPROVED", "MONITORING", "MONITOR"]
+    });
+
+    await recordWorkflowEventsForUpdatedRows({
+      sellerId: result.sellerId,
+      beforeRows: result.workflowBeforeRows ?? [],
+      afterRows: result.rows,
+      eventType: "BATCH_COMPLETED",
+      actor: actorForAction({ actor: parsed.data.actor, approvedBy: parsed.data.approvedBy, fallback: "founder" }),
+      note: parsed.data.note,
+      metadata: {
+        batch: true,
+        requestedCount: result.requestedCount,
+        updatedCount: result.updatedCount
+      }
     });
 
     sendBatchResult(res, result);
@@ -439,9 +523,134 @@ export async function dismissLowPriorityActionLedgerRowsRoute(req: Request, res:
       note: parsed.data.note
     });
 
+    await recordWorkflowEventsForUpdatedRows({
+      sellerId: result.sellerId,
+      beforeRows: result.workflowBeforeRows ?? [],
+      afterRows: result.rows,
+      eventType: "LOW_PRIORITY_DISMISSED",
+      actor: actorForAction({ actor: parsed.data.actor, fallback: "system" }),
+      note: parsed.data.note,
+      metadata: {
+        batch: true,
+        requestedCount: result.requestedCount,
+        updatedCount: result.updatedCount,
+        lowPriorityDismissal: true
+      }
+    });
+
     sendBatchResult(res, result);
   } catch {
     sendDatabaseError(res, "Could not dismiss low-priority action ledger rows in Supabase.");
+  }
+}
+
+export async function getActionLedgerWorkflowRoute(req: Request, res: Response): Promise<void> {
+  const cleanId = getValidActionLedgerId(req, res);
+  if (!cleanId) return;
+
+  const sellerId = getSellerIdFromQuery(req);
+
+  try {
+    const events = await getWorkflowEvents(cleanId, sellerId);
+
+    res.json({
+      ok: true,
+      sellerId,
+      actionId: cleanId,
+      events
+    });
+  } catch {
+    sendDatabaseError(res, "Could not load action workflow events from Supabase.");
+  }
+}
+
+export async function getActionLedgerRollbackPreviewRoute(req: Request, res: Response): Promise<void> {
+  const cleanId = getValidActionLedgerId(req, res);
+  if (!cleanId) return;
+
+  const sellerId = getSellerIdFromQuery(req);
+
+  try {
+    const preview = await getRollbackPreview({
+      actionId: cleanId,
+      sellerId
+    });
+
+    res.json({
+      ok: true,
+      sellerId: preview.sellerId,
+      actionId: preview.actionId,
+      canRollback: preview.canRollback,
+      rollbackSnapshot: preview.rollbackSnapshot,
+      message: preview.message
+    });
+  } catch {
+    sendDatabaseError(res, "Could not load action rollback preview from Supabase.");
+  }
+}
+
+export async function reopenActionLedgerRow(req: Request, res: Response): Promise<void> {
+  const cleanId = getValidActionLedgerId(req, res);
+  if (!cleanId) return;
+
+  const parsed = reopenSchema.safeParse(req.body ?? {});
+
+  if (!parsed.success) {
+    sendValidationError(res, parsed.error.issues);
+    return;
+  }
+
+  try {
+    const result = await transitionActionState({
+      actionId: cleanId,
+      sellerId: parsed.data.sellerId,
+      toState: "WAITING_FOR_APPROVAL",
+      approvalStatus: "PENDING",
+      eventType: "REOPEN",
+      actor: parsed.data.actor,
+      note: parsed.data.note
+    });
+
+    if (!result) {
+      res.status(404).json({
+        ok: false,
+        message: "Action ledger row not found.",
+        idUsed: cleanId
+      });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      message: "Action reopened for founder approval. No external action was executed.",
+      row: result.row,
+      workflowEvent: result.event
+    });
+  } catch (error) {
+    if (isInvalidWorkflowTransition(error)) {
+      sendWorkflowTransitionError(res);
+      return;
+    }
+
+    sendDatabaseError(res, "Could not reopen action ledger row in Supabase.");
+  }
+}
+
+export async function backfillActionLedgerWorkflowRoute(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+
+  try {
+    const result = await backfillWorkflowEvents({ sellerId });
+
+    res.json({
+      ok: true,
+      sellerId: result.sellerId,
+      scannedCount: result.scannedCount,
+      createdCount: result.createdCount,
+      skippedCount: result.skippedCount
+    });
+  } catch {
+    sendDatabaseError(res, "Could not backfill action workflow events in Supabase.");
   }
 }
 
@@ -450,7 +659,9 @@ async function updateState(
   res: Response,
   approvalStatus: ActionLedgerApprovalStatus,
   state: ActionLedgerState,
-  message: string
+  message: string,
+  eventType: string,
+  actorInput: "approvedBy" | "rejectedBy" | "actor"
 ): Promise<void> {
   const cleanId = getValidActionLedgerId(req, res);
   if (!cleanId) return;
@@ -463,15 +674,23 @@ async function updateState(
   }
 
   try {
-    const row = await updateActionLedgerApprovalState({
-      id: cleanId,
+    const sellerId = parsed.data.sellerId ?? getSellerIdFromQuery(req);
+    const result = await transitionActionState({
+      actionId: cleanId,
+      sellerId,
       approvalStatus,
-      state,
+      toState: state,
+      eventType,
       note: parsed.data.note,
-      approvedBy: parsed.data.approvedBy
+      actor: actorForAction({
+        actor: actorInput === "actor" ? parsed.data.actor : null,
+        approvedBy: actorInput === "approvedBy" ? parsed.data.approvedBy : null,
+        rejectedBy: actorInput === "rejectedBy" ? parsed.data.rejectedBy : null,
+        fallback: actorInput === "rejectedBy" ? "founder" : "founder"
+      })
     });
 
-    if (!row) {
+    if (!result) {
       res.status(404).json({
         ok: false,
         message: "Action ledger row not found.",
@@ -483,25 +702,31 @@ async function updateState(
     res.json({
       ok: true,
       message,
-      row
+      row: result.row,
+      workflowEvent: result.event
     });
-  } catch {
+  } catch (error) {
+    if (isInvalidWorkflowTransition(error)) {
+      sendWorkflowTransitionError(res);
+      return;
+    }
+
     sendDatabaseError(res, "Could not update action ledger row in Supabase.");
   }
 }
 
 export async function approveActionLedgerRow(req: Request, res: Response): Promise<void> {
-  await updateState(req, res, "APPROVED", "APPROVED", "Action approved in shadow mode. No external action was executed.");
+  await updateState(req, res, "APPROVED", "APPROVED", "Action approved in shadow mode. No external action was executed.", "APPROVED", "approvedBy");
 }
 
 export async function rejectActionLedgerRow(req: Request, res: Response): Promise<void> {
-  await updateState(req, res, "REJECTED", "REJECTED", "Action rejected. No external action was executed.");
+  await updateState(req, res, "REJECTED", "REJECTED", "Action rejected. No external action was executed.", "REJECTED", "rejectedBy");
 }
 
 export async function monitorActionLedgerRow(req: Request, res: Response): Promise<void> {
-  await updateState(req, res, "MONITOR", "MONITORING", "Action moved to monitoring. No external action was executed.");
+  await updateState(req, res, "MONITOR", "MONITORING", "Action moved to monitoring. No external action was executed.", "MOVED_TO_MONITORING", "actor");
 }
 
 export async function completeActionLedgerRow(req: Request, res: Response): Promise<void> {
-  await updateState(req, res, "COMPLETED", "COMPLETED", "Action marked completed manually.");
+  await updateState(req, res, "COMPLETED", "COMPLETED", "Action marked completed manually.", "COMPLETED", "actor");
 }

@@ -179,6 +179,7 @@ export type ActionLedgerBatchUpdateResult = {
   updatedCount: number;
   skippedCount: number;
   rows: SafeActionLedgerRow[];
+  workflowBeforeRows?: ActionLedgerRow[];
 };
 
 export type ActionLedgerDailyPriorities = {

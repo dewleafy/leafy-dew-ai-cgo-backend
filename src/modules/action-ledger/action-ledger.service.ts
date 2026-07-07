@@ -446,6 +446,7 @@ function applyBatchSafetyFilters<T extends {
   query: T,
   input: {
     onlyApprovalStatus?: ActionLedgerApprovalStatus;
+    allowedApprovalStatuses?: ActionLedgerApprovalStatus[];
     allowedStates?: string[];
     source?: ActionLedgerSource;
     actionType?: ActionLedgerActionType;
@@ -456,6 +457,7 @@ function applyBatchSafetyFilters<T extends {
   let filteredQuery = query;
 
   if (input.onlyApprovalStatus) filteredQuery = filteredQuery.eq("approval_status", input.onlyApprovalStatus);
+  if (input.allowedApprovalStatuses?.length) filteredQuery = filteredQuery.in("approval_status", input.allowedApprovalStatuses);
   if (input.allowedStates?.length) filteredQuery = filteredQuery.in("state", input.allowedStates);
   if (input.source) filteredQuery = filteredQuery.eq("source", input.source);
   if (input.actionType) filteredQuery = filteredQuery.eq("action_type", input.actionType);
@@ -479,6 +481,7 @@ export async function batchUpdateActionLedgerState(input: {
   note?: string | null;
   markRejectedAt?: boolean;
   onlyApprovalStatus?: ActionLedgerApprovalStatus;
+  allowedApprovalStatuses?: ActionLedgerApprovalStatus[];
   allowedStates?: string[];
   source?: ActionLedgerSource;
   actionType?: ActionLedgerActionType;
@@ -513,7 +516,44 @@ export async function batchUpdateActionLedgerState(input: {
       requestedCount,
       updatedCount: 0,
       skippedCount: requestedCount,
-      rows: []
+      rows: [],
+      workflowBeforeRows: []
+    };
+  }
+
+  let beforeQuery = supabase
+    .from("action_ledger")
+    .select("*")
+    .eq("seller_id", sellerId)
+    .in("id", ids);
+
+  beforeQuery = applyBatchSafetyFilters(beforeQuery, input);
+
+  const { data: beforeData, error: beforeError } = await beforeQuery;
+
+  if (beforeError) {
+    logActionLedgerError("Could not load action ledger rows before batch update.", beforeError);
+    throw new Error("Could not load action ledger rows before batch update in Supabase.");
+  }
+
+  const workflowBeforeRows = (beforeData ?? []) as ActionLedgerRow[];
+  const updateIds = workflowBeforeRows.map((row) => row.id);
+
+  if (!updateIds.length) {
+    logger.info("Action ledger batch update completed.", {
+      sellerId,
+      requestedCount,
+      updatedCount: 0,
+      skippedCount: requestedCount
+    });
+
+    return {
+      sellerId,
+      requestedCount,
+      updatedCount: 0,
+      skippedCount: requestedCount,
+      rows: [],
+      workflowBeforeRows
     };
   }
 
@@ -521,7 +561,7 @@ export async function batchUpdateActionLedgerState(input: {
     .from("action_ledger")
     .update(updateRow)
     .eq("seller_id", sellerId)
-    .in("id", ids);
+    .in("id", updateIds);
 
   query = applyBatchSafetyFilters(query, input);
 
@@ -548,7 +588,8 @@ export async function batchUpdateActionLedgerState(input: {
     requestedCount,
     updatedCount,
     skippedCount,
-    rows
+    rows,
+    workflowBeforeRows
   };
 }
 

@@ -2,6 +2,7 @@ import { supabase } from "../../db/supabase";
 import { logger } from "../../utils/logger";
 import { ActionLedgerRow, SafeActionLedgerRow } from "../action-ledger/action-ledger.types";
 import { toSafeActionLedgerRow } from "../action-ledger/action-ledger.service";
+import { recordWorkflowEventsForUpdatedRows } from "../action-ledger/action-workflow.service";
 import { AmazonSpListingRow } from "../amazon-sp/amazon-sp.types";
 import {
   ProductEconomicsRow,
@@ -780,6 +781,20 @@ export async function resolveProductPassportCostActions(input: {
   }
 
   const rows = ((data ?? []) as ActionLedgerRow[]).map(toSafeActionLedgerRow);
+
+  await recordWorkflowEventsForUpdatedRows({
+    sellerId,
+    beforeRows: (pendingRows ?? []) as ActionLedgerRow[],
+    afterRows: rows,
+    eventType: "COST_DATA_COMPLETED_AUTO_RESOLVE",
+    actor: "system",
+    note: ACTION_RESOLVED_NOTE,
+    metadata: {
+      sku,
+      costStatus: row.costStatus,
+      source: "product_passport_cost_completion"
+    }
+  });
 
   return {
     ok: true,
