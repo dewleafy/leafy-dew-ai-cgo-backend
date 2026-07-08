@@ -11,6 +11,7 @@ import { automationSettingsRoutes } from "./modules/automation-settings/automati
 import { brandReadinessRoutes } from "./modules/brand-readiness/brand-readiness.routes";
 import { ceoReportRouter } from "./modules/ceo-report/ceo-report.routes";
 import { engineRegistryRouter } from "./modules/engine-registry/engine-registry.routes";
+import { engineRouterRouter } from "./modules/engine-router/engine-router.routes";
 import { experimentRoutes } from "./modules/experiments/experiments.routes";
 import { learningSummaryRoutes } from "./modules/learning-summary/learning-summary.routes";
 import { listingReadinessRoutes } from "./modules/listing-readiness/listing-readiness.routes";
@@ -164,6 +165,7 @@ app.use("/api/automation-settings", automationSettingsRoutes);
 app.use("/api/brand-readiness", brandReadinessRoutes);
 app.use("/api/ceo-report", ceoReportRouter);
 app.use("/api/engine-registry", engineRegistryRouter);
+app.use("/api/engine-router", engineRouterRouter);
 app.use("/api/experiments", experimentRoutes);
 app.use("/api/learning-summary", learningSummaryRoutes);
 app.use("/api/listing-readiness", listingReadinessRoutes);

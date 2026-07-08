@@ -8,6 +8,7 @@ export type ActionLedgerSource =
   | "IMAGE_AI"
   | "BRAND_STORE_AI"
   | "SOCIAL_AI"
+  | "ENGINE_ROUTER"
   | "SYSTEM";
 
 export type ActionLedgerActionType =
@@ -21,6 +22,7 @@ export type ActionLedgerActionType =
   | "COST_DATA_REQUIRED"
   | "PROFIT_RISK_REVIEW"
   | "ACCOUNT_HEALTH_REVIEW"
+  | "LISTING_READINESS_REVIEW"
   | "LISTING_UPDATE"
   | "IMAGE_UPDATE"
   | "A_PLUS_UPDATE"
