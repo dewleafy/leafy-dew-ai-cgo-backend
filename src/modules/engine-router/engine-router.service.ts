@@ -766,10 +766,11 @@ async function runEngine(engine: SafeEngineRegistryRow, sellerId: string, actor:
 export async function getDailyEnginePlan(input: {
   sellerId: string;
   limit: number;
+  categories?: string[];
 }): Promise<{ ok: true; sellerId: string; count: number; engines: SafeEngineRegistryRow[] }> {
   const sellerId = cleanText(input.sellerId) ?? "default";
   const limit = Math.min(Math.max(Math.floor(input.limit), 1), 100);
-  const engines = await loadRunnableEngines({ limit });
+  const engines = await loadRunnableEngines({ limit, categories: input.categories });
 
   return {
     ok: true,
