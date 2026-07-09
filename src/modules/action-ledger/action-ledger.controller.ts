@@ -28,6 +28,7 @@ import {
   ActionLedgerState
 } from "./action-ledger.types";
 import { syncRecommendationsToActionLedger } from "./action-ledger-bridge.service";
+import { recordLearningEventSafe } from "../learning-loop/learning-loop.service";
 import {
   backfillWorkflowEvents,
   getRollbackPreview,
@@ -225,6 +226,58 @@ function actorForAction(input: {
   return input.actor ?? input.approvedBy ?? input.rejectedBy ?? input.fallback ?? "system";
 }
 
+function engineKeyFromRow(row: { payload?: Record<string, unknown> | null }): string | null {
+  const engineKey = row.payload?.engineKey;
+  return typeof engineKey === "string" && engineKey.trim() ? engineKey.trim() : null;
+}
+
+async function recordLearningForActionRow(input: {
+  row: {
+    id: string;
+    sellerId: string;
+    source: string;
+    sourceId: string | null;
+    actionType: string;
+    entityType: string | null;
+    entityId: string | null;
+    sku: string | null;
+    asin: string | null;
+    payload?: Record<string, unknown> | null;
+    evidence?: Record<string, unknown> | null;
+    confidenceLabel?: string | null;
+  };
+  eventType:
+    | "ACTION_CREATED"
+    | "ACTION_APPROVED"
+    | "ACTION_REJECTED"
+    | "ACTION_MONITORING"
+    | "ACTION_COMPLETED"
+    | "ACTION_REOPENED";
+  actor?: string | null;
+  note?: string | null;
+}): Promise<void> {
+  await recordLearningEventSafe({
+    sellerId: input.row.sellerId,
+    actionId: input.row.id,
+    engineKey: engineKeyFromRow(input.row),
+    source: input.row.source,
+    sourceId: input.row.sourceId,
+    actionType: input.row.actionType,
+    entityType: input.row.entityType,
+    entityId: input.row.entityId,
+    sku: input.row.sku,
+    asin: input.row.asin,
+    eventType: input.eventType,
+    actor: input.actor ?? "system",
+    note: input.note,
+    confidenceBefore: input.row.confidenceLabel ?? null,
+    evidence: input.row.evidence ?? {},
+    metadata: {
+      actionLedger: true
+    }
+  });
+}
+
 const batchIdSchema = z
   .string()
   .trim()
@@ -372,6 +425,12 @@ export async function postActionLedgerRow(req: Request, res: Response): Promise<
 
   try {
     const row = await createActionLedgerRow(parsed.data);
+    await recordLearningForActionRow({
+      row,
+      eventType: "ACTION_CREATED",
+      actor: "system",
+      note: "Action Ledger row created."
+    });
     res.json({ ok: true, row });
   } catch {
     sendDatabaseError(res, "Could not create action ledger row in Supabase.");
@@ -423,6 +482,13 @@ export async function batchRejectActionLedgerRows(req: Request, res: Response): 
       }
     });
 
+    await Promise.all(result.rows.map((row) => recordLearningForActionRow({
+      row,
+      eventType: "ACTION_REJECTED",
+      actor: actorForAction({ actor: parsed.data.actor, rejectedBy: parsed.data.rejectedBy, fallback: "founder" }),
+      note: parsed.data.note
+    })));
+
     sendBatchResult(res, result);
   } catch {
     sendDatabaseError(res, "Could not batch reject action ledger rows in Supabase.");
@@ -462,6 +528,13 @@ export async function batchMonitorActionLedgerRows(req: Request, res: Response):
       }
     });
 
+    await Promise.all(result.rows.map((row) => recordLearningForActionRow({
+      row,
+      eventType: "ACTION_MONITORING",
+      actor: actorForAction({ actor: parsed.data.actor, approvedBy: parsed.data.approvedBy, fallback: "founder" }),
+      note: parsed.data.note
+    })));
+
     sendBatchResult(res, result);
   } catch {
     sendDatabaseError(res, "Could not batch move action ledger rows to monitoring in Supabase.");
@@ -500,6 +573,13 @@ export async function batchCompleteActionLedgerRows(req: Request, res: Response)
       }
     });
 
+    await Promise.all(result.rows.map((row) => recordLearningForActionRow({
+      row,
+      eventType: "ACTION_COMPLETED",
+      actor: actorForAction({ actor: parsed.data.actor, approvedBy: parsed.data.approvedBy, fallback: "founder" }),
+      note: parsed.data.note
+    })));
+
     sendBatchResult(res, result);
   } catch {
     sendDatabaseError(res, "Could not batch complete action ledger rows in Supabase.");
@@ -537,6 +617,13 @@ export async function dismissLowPriorityActionLedgerRowsRoute(req: Request, res:
         lowPriorityDismissal: true
       }
     });
+
+    await Promise.all(result.rows.map((row) => recordLearningForActionRow({
+      row,
+      eventType: "ACTION_REJECTED",
+      actor: actorForAction({ actor: parsed.data.actor, fallback: "system" }),
+      note: parsed.data.note
+    })));
 
     sendBatchResult(res, result);
   } catch {
@@ -626,6 +713,13 @@ export async function reopenActionLedgerRow(req: Request, res: Response): Promis
       row: result.row,
       workflowEvent: result.event
     });
+
+    await recordLearningForActionRow({
+      row: result.row,
+      eventType: "ACTION_REOPENED",
+      actor: parsed.data.actor,
+      note: parsed.data.note
+    });
   } catch (error) {
     if (isInvalidWorkflowTransition(error)) {
       sendWorkflowTransitionError(res);
@@ -704,6 +798,29 @@ async function updateState(
       message,
       row: result.row,
       workflowEvent: result.event
+    });
+
+    const learningEventType =
+      approvalStatus === "APPROVED"
+        ? "ACTION_APPROVED"
+        : approvalStatus === "REJECTED"
+          ? "ACTION_REJECTED"
+          : approvalStatus === "MONITOR"
+            ? "ACTION_MONITORING"
+            : approvalStatus === "COMPLETED"
+              ? "ACTION_COMPLETED"
+              : "ACTION_CREATED";
+
+    await recordLearningForActionRow({
+      row: result.row,
+      eventType: learningEventType,
+      actor: actorForAction({
+        actor: actorInput === "actor" ? parsed.data.actor : null,
+        approvedBy: actorInput === "approvedBy" ? parsed.data.approvedBy : null,
+        rejectedBy: actorInput === "rejectedBy" ? parsed.data.rejectedBy : null,
+        fallback: "founder"
+      }),
+      note: parsed.data.note
     });
   } catch (error) {
     if (isInvalidWorkflowTransition(error)) {

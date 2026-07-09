@@ -12,6 +12,7 @@ import {
 import { recordWorkflowEvent } from "../action-ledger/action-workflow.service";
 import { getDailyCeoReport } from "../ceo-report/ceo-report.service";
 import { EngineRegistryRow, EngineRunLogRow, SafeEngineRegistryRow, SafeEngineRunLogRow } from "../engine-registry/engine-registry.types";
+import { recordLearningEventSafe } from "../learning-loop/learning-loop.service";
 import { getCostCompletionQueue, listProductEconomics } from "../product-economics/product-economics.service";
 import { CostCompletionQueueRow, SafeProductEconomicsRow } from "../product-economics/product-economics.types";
 import { ProductPassportRow } from "../product-passports/product-passports.types";
@@ -23,6 +24,7 @@ import {
   EngineRunResult,
   EngineRunStatus
 } from "./engine-router.types";
+import { LearningEventType } from "../learning-loop/learning-loop.types";
 
 type EngineRunLogInsert = {
   engine_key: string;
@@ -702,6 +704,60 @@ async function updateEngineLastRun(engine: SafeEngineRegistryRow, status: Engine
   }
 }
 
+function learningEventTypeForEngineResult(result: {
+  status: EngineRunStatus;
+  actionCreated: boolean;
+  duplicateSkipped: boolean;
+}): LearningEventType {
+  if (result.duplicateSkipped) return "DUPLICATE_ACTION_SKIPPED";
+  if (result.actionCreated) return "ENGINE_PREVIEW_ACTION_CREATED";
+  if (result.status === "PREVIEW_NO_ACTION") return "ENGINE_PREVIEW_NO_ACTION";
+  if (result.status === "SKIPPED_NO_DATA") return "ENGINE_SKIPPED_NO_DATA";
+  if (result.status === "SKIPPED_TEMPLATE_NOT_IMPLEMENTED") return "ENGINE_SKIPPED_TEMPLATE_NOT_IMPLEMENTED";
+  return "ENGINE_FAILED";
+}
+
+async function recordEngineLearning(input: {
+  sellerId: string;
+  actor: string;
+  engine: SafeEngineRegistryRow;
+  status: EngineRunStatus;
+  summary: string;
+  actionCreated: boolean;
+  duplicateSkipped: boolean;
+  action: SafeActionLedgerRow | null;
+  log: SafeEngineRunLogRow;
+}): Promise<void> {
+  await recordLearningEventSafe({
+    sellerId: input.sellerId,
+    actionId: input.action?.id ?? null,
+    engineKey: input.engine.engineKey,
+    source: "ENGINE_ROUTER",
+    sourceId: input.action?.sourceId ?? input.log.id,
+    actionType: input.action?.actionType ?? input.engine.outputActionType,
+    entityType: input.action?.entityType ?? input.engine.outputEntityType,
+    entityId: input.action?.entityId ?? null,
+    sku: input.action?.sku ?? null,
+    asin: input.action?.asin ?? null,
+    eventType: learningEventTypeForEngineResult(input),
+    actor: input.actor,
+    note: input.summary,
+    evidence: {
+      engineName: input.engine.engineName,
+      category: input.engine.category,
+      ruleTemplate: input.engine.ruleTemplate,
+      runStatus: input.status,
+      logId: input.log.id
+    },
+    metadata: {
+      engineRouter: true,
+      actionCreated: input.actionCreated,
+      duplicateSkipped: input.duplicateSkipped,
+      previewOnly: true
+    }
+  });
+}
+
 async function runEngine(engine: SafeEngineRegistryRow, sellerId: string, actor: string): Promise<EngineRunResult> {
   try {
     const decision = await runDeterministicPreview(engine, sellerId);
@@ -721,6 +777,15 @@ async function runEngine(engine: SafeEngineRegistryRow, sellerId: string, actor:
     });
 
     await updateEngineLastRun(engine, status, summary);
+    await recordEngineLearning({
+      sellerId,
+      actor,
+      engine,
+      status,
+      summary,
+      ...actionResult,
+      log
+    });
 
     return {
       engine,
@@ -750,6 +815,17 @@ async function runEngine(engine: SafeEngineRegistryRow, sellerId: string, actor:
       errorMessage: message
     });
     await updateEngineLastRun(engine, "FAILED", message);
+    await recordEngineLearning({
+      sellerId,
+      actor,
+      engine,
+      status: "FAILED",
+      summary: message,
+      actionCreated: false,
+      duplicateSkipped: false,
+      action: null,
+      log
+    });
 
     return {
       engine,

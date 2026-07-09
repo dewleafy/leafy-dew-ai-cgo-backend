@@ -4,6 +4,7 @@ import { ActionLedgerRow, SafeActionLedgerRow } from "../action-ledger/action-le
 import { toSafeActionLedgerRow } from "../action-ledger/action-ledger.service";
 import { recordWorkflowEventsForUpdatedRows } from "../action-ledger/action-workflow.service";
 import { AmazonSpListingRow } from "../amazon-sp/amazon-sp.types";
+import { recordLearningEventSafe } from "../learning-loop/learning-loop.service";
 import {
   ProductEconomicsRow,
   SafeProductEconomicsRow
@@ -795,6 +796,28 @@ export async function resolveProductPassportCostActions(input: {
       source: "product_passport_cost_completion"
     }
   });
+
+  await Promise.all(rows.map((actionRow) => recordLearningEventSafe({
+    sellerId,
+    actionId: actionRow.id,
+    source: actionRow.source,
+    sourceId: actionRow.sourceId,
+    actionType: actionRow.actionType,
+    entityType: actionRow.entityType,
+    entityId: actionRow.entityId,
+    sku: actionRow.sku,
+    asin: actionRow.asin,
+    eventType: "COST_DATA_AUTO_RESOLVED",
+    actor: "system",
+    note: ACTION_RESOLVED_NOTE,
+    evidence: {
+      sku,
+      costStatus: row.costStatus
+    },
+    metadata: {
+      productPassportCostCompletion: true
+    }
+  })));
 
   return {
     ok: true,
