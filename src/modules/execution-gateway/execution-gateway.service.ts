@@ -2,6 +2,7 @@ import { getActionLedgerById } from "../action-ledger/action-ledger.service";
 import { SafeActionLedgerRow } from "../action-ledger/action-ledger.types";
 import { recordWorkflowEvent } from "../action-ledger/action-workflow.service";
 import { recordLearningEventSafe } from "../learning-loop/learning-loop.service";
+import { getSafetyControlSnapshotSafe } from "../safety-control/safety-control.service";
 import { supabase } from "../../db/supabase";
 import { logger } from "../../utils/logger";
 import {
@@ -15,6 +16,7 @@ import {
 export const EXECUTION_SAFETY_CHECKS: ExecutionSafetyChecks = {
   shadowMode: true,
   externalExecution: false,
+  liveExecutionEnabled: false,
   amazonUpdate: false,
   adsUpdate: false,
   listingUpdate: false,
@@ -22,7 +24,14 @@ export const EXECUTION_SAFETY_CHECKS: ExecutionSafetyChecks = {
   aPlusUpload: false,
   socialPost: false,
   aiCall: false,
-  approvalRequired: true
+  aiCallsEnabled: false,
+  approvalRequired: true,
+  safetyControl: {
+    shadowMode: true,
+    liveExecutionEnabled: false,
+    aiCallsEnabled: false,
+    message: "Live execution remains blocked in V1."
+  }
 };
 
 const SUPPORTED_SHADOW_ACTION_TYPES = new Set([
@@ -57,6 +66,17 @@ function toJsonObject(value: unknown): Record<string, unknown> {
 
 function toNullableJsonObject(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+async function buildExecutionSafetyChecks(sellerId: string): Promise<ExecutionSafetyChecks> {
+  const safetySnapshot = await getSafetyControlSnapshotSafe(sellerId);
+  return {
+    ...EXECUTION_SAFETY_CHECKS,
+    liveExecutionEnabled: false,
+    aiCallsEnabled: false,
+    approvalRequired: true,
+    safetyControl: safetySnapshot as unknown as Record<string, unknown>
+  };
 }
 
 function toSafeAttempt(row: ExecutionAttemptRow): SafeExecutionAttempt {
@@ -147,6 +167,7 @@ async function createAttempt(input: {
   errorMessage?: string | null;
 }): Promise<SafeExecutionAttempt> {
   const now = new Date().toISOString();
+  const safetyChecks = await buildExecutionSafetyChecks(input.action.sellerId);
   const { data, error } = await supabase
     .from("execution_attempts")
     .insert({
@@ -167,7 +188,7 @@ async function createAttempt(input: {
       snapshot_before: input.snapshotBefore ?? input.action,
       snapshot_after: input.snapshotAfter ?? null,
       rollback_snapshot: input.rollbackSnapshot ?? input.action.rollbackSnapshot,
-      safety_checks: EXECUTION_SAFETY_CHECKS,
+      safety_checks: safetyChecks,
       blocked_reason: cleanText(input.blockedReason),
       result_message: cleanText(input.resultMessage),
       error_message: cleanText(input.errorMessage),
@@ -191,18 +212,24 @@ function isApprovedForShadowExecution(action: SafeActionLedgerRow): boolean {
   return action.approvalStatus === "APPROVED" || action.state === "APPROVED" || action.state === "MONITORING";
 }
 
-export function getExecutionGatewayStatus(sellerIdInput: string): {
+export async function getExecutionGatewayStatus(sellerIdInput: string): Promise<{
   ok: true;
   sellerId: string;
   mode: "SHADOW_ONLY";
   liveExecutionEnabled: false;
+  aiCallsEnabled: false;
+  safety: Record<string, unknown>;
   message: string;
-} {
+}> {
+  const sellerId = cleanText(sellerIdInput) ?? "default";
+  const safety = await getSafetyControlSnapshotSafe(sellerId);
   return {
     ok: true,
-    sellerId: cleanText(sellerIdInput) ?? "default",
+    sellerId,
     mode: "SHADOW_ONLY",
     liveExecutionEnabled: false,
+    aiCallsEnabled: false,
+    safety: safety as unknown as Record<string, unknown>,
     message: "Live execution is blocked. Shadow execution only."
   };
 }
@@ -242,7 +269,7 @@ export async function previewExecution(input: {
     metadata: { executionGateway: true }
   });
 
-  return { ok: true, action, attempt, preview, safetyChecks: EXECUTION_SAFETY_CHECKS };
+  return { ok: true, action, attempt, preview, safetyChecks: attempt.safetyChecks as ExecutionSafetyChecks };
 }
 
 export async function executeShadow(input: {

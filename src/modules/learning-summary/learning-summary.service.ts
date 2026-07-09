@@ -277,15 +277,15 @@ function buildRiskyPatterns(summary: LearningSummaryCount): string[] {
 function toExperimentLearningItem(row: ExperimentRow): ExperimentLearningItem {
   return {
     id: row.id,
-    experimentName: row.experiment_name,
+    experimentName: row.experiment_name ?? row.name ?? "Untitled experiment",
     experimentType: row.experiment_type,
     status: row.status,
-    priority: row.priority,
+    priority: row.priority ?? "MEDIUM",
     hypothesis: row.hypothesis,
-    expectedResult: row.expected_result,
-    successMetric: row.success_metric,
-    startDate: row.start_date,
-    endDate: row.end_date
+    expectedResult: row.expected_result ?? row.description ?? null,
+    successMetric: row.success_metric ?? null,
+    startDate: row.start_date ?? row.started_at ?? null,
+    endDate: row.end_date ?? row.ended_at ?? null
   };
 }
 
@@ -415,9 +415,9 @@ export async function buildLearningSummary(input: {
   ]);
 
   const summary = buildSummary(recommendations, experiments, outcomes);
-  const activeExperiments = experiments.filter((row) => row.status === "ACTIVE").slice(0, 5).map(toExperimentLearningItem);
+  const activeExperiments = experiments.filter((row) => row.status === "ACTIVE" || row.status === "RUNNING").slice(0, 5).map(toExperimentLearningItem);
   const completedExperiments = experiments.filter((row) => row.status === "COMPLETED").slice(0, 5).map(toExperimentLearningItem);
-  const plannedExperiments = experiments.filter((row) => row.status === "PLANNED").slice(0, 5).map(toExperimentLearningItem);
+  const plannedExperiments = experiments.filter((row) => row.status === "PLANNED" || row.status === "DRAFT").slice(0, 5).map(toExperimentLearningItem);
 
   return {
     ok: true,

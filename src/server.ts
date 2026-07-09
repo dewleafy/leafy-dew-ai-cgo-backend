@@ -4,6 +4,8 @@ import { env } from "./config/env";
 import { supabase } from "./db/supabase";
 import { actionLedgerRoutes } from "./modules/action-ledger/action-ledger.routes";
 import { activityLogRoutes } from "./modules/activity-logs/activity-logs.routes";
+import { aiGatewayRouter } from "./modules/ai-gateway/ai-gateway.routes";
+import { alertCenterRouter } from "./modules/alert-center/alert-center.routes";
 import { amazonAdsRouter } from "./modules/amazon-ads/amazon-ads.routes";
 import { amazonSpRouter } from "./modules/amazon-sp/amazon-sp.routes";
 import { amazonRouter } from "./modules/amazon/amazon.routes";
@@ -12,6 +14,7 @@ import { brandReadinessRoutes } from "./modules/brand-readiness/brand-readiness.
 import { ceoReportRouter } from "./modules/ceo-report/ceo-report.routes";
 import { creativeRecommendationsRouter } from "./modules/creative-recommendations/creative-recommendations.routes";
 import { dailyOrchestratorRouter } from "./modules/daily-orchestrator/daily-orchestrator.routes";
+import { dataFreshnessRouter } from "./modules/data-freshness/data-freshness.routes";
 import { engineRegistryRouter } from "./modules/engine-registry/engine-registry.routes";
 import { engineRouterRouter } from "./modules/engine-router/engine-router.routes";
 import { executionGatewayRouter } from "./modules/execution-gateway/execution-gateway.routes";
@@ -22,8 +25,10 @@ import { listingDraftsRouter } from "./modules/listing-drafts/listing-drafts.rou
 import { listingReadinessRoutes } from "./modules/listing-readiness/listing-readiness.routes";
 import { productEconomicsRouter } from "./modules/product-economics/product-economics.routes";
 import { productPassportRoutes } from "./modules/product-passports/product-passports.routes";
+import { productionHealthRouter } from "./modules/production-health/production-health.routes";
 import { recommendationOutcomeRoutes } from "./modules/recommendation-outcomes/recommendation-outcomes.routes";
 import { recommendationsRouter } from "./modules/recommendations/recommendations.routes";
+import { safetyControlRouter } from "./modules/safety-control/safety-control.routes";
 import { todayCommandRouter } from "./modules/today-command/today-command.routes";
 import { logger } from "./utils/logger";
 
@@ -167,11 +172,14 @@ app.use("/api/amazon-ads", amazonAdsRouter);
 app.use("/api/amazon-sp", amazonSpRouter);
 app.use("/api/action-ledger", actionLedgerRoutes);
 app.use("/api/activity-logs", activityLogRoutes);
+app.use("/api/ai-gateway", aiGatewayRouter);
+app.use("/api/alert-center", alertCenterRouter);
 app.use("/api/automation-settings", automationSettingsRoutes);
 app.use("/api/brand-readiness", brandReadinessRoutes);
 app.use("/api/ceo-report", ceoReportRouter);
 app.use("/api/creative-recommendations", creativeRecommendationsRouter);
 app.use("/api/daily-orchestrator", dailyOrchestratorRouter);
+app.use("/api/data-freshness", dataFreshnessRouter);
 app.use("/api/engine-registry", engineRegistryRouter);
 app.use("/api/engine-router", engineRouterRouter);
 app.use("/api/execution-gateway", executionGatewayRouter);
@@ -183,8 +191,10 @@ app.use("/api/listing-readiness", listingReadinessRoutes);
 app.use("/api/product-economics", productEconomicsRouter);
 app.use("/api/product-passport", productPassportRoutes);
 app.use("/api/product-passports", productPassportRoutes);
+app.use("/api/production-health", productionHealthRouter);
 app.use("/api/recommendation-outcomes", recommendationOutcomeRoutes);
 app.use("/api/recommendations", recommendationsRouter);
+app.use("/api/safety-control", safetyControlRouter);
 app.use("/api/today-command", todayCommandRouter);
 
 app.use((_req: Request, res: Response) => {

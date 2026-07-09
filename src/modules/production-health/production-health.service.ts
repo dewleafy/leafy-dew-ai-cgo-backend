@@ -1,0 +1,177 @@
+import { supabase } from "../../db/supabase";
+import { getAlertSummary } from "../alert-center/alert-center.service";
+import { getAiCostSummary, getAiGatewayStatus } from "../ai-gateway/ai-gateway.service";
+import { getDataFreshnessSummary } from "../data-freshness/data-freshness.service";
+import { getExperimentSummary } from "../experiments/experiments.service";
+import { getSafetyControlSnapshotSafe } from "../safety-control/safety-control.service";
+import { ProductionHealthModule, ProductionHealthStatus, ProductionHealthSummary } from "./production-health.types";
+
+function cleanText(value: unknown): string | null {
+  const trimmed = typeof value === "string" ? value.trim() : value == null ? "" : String(value).trim();
+  return trimmed ? trimmed : null;
+}
+
+async function safeCount(input: {
+  table: string;
+  sellerId?: string;
+  filters?: Array<{ column: string; value: string | number | boolean }>;
+}): Promise<{ count: number; error: string | null }> {
+  let query = supabase.from(input.table).select("id", { count: "exact", head: true });
+  if (input.sellerId) query = query.eq("seller_id", input.sellerId);
+  for (const filter of input.filters ?? []) query = query.eq(filter.column, filter.value);
+  const { count, error } = await query;
+  return { count: count ?? 0, error: error?.message ?? null };
+}
+
+function moduleResult(input: {
+  key: string;
+  name: string;
+  status: ProductionHealthStatus;
+  message: string;
+  critical: boolean;
+  counts?: Record<string, number>;
+}): ProductionHealthModule {
+  return {
+    key: input.key,
+    name: input.name,
+    status: input.status,
+    message: input.message,
+    critical: input.critical,
+    counts: input.counts ?? {},
+    lastCheckedAt: new Date().toISOString()
+  };
+}
+
+async function tableModule(input: {
+  key: string;
+  name: string;
+  table: string;
+  sellerId?: string;
+  critical: boolean;
+  emptyWarn?: boolean;
+}): Promise<ProductionHealthModule> {
+  const result = await safeCount({ table: input.table, sellerId: input.sellerId });
+  if (result.error) {
+    return moduleResult({
+      key: input.key,
+      name: input.name,
+      critical: input.critical,
+      status: input.critical ? "FAIL" : "WARN",
+      message: `${input.name} is not reachable.`,
+      counts: { rows: 0 }
+    });
+  }
+
+  const status: ProductionHealthStatus = input.emptyWarn && result.count === 0 ? "WARN" : "PASS";
+  return moduleResult({
+    key: input.key,
+    name: input.name,
+    critical: input.critical,
+    status,
+    message: status === "PASS" ? `${input.name} is reachable.` : `${input.name} has no rows yet.`,
+    counts: { rows: result.count }
+  });
+}
+
+export async function getProductionHealthSummary(sellerIdInput: string): Promise<ProductionHealthSummary> {
+  const sellerId = cleanText(sellerIdInput) ?? "default";
+  const modules: ProductionHealthModule[] = [
+    moduleResult({ key: "api_server", name: "API server", status: "PASS", message: "API server is responding.", critical: true }),
+    await tableModule({ key: "supabase_connection", name: "Supabase connection", table: "amazon_connections", critical: true }),
+    await tableModule({ key: "action_ledger", name: "Action Ledger", table: "action_ledger", sellerId, critical: true }),
+    await tableModule({ key: "approval_center", name: "Approval Center", table: "action_ledger", sellerId, critical: true }),
+    await tableModule({ key: "product_passport", name: "Product Passport", table: "product_passports", sellerId, critical: true }),
+    await tableModule({ key: "product_economics", name: "Product Economics", table: "amazon_product_economics", sellerId, critical: true }),
+    await tableModule({ key: "amazon_sp_api", name: "Amazon SP-API data availability", table: "amazon_sp_listings", sellerId, critical: true, emptyWarn: true }),
+    await tableModule({ key: "amazon_ads", name: "Amazon Ads data availability", table: "amazon_ads_campaigns", sellerId, critical: false, emptyWarn: true }),
+    await tableModule({ key: "engine_registry", name: "Engine Registry", table: "engine_registry", critical: true }),
+    await tableModule({ key: "engine_router", name: "Engine Router", table: "engine_run_logs", sellerId, critical: true }),
+    await tableModule({ key: "daily_orchestrator", name: "Daily Orchestrator", table: "daily_orchestrator_runs", sellerId, critical: false }),
+    await tableModule({ key: "learning_loop", name: "Learning Loop", table: "action_learning_events", sellerId, critical: false }),
+    await tableModule({ key: "execution_gateway", name: "Execution Gateway", table: "execution_attempts", sellerId, critical: true }),
+    await tableModule({ key: "listing_drafts", name: "Listing Drafts", table: "listing_optimization_drafts", sellerId, critical: false }),
+    await tableModule({ key: "creative_recommendations", name: "Creative Recommendations", table: "creative_recommendations", sellerId, critical: false })
+  ];
+
+  const safety = await getSafetyControlSnapshotSafe(sellerId);
+  modules.push(moduleResult({
+    key: "safety_control",
+    name: "Safety Control",
+    status: safety.settings ? "PASS" : "WARN",
+    message: safety.settings ? "Safety Control is initialized and locked to shadow mode." : "Safety Control table is unavailable or not initialized; locked fallback is active.",
+    critical: true
+  }));
+
+  await getAlertSummary(sellerId)
+    .then((summary) => modules.push(moduleResult({
+      key: "alert_center",
+      name: "Alert Center",
+      status: "PASS",
+      message: "Alert Center is reachable.",
+      critical: false,
+      counts: { openAlerts: summary.openAlerts, highAlerts: summary.highAlerts }
+    })))
+    .catch(() => modules.push(moduleResult({ key: "alert_center", name: "Alert Center", status: "WARN", message: "Alert Center is not reachable.", critical: false })));
+
+  await getExperimentSummary(sellerId)
+    .then((summary) => modules.push(moduleResult({
+      key: "experiments",
+      name: "Experiments",
+      status: "PASS",
+      message: "Experiment tracking is reachable.",
+      critical: false,
+      counts: { runningExperiments: summary.runningExperiments, completedExperiments: summary.completedExperiments }
+    })))
+    .catch(() => modules.push(moduleResult({ key: "experiments", name: "Experiments", status: "WARN", message: "Experiment tracking is not reachable.", critical: false })));
+
+  await getDataFreshnessSummary(sellerId)
+    .then((summary) => modules.push(moduleResult({
+      key: "data_freshness",
+      name: "Data Freshness",
+      status: summary.errorSources > 0 ? "FAIL" : summary.staleSources > 0 || summary.unknownSources > 0 ? "WARN" : "PASS",
+      message: `${summary.freshSources}/${summary.totalSources} data sources are fresh.`,
+      critical: true,
+      counts: { staleSources: summary.staleSources, unknownSources: summary.unknownSources, errorSources: summary.errorSources }
+    })))
+    .catch(() => modules.push(moduleResult({ key: "data_freshness", name: "Data Freshness", status: "WARN", message: "Data Freshness is not reachable.", critical: true })));
+
+  await Promise.all([
+    getAiGatewayStatus(sellerId),
+    getAiCostSummary(sellerId)
+  ])
+    .then(([, cost]) => modules.push(moduleResult({
+      key: "ai_gateway",
+      name: "AI Gateway",
+      status: "PASS",
+      message: "AI Gateway is reachable and AI calls are disabled.",
+      critical: true,
+      counts: { requestsToday: cost.requestsToday, requestsMonth: cost.requestsMonth }
+    })))
+    .catch(() => modules.push(moduleResult({ key: "ai_gateway", name: "AI Gateway", status: "WARN", message: "AI Gateway is not reachable; AI calls remain disabled.", critical: true })));
+
+  const blockers = modules.filter((module) => module.critical && module.status === "FAIL").map((module) => module.message);
+  const warnings = modules.filter((module) => module.status === "WARN").map((module) => module.message);
+  const overallStatus: ProductionHealthStatus = blockers.length > 0 ? "FAIL" : warnings.length > 0 ? "WARN" : "PASS";
+
+  return {
+    ok: blockers.length === 0,
+    sellerId,
+    mode: "SHADOW",
+    overallStatus,
+    modules,
+    blockers,
+    warnings,
+    nextChecks: [
+      "Run data freshness check before daily operating review.",
+      "Review open high severity alerts.",
+      "Keep live execution blocked until production health is PASS.",
+      "Review AI budget before enabling any AI call path."
+    ],
+    safety: {
+      shadowMode: true,
+      externalExecution: false,
+      liveExecutionEnabled: false,
+      aiCallsEnabled: false
+    }
+  };
+}

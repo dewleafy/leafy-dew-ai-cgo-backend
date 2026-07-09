@@ -1,6 +1,12 @@
 import { supabase } from "../../db/supabase";
 import { getActionLedgerSummary, getDailyPriorities } from "../action-ledger/action-ledger.service";
+import { getAlertSummary } from "../alert-center/alert-center.service";
+import { getAiCostSummary } from "../ai-gateway/ai-gateway.service";
+import { getCriticalDataSourceSet, getDataFreshnessSummary } from "../data-freshness/data-freshness.service";
 import { getEngineRouterSummary } from "../engine-router/engine-router.service";
+import { getExperimentSummary } from "../experiments/experiments.service";
+import { getProductionHealthSummary } from "../production-health/production-health.service";
+import { getSafetyControlSnapshotSafe } from "../safety-control/safety-control.service";
 import { TodayCommandCounts, TodayCommandSummary, TodayCommandSystemStatus } from "./today-command.types";
 
 function cleanText(value: unknown): string | null {
@@ -125,17 +131,126 @@ function buildNextBestActions(input: {
   pendingApprovals: number;
   listingDrafts: number;
   creativeRecommendations: number;
+  openAlerts: number;
+  staleDataSources: number;
+  runningExperiments: number;
   failedReadiness: string[];
 }): string[] {
   const actions: string[] = [];
 
+  if (input.openAlerts > 0) actions.push("Review open high severity alerts.");
+  if (input.staleDataSources > 0) actions.push("Check stale data sources.");
+  if (input.runningExperiments > 0) actions.push("Review running experiments.");
   if (input.pendingApprovals > 0) actions.push("Review pending approval actions.");
   if (input.listingDrafts > 0) actions.push("Review listing optimization drafts awaiting approval.");
   if (input.creativeRecommendations > 0) actions.push("Review image and A+ recommendations awaiting approval.");
   if (input.failedReadiness.length > 0) actions.push("Resolve backend readiness warnings before expanding automation.");
+  actions.push("Keep live execution blocked until QA passes.");
+  actions.push("Review AI gateway budget before enabling AI calls.");
   actions.push("Keep all marketplace actions in shadow mode.");
 
   return [...new Set(actions)].slice(0, 8);
+}
+
+async function safeAlertSummary(sellerId: string): Promise<{
+  ready: boolean;
+  openAlerts: number;
+  highAlerts: number;
+  topRisks: unknown[];
+  warning: string | null;
+}> {
+  try {
+    const summary = await getAlertSummary(sellerId);
+    return {
+      ready: true,
+      openAlerts: summary.openAlerts,
+      highAlerts: summary.highAlerts + summary.criticalAlerts,
+      topRisks: summary.latestOpenAlerts.filter((row) => row.severity === "HIGH" || row.severity === "CRITICAL").slice(0, 5),
+      warning: null
+    };
+  } catch {
+    return { ready: false, openAlerts: 0, highAlerts: 0, topRisks: [], warning: "Alert Center is not reachable." };
+  }
+}
+
+async function safeExperimentSummary(sellerId: string): Promise<{
+  ready: boolean;
+  runningExperiments: number;
+  completedExperiments: number;
+  warning: string | null;
+}> {
+  try {
+    const summary = await getExperimentSummary(sellerId);
+    return {
+      ready: true,
+      runningExperiments: summary.runningExperiments,
+      completedExperiments: summary.completedExperiments,
+      warning: null
+    };
+  } catch {
+    return { ready: false, runningExperiments: 0, completedExperiments: 0, warning: "Experiment Tracking is not reachable." };
+  }
+}
+
+async function safeDataFreshnessSummary(sellerId: string): Promise<{
+  ready: boolean;
+  staleDataSources: number;
+  topRisks: unknown[];
+  warning: string | null;
+}> {
+  try {
+    const summary = await getDataFreshnessSummary(sellerId);
+    const criticalSources = getCriticalDataSourceSet();
+    return {
+      ready: true,
+      staleDataSources: summary.staleSources,
+      topRisks: summary.rows
+        .filter((row) => (row.status === "STALE" || row.status === "ERROR") && criticalSources.has(row.dataSource))
+        .slice(0, 5),
+      warning: summary.warnings[0] ?? null
+    };
+  } catch {
+    return { ready: false, staleDataSources: 0, topRisks: [], warning: "Data Freshness is not reachable." };
+  }
+}
+
+async function safeAiCostSummary(sellerId: string): Promise<{
+  ready: boolean;
+  aiCostToday: number;
+  aiCostMonth: number;
+  warning: string | null;
+}> {
+  try {
+    const summary = await getAiCostSummary(sellerId);
+    return {
+      ready: true,
+      aiCostToday: summary.estimatedCostToday,
+      aiCostMonth: summary.estimatedCostMonth,
+      warning: null
+    };
+  } catch {
+    return { ready: false, aiCostToday: 0, aiCostMonth: 0, warning: "AI Gateway is not reachable." };
+  }
+}
+
+async function safeSafetyControlReady(sellerId: string): Promise<{ ready: boolean; warning: string | null }> {
+  const snapshot = await getSafetyControlSnapshotSafe(sellerId);
+  return {
+    ready: Boolean(snapshot.settings),
+    warning: snapshot.settings ? null : "Safety Control is using locked fallback settings."
+  };
+}
+
+async function safeProductionHealthReady(sellerId: string): Promise<{ ready: boolean; warning: string | null }> {
+  try {
+    const summary = await getProductionHealthSummary(sellerId);
+    return {
+      ready: true,
+      warning: summary.overallStatus === "PASS" ? null : `Production Health is ${summary.overallStatus}.`
+    };
+  } catch {
+    return { ready: false, warning: "Production Health is not reachable." };
+  }
 }
 
 export async function getTodayCommandSummary(sellerIdInput: string): Promise<TodayCommandSummary> {
@@ -155,7 +270,13 @@ export async function getTodayCommandSummary(sellerIdInput: string): Promise<Tod
     executionAttemptCount,
     shadowExecutionCount,
     listingDraftCount,
-    creativeRecommendationCount
+    creativeRecommendationCount,
+    safetyControl,
+    alertSummary,
+    experimentSummary,
+    dataFreshnessSummary,
+    aiCostSummary,
+    productionHealth
   ] = await Promise.all([
     safeActionSummary(sellerId),
     safePriorities(sellerId),
@@ -168,7 +289,13 @@ export async function getTodayCommandSummary(sellerIdInput: string): Promise<Tod
     safeCount({ table: "execution_attempts", sellerId }),
     safeCount({ table: "execution_attempts", sellerId, filters: [{ column: "execution_status", value: "SHADOW_COMPLETED" }] }),
     safeCount({ table: "listing_optimization_drafts", sellerId }),
-    safeCount({ table: "creative_recommendations", sellerId })
+    safeCount({ table: "creative_recommendations", sellerId }),
+    safeSafetyControlReady(sellerId),
+    safeAlertSummary(sellerId),
+    safeExperimentSummary(sellerId),
+    safeDataFreshnessSummary(sellerId),
+    safeAiCostSummary(sellerId),
+    safeProductionHealthReady(sellerId)
   ]);
 
   for (const warning of [
@@ -183,7 +310,13 @@ export async function getTodayCommandSummary(sellerIdInput: string): Promise<Tod
     executionAttemptCount.warning,
     shadowExecutionCount.warning,
     listingDraftCount.warning,
-    creativeRecommendationCount.warning
+    creativeRecommendationCount.warning,
+    safetyControl.warning,
+    alertSummary.warning,
+    experimentSummary.warning,
+    dataFreshnessSummary.warning,
+    aiCostSummary.warning,
+    productionHealth.warning
   ]) {
     if (warning) warnings.push(warning);
   }
@@ -205,7 +338,13 @@ export async function getTodayCommandSummary(sellerIdInput: string): Promise<Tod
     productPassportReady: productPassportCount.ready,
     productEconomicsReady: productEconomicsCount.ready,
     learningLoopReady: learningEventCount.ready && enginesTrackedCount.ready,
-    executionGatewayReady: executionAttemptCount.ready
+    executionGatewayReady: executionAttemptCount.ready,
+    safetyControlReady: safetyControl.ready,
+    alertCenterReady: alertSummary.ready,
+    experimentsReady: experimentSummary.ready,
+    dataFreshnessReady: dataFreshnessSummary.ready,
+    aiGatewayReady: aiCostSummary.ready,
+    productionHealthReady: productionHealth.ready
   };
 
   const counts: TodayCommandCounts = {
@@ -222,7 +361,14 @@ export async function getTodayCommandSummary(sellerIdInput: string): Promise<Tod
     executionAttempts: executionAttemptCount.count,
     shadowExecutions: shadowExecutionCount.count,
     listingDrafts: listingDraftCount.count,
-    creativeRecommendations: creativeRecommendationCount.count
+    creativeRecommendations: creativeRecommendationCount.count,
+    openAlerts: alertSummary.openAlerts,
+    highAlerts: alertSummary.highAlerts,
+    runningExperiments: experimentSummary.runningExperiments,
+    completedExperiments: experimentSummary.completedExperiments,
+    staleDataSources: dataFreshnessSummary.staleDataSources,
+    aiCostToday: aiCostSummary.aiCostToday,
+    aiCostMonth: aiCostSummary.aiCostMonth
   };
 
   const failedReadiness = Object.entries(systemStatus)
@@ -235,18 +381,26 @@ export async function getTodayCommandSummary(sellerIdInput: string): Promise<Tod
     mode: "SHADOW",
     systemStatus,
     counts,
-    topRisks: actionSummary.topRisks,
+    topRisks: [
+      ...alertSummary.topRisks,
+      ...dataFreshnessSummary.topRisks,
+      ...actionSummary.topRisks
+    ].slice(0, 12),
     todayPriorities: priorities.rows,
     nextBestActions: buildNextBestActions({
       pendingApprovals: counts.pendingApprovals,
       listingDrafts: counts.listingDrafts,
       creativeRecommendations: counts.creativeRecommendations,
+      openAlerts: counts.highAlerts,
+      staleDataSources: counts.staleDataSources,
+      runningExperiments: counts.runningExperiments,
       failedReadiness
     }),
     safety: {
       shadowMode: true,
       externalExecution: false,
-      liveExecutionEnabled: false
+      liveExecutionEnabled: false,
+      aiCallsEnabled: false
     },
     warnings: [...new Set(warnings)]
   };

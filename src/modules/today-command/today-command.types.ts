@@ -8,6 +8,12 @@ export type TodayCommandSystemStatus = {
   productEconomicsReady: boolean;
   learningLoopReady: boolean;
   executionGatewayReady: boolean;
+  safetyControlReady: boolean;
+  alertCenterReady: boolean;
+  experimentsReady: boolean;
+  dataFreshnessReady: boolean;
+  aiGatewayReady: boolean;
+  productionHealthReady: boolean;
 };
 
 export type TodayCommandCounts = {
@@ -25,6 +31,13 @@ export type TodayCommandCounts = {
   shadowExecutions: number;
   listingDrafts: number;
   creativeRecommendations: number;
+  openAlerts: number;
+  highAlerts: number;
+  runningExperiments: number;
+  completedExperiments: number;
+  staleDataSources: number;
+  aiCostToday: number;
+  aiCostMonth: number;
 };
 
 export type TodayCommandSummary = {
@@ -40,6 +53,7 @@ export type TodayCommandSummary = {
     shadowMode: true;
     externalExecution: false;
     liveExecutionEnabled: false;
+    aiCallsEnabled: false;
   };
   warnings: string[];
 };

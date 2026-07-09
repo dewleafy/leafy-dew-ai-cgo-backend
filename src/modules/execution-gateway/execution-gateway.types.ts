@@ -66,6 +66,7 @@ export type SafeExecutionAttempt = {
 export type ExecutionSafetyChecks = {
   shadowMode: true;
   externalExecution: false;
+  liveExecutionEnabled: false;
   amazonUpdate: false;
   adsUpdate: false;
   listingUpdate: false;
@@ -73,5 +74,7 @@ export type ExecutionSafetyChecks = {
   aPlusUpload: false;
   socialPost: false;
   aiCall: false;
+  aiCallsEnabled: false;
   approvalRequired: true;
+  safetyControl: Record<string, unknown>;
 };

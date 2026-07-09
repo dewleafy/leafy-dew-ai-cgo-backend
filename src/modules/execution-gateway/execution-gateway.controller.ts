@@ -40,7 +40,18 @@ function sendExecutionError(res: Response, error: unknown): void {
 }
 
 export async function getExecutionGatewayStatusRoute(req: Request, res: Response): Promise<void> {
-  res.json(getExecutionGatewayStatus(sellerIdFromQuery(req)));
+  try {
+    res.json(await getExecutionGatewayStatus(sellerIdFromQuery(req)));
+  } catch {
+    res.json({
+      ok: true,
+      sellerId: sellerIdFromQuery(req),
+      mode: "SHADOW_ONLY",
+      liveExecutionEnabled: false,
+      aiCallsEnabled: false,
+      message: "Live execution is blocked. Shadow execution only."
+    });
+  }
 }
 
 export async function previewExecutionRoute(req: Request, res: Response): Promise<void> {
