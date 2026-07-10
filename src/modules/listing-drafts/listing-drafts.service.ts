@@ -1,6 +1,7 @@
 import { supabase } from "../../db/supabase";
 import { ensureActionLedgerAction } from "../action-ledger/action-ledger.service";
 import { ActionLedgerActionType } from "../action-ledger/action-ledger.types";
+import { safeRecordActivityLog } from "../activity-logs/activity-logs.service";
 import { AmazonSpListingRow } from "../amazon-sp/amazon-sp.types";
 import { recordLearningEventSafe } from "../learning-loop/learning-loop.service";
 import { ProductPassportRow } from "../product-passports/product-passports.types";
@@ -353,6 +354,23 @@ export async function createActionForListingDraft(draftId: string): Promise<{ ro
     metadata: { listingDraftSystem: true }
   });
 
+  await safeRecordActivityLog({
+    sellerId: draft.sellerId,
+    eventType: "LISTING_DRAFT_ACTION_CREATED",
+    eventCategory: "LISTING_DRAFTS",
+    severity: ensured.created ? "INFO" : "WARNING",
+    actor: "system",
+    title: "Listing draft action linked",
+    message: "Listing draft review action was created or linked. No listing update executed.",
+    entityType: ensured.row.entityType,
+    entityId: ensured.row.entityId,
+    sku: draft.sku,
+    asin: draft.asin,
+    actionId: ensured.row.id,
+    sourceModule: "listing-drafts",
+    metadata: { draftId: draft.id, actionCreated: ensured.created, listingUpdate: false }
+  });
+
   return { row: toSafeDraft(updated), actionCreated: ensured.created, actionId: ensured.row.id };
 }
 
@@ -389,6 +407,18 @@ export async function generateListingDrafts(sellerIdInput: string): Promise<List
       if (actionResult.actionCreated) actionsCreated += 1;
     }
   }
+
+  await safeRecordActivityLog({
+    sellerId,
+    eventType: "LISTING_DRAFT_GENERATION_COMPLETED",
+    eventCategory: "LISTING_DRAFTS",
+    severity: rows.length > 0 ? "INFO" : "WARNING",
+    actor: "system",
+    title: "Listing draft generation completed",
+    message: "Listing draft generation completed in shadow mode. No listing update executed.",
+    sourceModule: "listing-drafts",
+    metadata: { scannedCount: products.length, draftsCreated: rows.length, actionsCreated, skippedCount }
+  });
 
   return {
     ok: true,

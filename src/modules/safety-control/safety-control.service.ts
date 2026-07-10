@@ -1,5 +1,6 @@
 import { supabase } from "../../db/supabase";
 import { logger } from "../../utils/logger";
+import { safeRecordActivityLog } from "../activity-logs/activity-logs.service";
 import {
   SafeSafetyAuditEvent,
   SafeSafetyControlSettings,
@@ -168,6 +169,18 @@ export async function initializeSafetyControl(sellerIdInput: string, actor = "sy
     note: "Safety Control initialized in shadow mode."
   });
 
+  await safeRecordActivityLog({
+    sellerId,
+    eventType: "SAFETY_CONTROL_INITIALIZED",
+    eventCategory: "SAFETY",
+    severity: "SUCCESS",
+    actor,
+    title: "Safety Control initialized",
+    message: "Safety Control initialized in shadow mode. Live execution and AI calls remain disabled.",
+    sourceModule: "safety-control",
+    metadata: { liveExecutionEnabled: false, aiCallsEnabled: false }
+  });
+
   return { settings, created: true, snapshot: buildSafetySnapshot(settings) };
 }
 
@@ -229,6 +242,20 @@ export async function patchSafetyControlSettings(input: {
     afterState: settings as unknown as Record<string, unknown>,
     note: liveEnableBlocked ? "A V1 request tried to enable live execution or AI calls and was blocked." : input.patch.note,
     metadata: { requestedPatch: input.patch, v1LiveExecutionBlocked: true, aiCallsBlocked: true }
+  });
+
+  await safeRecordActivityLog({
+    sellerId,
+    eventType: liveEnableBlocked ? "LIVE_ENABLE_BLOCKED" : "SAFETY_SETTINGS_UPDATED",
+    eventCategory: "SAFETY",
+    severity: liveEnableBlocked ? "WARNING" : "INFO",
+    actor: input.patch.actor ?? "system",
+    title: liveEnableBlocked ? "Live enable request blocked" : "Safety settings updated",
+    message: liveEnableBlocked
+      ? "A request tried to enable live execution or AI calls and was blocked."
+      : "Safety settings were updated while keeping shadow-mode locks.",
+    sourceModule: "safety-control",
+    metadata: { requestedPatch: input.patch, liveExecutionEnabled: false, aiCallsEnabled: false }
   });
 
   return { settings, snapshot: buildSafetySnapshot(settings), liveEnableBlocked };

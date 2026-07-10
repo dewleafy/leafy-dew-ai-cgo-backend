@@ -14,6 +14,11 @@ export type TodayCommandSystemStatus = {
   dataFreshnessReady: boolean;
   aiGatewayReady: boolean;
   productionHealthReady: boolean;
+  activityLogsReady: boolean;
+  rollbackReady: boolean;
+  approvalExecutionReady: boolean;
+  maintenanceReady: boolean;
+  qaSmokeReady: boolean;
 };
 
 export type TodayCommandCounts = {
@@ -38,6 +43,14 @@ export type TodayCommandCounts = {
   staleDataSources: number;
   aiCostToday: number;
   aiCostMonth: number;
+  activityEventsToday: number;
+  rollbackSnapshots: number;
+  executableApprovedActions: number;
+  latestMaintenanceStatus: string | null;
+  latestQaStatus: string | null;
+  qaPassCount: number;
+  qaWarnCount: number;
+  qaFailCount: number;
 };
 
 export type TodayCommandSummary = {

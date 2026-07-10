@@ -1,8 +1,10 @@
 import { supabase } from "../../db/supabase";
+import { getActionLedgerSummary } from "../action-ledger/action-ledger.service";
 import { getAlertSummary } from "../alert-center/alert-center.service";
 import { getAiCostSummary, getAiGatewayStatus } from "../ai-gateway/ai-gateway.service";
 import { getDataFreshnessSummary } from "../data-freshness/data-freshness.service";
 import { getExperimentSummary } from "../experiments/experiments.service";
+import { getExecutionGatewayStatus } from "../execution-gateway/execution-gateway.service";
 import { getSafetyControlSnapshotSafe } from "../safety-control/safety-control.service";
 import { ProductionHealthModule, ProductionHealthStatus, ProductionHealthSummary } from "./production-health.types";
 
@@ -73,6 +75,21 @@ async function tableModule(input: {
   });
 }
 
+async function recentCount(input: {
+  table: string;
+  sellerId: string;
+  timestampColumn: string;
+  sinceIso: string;
+}): Promise<number> {
+  const { count, error } = await supabase
+    .from(input.table)
+    .select("id", { count: "exact", head: true })
+    .eq("seller_id", input.sellerId)
+    .gte(input.timestampColumn, input.sinceIso);
+  if (error) return 0;
+  return count ?? 0;
+}
+
 export async function getProductionHealthSummary(sellerIdInput: string): Promise<ProductionHealthSummary> {
   const sellerId = cleanText(sellerIdInput) ?? "default";
   const modules: ProductionHealthModule[] = [
@@ -90,7 +107,12 @@ export async function getProductionHealthSummary(sellerIdInput: string): Promise
     await tableModule({ key: "learning_loop", name: "Learning Loop", table: "action_learning_events", sellerId, critical: false }),
     await tableModule({ key: "execution_gateway", name: "Execution Gateway", table: "execution_attempts", sellerId, critical: true }),
     await tableModule({ key: "listing_drafts", name: "Listing Drafts", table: "listing_optimization_drafts", sellerId, critical: false }),
-    await tableModule({ key: "creative_recommendations", name: "Creative Recommendations", table: "creative_recommendations", sellerId, critical: false })
+    await tableModule({ key: "creative_recommendations", name: "Creative Recommendations", table: "creative_recommendations", sellerId, critical: false }),
+    await tableModule({ key: "activity_logs", name: "Activity Logs", table: "activity_log_events", sellerId, critical: false }),
+    await tableModule({ key: "rollback", name: "Rollback Snapshots", table: "rollback_snapshots", sellerId, critical: false }),
+    await tableModule({ key: "approval_execution", name: "Approval Execution Bridge", table: "action_ledger", sellerId, critical: true }),
+    await tableModule({ key: "maintenance", name: "Maintenance Runner", table: "maintenance_runs", sellerId, critical: false }),
+    await tableModule({ key: "qa_smoke", name: "QA Smoke Tests", table: "qa_smoke_test_runs", sellerId, critical: false })
   ];
 
   const safety = await getSafetyControlSnapshotSafe(sellerId);
@@ -149,8 +171,80 @@ export async function getProductionHealthSummary(sellerIdInput: string): Promise
     })))
     .catch(() => modules.push(moduleResult({ key: "ai_gateway", name: "AI Gateway", status: "WARN", message: "AI Gateway is not reachable; AI calls remain disabled.", critical: true })));
 
+  const explicitBlockers: string[] = [];
+  const explicitWarnings: string[] = [];
+  const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+  if (!safety.settings) {
+    explicitBlockers.push("Safety Control is missing and using locked fallback settings.");
+  }
+  if (safety.liveExecutionEnabled !== false) {
+    explicitBlockers.push("Live execution is enabled unexpectedly.");
+  }
+  if (safety.aiCallsEnabled !== false) {
+    explicitBlockers.push("AI calls are enabled unexpectedly.");
+  }
+
+  await getExecutionGatewayStatus(sellerId)
+    .then((status) => {
+      if (status.liveExecutionEnabled !== false) explicitBlockers.push("Execution Gateway is not blocking live execution.");
+    })
+    .catch(() => explicitBlockers.push("Execution Gateway live-block status is unavailable."));
+
+  await getAiGatewayStatus(sellerId)
+    .then((status) => {
+      if (status.aiCallsEnabled !== false) explicitBlockers.push("AI calls are enabled unexpectedly.");
+    })
+    .catch(() => explicitWarnings.push("AI Gateway status is unavailable; fallback remains disabled."));
+
+  const engineRegistryModule = modules.find((module) => module.key === "engine_registry");
+  if ((engineRegistryModule?.counts.rows ?? 0) < 300) {
+    explicitBlockers.push("Engine Registry is below 300 engines.");
+  }
+
+  if (modules.find((module) => module.key === "supabase_connection")?.status === "FAIL") {
+    explicitBlockers.push("Supabase is unreachable.");
+  }
+  if (modules.find((module) => module.key === "action_ledger")?.status === "FAIL") {
+    explicitBlockers.push("Action Ledger is unavailable.");
+  }
+
+  await getActionLedgerSummary(sellerId)
+    .then((summary) => {
+      if (summary.pendingCount >= 50) explicitWarnings.push("High pending approval backlog.");
+    })
+    .catch(() => explicitWarnings.push("Action Ledger pending approvals could not be checked."));
+
+  await getAlertSummary(sellerId)
+    .then((summary) => {
+      if (summary.highAlerts + summary.criticalAlerts > 0) explicitWarnings.push("Open critical/high alerts need review.");
+    })
+    .catch(() => null);
+
+  await getDataFreshnessSummary(sellerId)
+    .then((summary) => {
+      if (summary.staleSources > 0 || summary.errorSources > 0) explicitWarnings.push("One or more data sources are stale or failing.");
+    })
+    .catch(() => null);
+
+  const { count: weakEngineCount } = await supabase
+    .from("engine_learning_summary")
+    .select("id", { count: "exact", head: true })
+    .eq("seller_id", sellerId)
+    .lt("usefulness_score", 35);
+  if ((weakEngineCount ?? 0) > 0) explicitWarnings.push("Learning Loop has weak engines below usefulness score 35.");
+
+  if ((await recentCount({ table: "qa_smoke_test_runs", sellerId, timestampColumn: "started_at", sinceIso: since24h })) === 0) {
+    explicitWarnings.push("No recent QA smoke run in the last 24 hours.");
+  }
+  if ((await recentCount({ table: "maintenance_runs", sellerId, timestampColumn: "started_at", sinceIso: since24h })) === 0) {
+    explicitWarnings.push("No recent maintenance run in the last 24 hours.");
+  }
+
   const blockers = modules.filter((module) => module.critical && module.status === "FAIL").map((module) => module.message);
+  blockers.push(...explicitBlockers);
   const warnings = modules.filter((module) => module.status === "WARN").map((module) => module.message);
+  warnings.push(...explicitWarnings);
   const overallStatus: ProductionHealthStatus = blockers.length > 0 ? "FAIL" : warnings.length > 0 ? "WARN" : "PASS";
 
   return {
@@ -159,8 +253,8 @@ export async function getProductionHealthSummary(sellerIdInput: string): Promise
     mode: "SHADOW",
     overallStatus,
     modules,
-    blockers,
-    warnings,
+    blockers: [...new Set(blockers)],
+    warnings: [...new Set(warnings)],
     nextChecks: [
       "Run data freshness check before daily operating review.",
       "Review open high severity alerts.",

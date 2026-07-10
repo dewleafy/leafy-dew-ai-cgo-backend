@@ -19,6 +19,25 @@ function toNumber(value: unknown): number {
   return Number.isFinite(numeric) ? numeric : 0;
 }
 
+async function safeLatestRow(input: {
+  table: string;
+  sellerId: string;
+  orderColumn: string;
+}): Promise<{ ready: boolean; row: Record<string, unknown> | null; warning: string | null }> {
+  const { data, error } = await supabase
+    .from(input.table)
+    .select("*")
+    .eq("seller_id", input.sellerId)
+    .order(input.orderColumn, { ascending: false })
+    .limit(1);
+
+  if (error) {
+    return { ready: false, row: null, warning: `${input.table} is not reachable.` };
+  }
+
+  return { ready: true, row: ((data ?? []) as Record<string, unknown>[])[0] ?? null, warning: null };
+}
+
 async function safeCount(input: {
   table: string;
   sellerId?: string;
@@ -129,23 +148,30 @@ async function safeEngineSummary(sellerId: string): Promise<{
 
 function buildNextBestActions(input: {
   pendingApprovals: number;
+  executableApprovedActions: number;
   listingDrafts: number;
   creativeRecommendations: number;
   openAlerts: number;
   staleDataSources: number;
   runningExperiments: number;
+  latestMaintenanceStatus: string | null;
+  latestQaStatus: string | null;
   failedReadiness: string[];
 }): string[] {
   const actions: string[] = [];
 
+  if (!input.latestMaintenanceStatus) actions.push("Run maintenance if not run today.");
+  if (input.latestQaStatus !== "PASS") actions.push("Run QA smoke test before enabling any execution.");
+  if (input.executableApprovedActions > 0) actions.push("Review approved actions ready for shadow execution.");
   if (input.openAlerts > 0) actions.push("Review open high severity alerts.");
   if (input.staleDataSources > 0) actions.push("Check stale data sources.");
   if (input.runningExperiments > 0) actions.push("Review running experiments.");
   if (input.pendingApprovals > 0) actions.push("Review pending approval actions.");
   if (input.listingDrafts > 0) actions.push("Review listing optimization drafts awaiting approval.");
   if (input.creativeRecommendations > 0) actions.push("Review image and A+ recommendations awaiting approval.");
+  actions.push("Capture rollback snapshots before any future live execution.");
+  actions.push("Keep live execution blocked until QA smoke is PASS.");
   if (input.failedReadiness.length > 0) actions.push("Resolve backend readiness warnings before expanding automation.");
-  actions.push("Keep live execution blocked until QA passes.");
   actions.push("Review AI gateway budget before enabling AI calls.");
   actions.push("Keep all marketplace actions in shadow mode.");
 
@@ -276,7 +302,12 @@ export async function getTodayCommandSummary(sellerIdInput: string): Promise<Tod
     experimentSummary,
     dataFreshnessSummary,
     aiCostSummary,
-    productionHealth
+    productionHealth,
+    activityEventsToday,
+    rollbackSnapshotCount,
+    executableApprovedActions,
+    latestMaintenance,
+    latestQa
   ] = await Promise.all([
     safeActionSummary(sellerId),
     safePriorities(sellerId),
@@ -295,7 +326,12 @@ export async function getTodayCommandSummary(sellerIdInput: string): Promise<Tod
     safeExperimentSummary(sellerId),
     safeDataFreshnessSummary(sellerId),
     safeAiCostSummary(sellerId),
-    safeProductionHealthReady(sellerId)
+    safeProductionHealthReady(sellerId),
+    safeCount({ table: "activity_log_events", sellerId, sinceColumn: "created_at", sinceIso: since }),
+    safeCount({ table: "rollback_snapshots", sellerId }),
+    safeCount({ table: "action_ledger", sellerId, filters: [{ column: "approval_status", value: "APPROVED" }, { column: "requires_approval", value: true }] }),
+    safeLatestRow({ table: "maintenance_runs", sellerId, orderColumn: "started_at" }),
+    safeLatestRow({ table: "qa_smoke_test_runs", sellerId, orderColumn: "started_at" })
   ]);
 
   for (const warning of [
@@ -316,7 +352,12 @@ export async function getTodayCommandSummary(sellerIdInput: string): Promise<Tod
     experimentSummary.warning,
     dataFreshnessSummary.warning,
     aiCostSummary.warning,
-    productionHealth.warning
+    productionHealth.warning,
+    activityEventsToday.warning,
+    rollbackSnapshotCount.warning,
+    executableApprovedActions.warning,
+    latestMaintenance.warning,
+    latestQa.warning
   ]) {
     if (warning) warnings.push(warning);
   }
@@ -344,8 +385,19 @@ export async function getTodayCommandSummary(sellerIdInput: string): Promise<Tod
     experimentsReady: experimentSummary.ready,
     dataFreshnessReady: dataFreshnessSummary.ready,
     aiGatewayReady: aiCostSummary.ready,
-    productionHealthReady: productionHealth.ready
+    productionHealthReady: productionHealth.ready,
+    activityLogsReady: activityEventsToday.ready,
+    rollbackReady: rollbackSnapshotCount.ready,
+    approvalExecutionReady: executableApprovedActions.ready,
+    maintenanceReady: latestMaintenance.ready,
+    qaSmokeReady: latestQa.ready
   };
+
+  const latestMaintenanceStatus = typeof latestMaintenance.row?.run_status === "string" ? latestMaintenance.row.run_status : null;
+  const latestQaStatus = typeof latestQa.row?.run_status === "string" ? latestQa.row.run_status : null;
+  const qaPassCount = toNumber(latestQa.row?.pass_count);
+  const qaWarnCount = toNumber(latestQa.row?.warn_count);
+  const qaFailCount = toNumber(latestQa.row?.fail_count);
 
   const counts: TodayCommandCounts = {
     pendingApprovals: actionSummary.pending,
@@ -368,7 +420,15 @@ export async function getTodayCommandSummary(sellerIdInput: string): Promise<Tod
     completedExperiments: experimentSummary.completedExperiments,
     staleDataSources: dataFreshnessSummary.staleDataSources,
     aiCostToday: aiCostSummary.aiCostToday,
-    aiCostMonth: aiCostSummary.aiCostMonth
+    aiCostMonth: aiCostSummary.aiCostMonth,
+    activityEventsToday: activityEventsToday.count,
+    rollbackSnapshots: rollbackSnapshotCount.count,
+    executableApprovedActions: executableApprovedActions.count,
+    latestMaintenanceStatus,
+    latestQaStatus,
+    qaPassCount,
+    qaWarnCount,
+    qaFailCount
   };
 
   const failedReadiness = Object.entries(systemStatus)
@@ -382,6 +442,8 @@ export async function getTodayCommandSummary(sellerIdInput: string): Promise<Tod
     systemStatus,
     counts,
     topRisks: [
+      ...(qaFailCount > 0 ? [{ type: "QA_SMOKE_FAILED", message: `${qaFailCount} QA smoke checks failed.`, latestQaStatus }] : []),
+      ...(productionHealth.warning ? [{ type: "PRODUCTION_HEALTH", message: productionHealth.warning }] : []),
       ...alertSummary.topRisks,
       ...dataFreshnessSummary.topRisks,
       ...actionSummary.topRisks
@@ -389,11 +451,14 @@ export async function getTodayCommandSummary(sellerIdInput: string): Promise<Tod
     todayPriorities: priorities.rows,
     nextBestActions: buildNextBestActions({
       pendingApprovals: counts.pendingApprovals,
+      executableApprovedActions: counts.executableApprovedActions,
       listingDrafts: counts.listingDrafts,
       creativeRecommendations: counts.creativeRecommendations,
       openAlerts: counts.highAlerts,
       staleDataSources: counts.staleDataSources,
       runningExperiments: counts.runningExperiments,
+      latestMaintenanceStatus: counts.latestMaintenanceStatus,
+      latestQaStatus: counts.latestQaStatus,
       failedReadiness
     }),
     safety: {

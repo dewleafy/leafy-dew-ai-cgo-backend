@@ -10,6 +10,7 @@ import {
   SafeActionLedgerRow
 } from "../action-ledger/action-ledger.types";
 import { recordWorkflowEvent } from "../action-ledger/action-workflow.service";
+import { safeRecordActivityLog } from "../activity-logs/activity-logs.service";
 import { getDailyCeoReport } from "../ceo-report/ceo-report.service";
 import { EngineRegistryRow, EngineRunLogRow, SafeEngineRegistryRow, SafeEngineRunLogRow } from "../engine-registry/engine-registry.types";
 import { recordLearningEventSafe } from "../learning-loop/learning-loop.service";
@@ -875,6 +876,24 @@ export async function runEngineRouterPreview(input: EngineRouterRunPreviewInput)
   for (const engine of engines) {
     results.push(await runEngine(engine, sellerId, cleanText(input.actor) ?? "founder"));
   }
+
+  await safeRecordActivityLog({
+    sellerId,
+    eventType: "ENGINE_ROUTER_RUN_COMPLETED",
+    eventCategory: "ENGINE_ROUTER",
+    severity: results.some((result) => result.status === "FAILED") ? "WARNING" : "INFO",
+    actor: cleanText(input.actor) ?? "founder",
+    title: "Engine Router preview run completed",
+    message: "Engine Router completed a preview-only run. No external action executed.",
+    sourceModule: "engine-router",
+    metadata: {
+      enginesScanned: engines.length,
+      enginesRun: results.filter((result) => result.status !== "FAILED").length,
+      actionsCreated: results.filter((result) => result.actionCreated).length,
+      failedCount: results.filter((result) => result.status === "FAILED").length,
+      previewOnly: true
+    }
+  });
 
   return {
     ok: true,

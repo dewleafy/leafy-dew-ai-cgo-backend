@@ -1,7 +1,10 @@
 import { getActionLedgerById } from "../action-ledger/action-ledger.service";
 import { SafeActionLedgerRow } from "../action-ledger/action-ledger.types";
 import { recordWorkflowEvent } from "../action-ledger/action-workflow.service";
+import { safeRecordActivityLog } from "../activity-logs/activity-logs.service";
+import { buildListingExecutionPlan, buildPpcExecutionPlan, buildPricingExecutionPlan, validateExecutionPlan } from "../execution-adapters/execution-adapters.service";
 import { recordLearningEventSafe } from "../learning-loop/learning-loop.service";
+import { captureRollbackSnapshotSafe } from "../rollback/rollback.service";
 import { getSafetyControlSnapshotSafe } from "../safety-control/safety-control.service";
 import { supabase } from "../../db/supabase";
 import { logger } from "../../utils/logger";
@@ -110,6 +113,18 @@ function toSafeAttempt(row: ExecutionAttemptRow): SafeExecutionAttempt {
 }
 
 function plannedChangeForAction(action: SafeActionLedgerRow): Record<string, unknown> {
+  if (action.actionType.includes("PPC") || action.actionType.includes("KEYWORD") || action.actionType.includes("TARGET")) {
+    return buildPpcExecutionPlan(action).plannedChange;
+  }
+
+  if (action.actionType.includes("LISTING") || action.actionType.includes("IMAGE") || action.actionType.includes("A_PLUS")) {
+    return buildListingExecutionPlan(action).plannedChange;
+  }
+
+  if (action.actionType.includes("PRICING")) {
+    return buildPricingExecutionPlan(action).plannedChange;
+  }
+
   const common = {
     actionId: action.id,
     actionType: action.actionType,
@@ -145,11 +160,40 @@ function plannedChangeForAction(action: SafeActionLedgerRow): Record<string, unk
     };
   }
 
-  return {
+  return validateExecutionPlan({
+    planKind: "GENERIC",
+    actionId: action.id,
+    actionType: action.actionType,
+    entityType: action.entityType,
+    entityId: action.entityId,
+    sku: action.sku,
+    asin: action.asin,
+    steps: [
+      { key: "review_action", label: "Review action payload", externalExecution: false, blocked: false },
+      { key: "block_external_execution", label: "Block external execution", externalExecution: false, blocked: true }
+    ],
+    plannedChange: {
     ...common,
     previewKind: "SAFE_REVIEW",
     proposedPayload: action.payload
-  };
+    },
+    safety: {
+      shadowMode: true,
+      externalExecution: false,
+      liveExecutionEnabled: false,
+      amazonUpdate: false,
+      adsUpdate: false,
+      listingUpdate: false,
+      imageUpload: false,
+      aPlusUpload: false,
+      aiCall: false
+    },
+    validation: {
+      valid: true,
+      warnings: [],
+      blockers: []
+    }
+  }).plannedChange;
 }
 
 async function createAttempt(input: {
@@ -243,6 +287,14 @@ export async function previewExecution(input: {
   if (!action) throw new Error("ACTION_NOT_FOUND");
 
   const preview = plannedChangeForAction(action);
+  const rollbackSnapshot = await captureRollbackSnapshotSafe({
+    actionId: action.id,
+    sellerId: action.sellerId,
+    sourceModule: "execution-gateway",
+    capturedBy: input.actor,
+    plannedChange: preview,
+    notes: "Captured during Execution Gateway preview."
+  });
   const attempt = await createAttempt({
     action,
     executionMode: "SHADOW",
@@ -250,7 +302,25 @@ export async function previewExecution(input: {
     actor: input.actor,
     requestPayload: input.requestPayload,
     plannedChange: preview,
+    rollbackSnapshot: rollbackSnapshot ? { snapshotId: rollbackSnapshot.id, rollbackPlan: rollbackSnapshot.rollbackPlan } : null,
     resultMessage: "Shadow preview created. No external action executed."
+  });
+
+  await safeRecordActivityLog({
+    sellerId: action.sellerId,
+    eventType: "EXECUTION_GATEWAY_PREVIEW_CREATED",
+    eventCategory: "EXECUTION",
+    severity: "INFO",
+    actor: cleanText(input.actor) ?? "founder",
+    title: "Execution preview created",
+    message: "Execution Gateway created a shadow preview. No external action executed.",
+    entityType: action.entityType,
+    entityId: action.entityId,
+    sku: action.sku,
+    asin: action.asin,
+    actionId: action.id,
+    sourceModule: "execution-gateway",
+    metadata: { attemptId: attempt.id, rollbackSnapshotId: rollbackSnapshot?.id ?? null }
   });
 
   await recordLearningEventSafe({
@@ -327,6 +397,14 @@ export async function executeShadow(input: {
   }
 
   const plannedChange = plannedChangeForAction(action);
+  const rollbackSnapshot = await captureRollbackSnapshotSafe({
+    actionId: action.id,
+    sellerId: action.sellerId,
+    sourceModule: "execution-gateway",
+    capturedBy: input.actor,
+    plannedChange,
+    notes: "Captured before shadow execution."
+  });
   const attempt = await createAttempt({
     action,
     executionMode: "SHADOW",
@@ -334,6 +412,7 @@ export async function executeShadow(input: {
     actor: input.actor,
     requestPayload: input.requestPayload,
     plannedChange,
+    rollbackSnapshot: rollbackSnapshot ? { snapshotId: rollbackSnapshot.id, rollbackPlan: rollbackSnapshot.rollbackPlan } : null,
     snapshotAfter: {
       ...action,
       shadowExecution: {
@@ -354,8 +433,8 @@ export async function executeShadow(input: {
     note: "Shadow execution completed. No external action executed.",
     snapshotBefore: action,
     snapshotAfter: { action, attempt },
-    rollbackSnapshot: action.rollbackSnapshot,
-    metadata: { executionGateway: true, attemptId: attempt.id }
+    rollbackSnapshot: rollbackSnapshot ?? action.rollbackSnapshot,
+    metadata: { executionGateway: true, attemptId: attempt.id, rollbackSnapshotId: rollbackSnapshot?.id ?? null }
   }).catch((error) => {
     logger.warn("Could not record workflow event for shadow execution.", {
       actionId: action.id,
@@ -377,6 +456,23 @@ export async function executeShadow(input: {
     actor: cleanText(input.actor) ?? "founder",
     evidence: { attemptId: attempt.id },
     metadata: { executionGateway: true }
+  });
+
+  await safeRecordActivityLog({
+    sellerId: action.sellerId,
+    eventType: "EXECUTION_GATEWAY_SHADOW_COMPLETED",
+    eventCategory: "EXECUTION",
+    severity: "SUCCESS",
+    actor: cleanText(input.actor) ?? "founder",
+    title: "Shadow execution completed",
+    message: "Execution Gateway completed shadow execution. No external action executed.",
+    entityType: action.entityType,
+    entityId: action.entityId,
+    sku: action.sku,
+    asin: action.asin,
+    actionId: action.id,
+    sourceModule: "execution-gateway",
+    metadata: { attemptId: attempt.id, rollbackSnapshotId: rollbackSnapshot?.id ?? null }
   });
 
   return {
@@ -421,6 +517,23 @@ export async function executeLive(input: {
     actor: cleanText(input.actor) ?? "founder",
     evidence: { attemptId: attempt.id },
     metadata: { executionGateway: true, liveExecutionEnabled: false }
+  });
+
+  await safeRecordActivityLog({
+    sellerId: action.sellerId,
+    eventType: "EXECUTION_GATEWAY_LIVE_BLOCKED",
+    eventCategory: "EXECUTION",
+    severity: "WARNING",
+    actor: cleanText(input.actor) ?? "founder",
+    title: "Live execution blocked",
+    message: "Live execution is disabled in V1. No external action executed.",
+    entityType: action.entityType,
+    entityId: action.entityId,
+    sku: action.sku,
+    asin: action.asin,
+    actionId: action.id,
+    sourceModule: "execution-gateway",
+    metadata: { attemptId: attempt.id, liveExecutionEnabled: false }
   });
 
   return {

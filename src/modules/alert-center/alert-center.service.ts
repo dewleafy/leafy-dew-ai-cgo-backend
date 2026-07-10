@@ -1,5 +1,6 @@
 import { supabase } from "../../db/supabase";
 import { getActionLedgerSummary } from "../action-ledger/action-ledger.service";
+import { safeRecordActivityLog } from "../activity-logs/activity-logs.service";
 import { AlertCandidate, AlertEventRow, AlertRuleRow, SafeAlertEvent, SafeAlertRule } from "./alert-center.types";
 
 const DEFAULT_ALERT_RULES: Array<Omit<AlertRuleRow, "id" | "created_at" | "updated_at">> = [
@@ -262,6 +263,18 @@ export async function generateAlerts(sellerIdInput: string): Promise<{
     rows.push(await insertAlertEvent(candidate, sellerId));
   }
 
+  await safeRecordActivityLog({
+    sellerId,
+    eventType: "ALERTS_GENERATED",
+    eventCategory: "ALERT_CENTER",
+    severity: rows.some((row) => row.severity === "CRITICAL") ? "CRITICAL" : rows.some((row) => row.severity === "HIGH") ? "WARNING" : "INFO",
+    actor: "system",
+    title: "Alert Center generated alerts",
+    message: `${rows.length} alerts generated and ${skippedCount} duplicates skipped.`,
+    sourceModule: "alert-center",
+    metadata: { generatedCount: rows.length, skippedCount }
+  });
+
   return { ok: true, sellerId, generatedCount: rows.length, skippedCount, rows };
 }
 
@@ -306,5 +319,25 @@ export async function updateAlertEventStatus(input: {
     .select("*")
     .maybeSingle<AlertEventRow>();
   if (error) throw new Error(error.message);
-  return data ? toSafeEvent(data) : null;
+  const row = data ? toSafeEvent(data) : null;
+  if (row) {
+    await safeRecordActivityLog({
+      sellerId: row.sellerId,
+      eventType: input.status === "ACKNOWLEDGED" ? "ALERT_ACKNOWLEDGED" : "ALERT_RESOLVED",
+      eventCategory: "ALERT_CENTER",
+      severity: input.status === "RESOLVED" ? "SUCCESS" : "INFO",
+      actor: "founder",
+      title: row.title,
+      message: `Alert marked ${input.status.toLowerCase()}.`,
+      entityType: row.entityType,
+      entityId: row.entityId,
+      sku: row.sku,
+      asin: row.asin,
+      actionId: row.actionId,
+      sourceModule: "alert-center",
+      metadata: { alertId: row.id, ruleKey: row.ruleKey, status: input.status }
+    });
+  }
+
+  return row;
 }

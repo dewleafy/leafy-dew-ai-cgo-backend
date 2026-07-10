@@ -38,6 +38,7 @@ import {
   recordWorkflowEventsForUpdatedRows,
   transitionActionState
 } from "./action-workflow.service";
+import { safeRecordActivityLog } from "../activity-logs/activity-logs.service";
 
 const nullableTextSchema = z
   .string()
@@ -278,6 +279,46 @@ async function recordLearningForActionRow(input: {
   });
 }
 
+async function recordActivityForActionRow(input: {
+  row: {
+    id: string;
+    sellerId: string;
+    actionType: string;
+    entityType: string | null;
+    entityId: string | null;
+    sku: string | null;
+    asin: string | null;
+    title: string;
+  };
+  eventType: string;
+  severity?: "INFO" | "SUCCESS" | "WARNING" | "ERROR";
+  actor?: string | null;
+  message: string;
+  metadata?: Record<string, unknown>;
+}): Promise<void> {
+  await safeRecordActivityLog({
+    sellerId: input.row.sellerId,
+    eventType: input.eventType,
+    eventCategory: "ACTION_LEDGER",
+    severity: input.severity ?? "INFO",
+    actor: input.actor ?? "founder",
+    title: input.row.title,
+    message: input.message,
+    entityType: input.row.entityType,
+    entityId: input.row.entityId,
+    sku: input.row.sku,
+    asin: input.row.asin,
+    actionId: input.row.id,
+    sourceModule: "action-ledger",
+    metadata: {
+      actionType: input.row.actionType,
+      shadowMode: true,
+      externalExecution: false,
+      ...(input.metadata ?? {})
+    }
+  });
+}
+
 const batchIdSchema = z
   .string()
   .trim()
@@ -489,6 +530,15 @@ export async function batchRejectActionLedgerRows(req: Request, res: Response): 
       note: parsed.data.note
     })));
 
+    await Promise.all(result.rows.map((row) => recordActivityForActionRow({
+      row,
+      eventType: "ACTION_REJECTED",
+      severity: "INFO",
+      actor: actorForAction({ actor: parsed.data.actor, rejectedBy: parsed.data.rejectedBy, fallback: "founder" }),
+      message: "Action rejected. No external action was executed.",
+      metadata: { batch: true }
+    })));
+
     sendBatchResult(res, result);
   } catch {
     sendDatabaseError(res, "Could not batch reject action ledger rows in Supabase.");
@@ -535,6 +585,15 @@ export async function batchMonitorActionLedgerRows(req: Request, res: Response):
       note: parsed.data.note
     })));
 
+    await Promise.all(result.rows.map((row) => recordActivityForActionRow({
+      row,
+      eventType: "ACTION_MONITORING",
+      severity: "INFO",
+      actor: actorForAction({ actor: parsed.data.actor, approvedBy: parsed.data.approvedBy, fallback: "founder" }),
+      message: "Action moved to monitoring. No external action was executed.",
+      metadata: { batch: true }
+    })));
+
     sendBatchResult(res, result);
   } catch {
     sendDatabaseError(res, "Could not batch move action ledger rows to monitoring in Supabase.");
@@ -578,6 +637,15 @@ export async function batchCompleteActionLedgerRows(req: Request, res: Response)
       eventType: "ACTION_COMPLETED",
       actor: actorForAction({ actor: parsed.data.actor, approvedBy: parsed.data.approvedBy, fallback: "founder" }),
       note: parsed.data.note
+    })));
+
+    await Promise.all(result.rows.map((row) => recordActivityForActionRow({
+      row,
+      eventType: "ACTION_COMPLETED",
+      severity: "SUCCESS",
+      actor: actorForAction({ actor: parsed.data.actor, approvedBy: parsed.data.approvedBy, fallback: "founder" }),
+      message: "Action marked completed manually.",
+      metadata: { batch: true }
     })));
 
     sendBatchResult(res, result);
@@ -720,6 +788,14 @@ export async function reopenActionLedgerRow(req: Request, res: Response): Promis
       actor: parsed.data.actor,
       note: parsed.data.note
     });
+
+    await recordActivityForActionRow({
+      row: result.row,
+      eventType: "ACTION_REOPENED",
+      severity: "INFO",
+      actor: parsed.data.actor,
+      message: "Action reopened for founder approval. No external action was executed."
+    });
   } catch (error) {
     if (isInvalidWorkflowTransition(error)) {
       sendWorkflowTransitionError(res);
@@ -821,6 +897,19 @@ async function updateState(
         fallback: "founder"
       }),
       note: parsed.data.note
+    });
+
+    await recordActivityForActionRow({
+      row: result.row,
+      eventType: learningEventType,
+      severity: approvalStatus === "APPROVED" || approvalStatus === "COMPLETED" ? "SUCCESS" : "INFO",
+      actor: actorForAction({
+        actor: actorInput === "actor" ? parsed.data.actor : null,
+        approvedBy: actorInput === "approvedBy" ? parsed.data.approvedBy : null,
+        rejectedBy: actorInput === "rejectedBy" ? parsed.data.rejectedBy : null,
+        fallback: "founder"
+      }),
+      message
     });
   } catch (error) {
     if (isInvalidWorkflowTransition(error)) {

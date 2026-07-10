@@ -1,4 +1,5 @@
 import { supabase } from "../../db/supabase";
+import { safeRecordActivityLog } from "../activity-logs/activity-logs.service";
 import {
   DataFreshnessMarkInput,
   DataFreshnessSource,
@@ -162,6 +163,23 @@ export async function checkDataFreshness(sellerIdInput: string): Promise<{
   const warnings = rows
     .filter((row) => row.status === "STALE" || row.status === "ERROR")
     .map((row) => `${row.dataSource} is ${row.status}.`);
+
+  await safeRecordActivityLog({
+    sellerId,
+    eventType: "DATA_FRESHNESS_CHECK_COMPLETED",
+    eventCategory: "DATA_FRESHNESS",
+    severity: warnings.length ? "WARNING" : "SUCCESS",
+    actor: "system",
+    title: "Data freshness check completed",
+    message: `${rows.length} data sources checked.`,
+    sourceModule: "data-freshness",
+    metadata: {
+      rows: rows.length,
+      warnings,
+      staleSources: rows.filter((row) => row.status === "STALE").length,
+      errorSources: rows.filter((row) => row.status === "ERROR").length
+    }
+  });
 
   return { ok: true, sellerId, rows, warnings };
 }

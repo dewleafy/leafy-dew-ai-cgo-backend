@@ -1,6 +1,7 @@
 import { env } from "../../config/env";
 import { supabase } from "../../db/supabase";
 import { logger } from "../../utils/logger";
+import { safeRecordActivityLog } from "../activity-logs/activity-logs.service";
 import { getActionLedgerSummary } from "../action-ledger/action-ledger.service";
 import { getDailyEnginePlan, runEngineRouterPreview } from "../engine-router/engine-router.service";
 import { listProductEconomics } from "../product-economics/product-economics.service";
@@ -536,6 +537,18 @@ export async function runDailyOrchestrator(input: DailyOrchestratorRunInput): Pr
       }
     });
 
+    await safeRecordActivityLog({
+      sellerId,
+      eventType: "DAILY_ORCHESTRATOR_RUN_COMPLETED",
+      eventCategory: "DAILY_ORCHESTRATOR",
+      severity: failedCount > 0 || warnings.length > 0 ? "WARNING" : "SUCCESS",
+      actor,
+      title: "Daily AI-CGO run completed",
+      message: "Daily AI-CGO run completed in shadow mode. No external action executed.",
+      sourceModule: "daily-orchestrator",
+      metadata: { runId: run.id, enginesRun: routerResult.enginesRun, actionsCreated, failedCount }
+    });
+
     return {
       ok: true,
       sellerId,
@@ -592,6 +605,18 @@ export async function runDailyOrchestrator(input: DailyOrchestratorRunInput): Pr
         runId: run.id,
         message: sanitizeErrorMessage(updateError instanceof Error ? updateError.message : "Unknown update failure")
       });
+    });
+
+    await safeRecordActivityLog({
+      sellerId,
+      eventType: "DAILY_ORCHESTRATOR_RUN_FAILED",
+      eventCategory: "DAILY_ORCHESTRATOR",
+      severity: "ERROR",
+      actor,
+      title: "Daily AI-CGO run failed safely",
+      message: "Daily orchestration failed safely. No external action executed.",
+      sourceModule: "daily-orchestrator",
+      metadata: { runId: run.id, error: safeMessage }
     });
 
     throw new DailyOrchestratorSafeError("Daily orchestration failed safely. No external action executed.", run.id);

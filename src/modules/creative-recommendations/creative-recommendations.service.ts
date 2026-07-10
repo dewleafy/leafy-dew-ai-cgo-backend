@@ -1,5 +1,6 @@
 import { supabase } from "../../db/supabase";
 import { ensureActionLedgerAction } from "../action-ledger/action-ledger.service";
+import { safeRecordActivityLog } from "../activity-logs/activity-logs.service";
 import { AmazonSpListingRow } from "../amazon-sp/amazon-sp.types";
 import { recordLearningEventSafe } from "../learning-loop/learning-loop.service";
 import { ProductPassportRow } from "../product-passports/product-passports.types";
@@ -363,6 +364,23 @@ export async function createActionForCreativeRecommendation(id: string): Promise
     metadata: { creativeRecommendationSystem: true }
   });
 
+  await safeRecordActivityLog({
+    sellerId: recommendation.sellerId,
+    eventType: "CREATIVE_RECOMMENDATION_ACTION_CREATED",
+    eventCategory: "CREATIVE_RECOMMENDATIONS",
+    severity: ensured.created ? "INFO" : "WARNING",
+    actor: "system",
+    title: "Creative recommendation action linked",
+    message: "Creative review action was created or linked. No image or A+ upload executed.",
+    entityType: ensured.row.entityType,
+    entityId: ensured.row.entityId,
+    sku: recommendation.sku,
+    asin: recommendation.asin,
+    actionId: ensured.row.id,
+    sourceModule: "creative-recommendations",
+    metadata: { recommendationId: recommendation.id, actionCreated: ensured.created, imageUpload: false, aPlusUpload: false }
+  });
+
   return { row: toSafeRecommendation(updated), actionCreated: ensured.created, actionId: ensured.row.id };
 }
 
@@ -399,6 +417,18 @@ export async function generateCreativeRecommendations(sellerIdInput: string): Pr
       if (actionResult.actionCreated) actionsCreated += 1;
     }
   }
+
+  await safeRecordActivityLog({
+    sellerId,
+    eventType: "CREATIVE_RECOMMENDATION_GENERATION_COMPLETED",
+    eventCategory: "CREATIVE_RECOMMENDATIONS",
+    severity: rows.length > 0 ? "INFO" : "WARNING",
+    actor: "system",
+    title: "Creative recommendation generation completed",
+    message: "Creative recommendation generation completed in shadow mode. No image or A+ upload executed.",
+    sourceModule: "creative-recommendations",
+    metadata: { scannedCount: products.length, recommendationsCreated: rows.length, actionsCreated, skippedCount }
+  });
 
   return {
     ok: true,

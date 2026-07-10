@@ -1,4 +1,5 @@
 import { supabase } from "../../db/supabase";
+import { safeRecordActivityLog } from "../activity-logs/activity-logs.service";
 import {
   AiBlockedInput,
   AiCostLedgerRow,
@@ -176,7 +177,26 @@ export async function recordBlockedAiAttempt(input: AiBlockedInput): Promise<Saf
     .single<AiCostLedgerRow>();
 
   if (error || !data) throw new Error(error?.message ?? "Could not record blocked AI attempt.");
-  return toSafeLedger(data);
+  const row = toSafeLedger(data);
+  await safeRecordActivityLog({
+    sellerId: row.sellerId,
+    eventType: "AI_GATEWAY_BLOCKED_ATTEMPT_RECORDED",
+    eventCategory: "AI_GATEWAY",
+    severity: "WARNING",
+    actor: "system",
+    title: "AI call blocked",
+    message: "AI call attempt was recorded as blocked. No external AI call executed.",
+    sourceModule: "ai-gateway",
+    metadata: {
+      requestId: row.requestId,
+      moduleName: row.moduleName,
+      estimatedCost: row.estimatedCost,
+      aiCallsEnabled: false,
+      externalAiCall: false
+    }
+  });
+
+  return row;
 }
 
 export async function listAiCostLedger(input: { sellerId: string; limit: number }): Promise<SafeAiCostLedgerEntry[]> {
