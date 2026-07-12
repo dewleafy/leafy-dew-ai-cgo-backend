@@ -20,9 +20,9 @@ export type ProductionHealthSummary = {
   warnings: string[];
   nextChecks: string[];
   safety: {
-    shadowMode: true;
+    shadowMode: boolean;
     externalExecution: false;
-    liveExecutionEnabled: false;
-    aiCallsEnabled: false;
+    liveExecutionEnabled: boolean;
+    aiCallsEnabled: boolean;
   };
 };

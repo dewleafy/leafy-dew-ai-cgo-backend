@@ -2,6 +2,7 @@ import { Request, Response } from "express";
 import { z } from "zod";
 import {
   estimateAiUsage,
+  generateAiResponse,
   getAiCostSummary,
   getAiGatewayStatus,
   listAiCostLedger,
@@ -23,6 +24,12 @@ const aiEstimateSchema = z.object({
 const blockedSchema = aiEstimateSchema.extend({
   requestId: z.string().nullable().optional(),
   blockedReason: z.string().nullable().optional()
+});
+
+const generateSchema = aiEstimateSchema.extend({
+  requestId: z.string().nullable().optional(),
+  maxOutputTokens: z.number().finite().optional(),
+  actor: z.string().nullable().optional()
 });
 
 function sellerIdFromQuery(req: Request): string {
@@ -90,5 +97,19 @@ export async function recordBlockedAiAttemptRoute(req: Request, res: Response): 
     res.json({ ok: true, row, aiCallsEnabled: false, message: "AI call attempt recorded as blocked. No AI provider was called." });
   } catch {
     sendAiGatewayError(res, "Could not record blocked AI attempt.");
+  }
+}
+
+export async function generateAiResponseRoute(req: Request, res: Response): Promise<void> {
+  const parsed = generateSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    res.status(400).json({ ok: false, message: "Please check AI generate input.", issues: parsed.error.issues });
+    return;
+  }
+
+  try {
+    res.json(await generateAiResponse(parsed.data));
+  } catch {
+    sendAiGatewayError(res, "Could not process AI generate request.");
   }
 }

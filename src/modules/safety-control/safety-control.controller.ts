@@ -55,10 +55,10 @@ export async function getSafetyControlStatusRoute(req: Request, res: Response): 
       sellerId,
       settings,
       snapshot,
-      shadowMode: true,
-      liveExecutionEnabled: false,
-      approvalRequired: true,
-      message: "Live execution remains blocked in V1."
+      shadowMode: snapshot.shadowMode,
+      liveExecutionEnabled: snapshot.liveExecutionEnabled,
+      approvalRequired: snapshot.approvalRequired,
+      message: snapshot.message
     });
   } catch {
     sendSafetyDatabaseError(res);
@@ -89,10 +89,10 @@ export async function patchSafetyControlSettingsRoute(req: Request, res: Respons
       ok: true,
       sellerId,
       ...result,
-      shadowMode: true,
-      liveExecutionEnabled: false,
-      approvalRequired: true,
-      message: "Live execution remains blocked in V1."
+      shadowMode: result.snapshot.shadowMode,
+      liveExecutionEnabled: result.snapshot.liveExecutionEnabled,
+      approvalRequired: result.snapshot.approvalRequired,
+      message: result.snapshot.message
     });
   } catch {
     sendSafetyDatabaseError(res);

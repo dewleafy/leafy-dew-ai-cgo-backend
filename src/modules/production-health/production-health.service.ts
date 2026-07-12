@@ -5,6 +5,8 @@ import { getAiCostSummary, getAiGatewayStatus } from "../ai-gateway/ai-gateway.s
 import { getDataFreshnessSummary } from "../data-freshness/data-freshness.service";
 import { getExperimentSummary } from "../experiments/experiments.service";
 import { getExecutionGatewayStatus } from "../execution-gateway/execution-gateway.service";
+import { getListingLiveAdapterStatus } from "../live-execution/listing-live-adapter";
+import { getPpcLiveAdapterStatus } from "../live-execution/ppc-live-adapter";
 import { getSafetyControlSnapshotSafe } from "../safety-control/safety-control.service";
 import { ProductionHealthModule, ProductionHealthStatus, ProductionHealthSummary } from "./production-health.types";
 
@@ -106,6 +108,11 @@ export async function getProductionHealthSummary(sellerIdInput: string): Promise
     await tableModule({ key: "daily_orchestrator", name: "Daily Orchestrator", table: "daily_orchestrator_runs", sellerId, critical: false }),
     await tableModule({ key: "learning_loop", name: "Learning Loop", table: "action_learning_events", sellerId, critical: false }),
     await tableModule({ key: "execution_gateway", name: "Execution Gateway", table: "execution_attempts", sellerId, critical: true }),
+    await tableModule({ key: "live_execution", name: "Live Execution", table: "live_execution_runs", sellerId, critical: true }),
+    await tableModule({ key: "launch_gate", name: "Launch Gate", table: "launch_gate_checks", sellerId, critical: false }),
+    await tableModule({ key: "scheduler_control", name: "Scheduler Control", table: "scheduler_jobs", sellerId, critical: false }),
+    await tableModule({ key: "notification_outbox", name: "Notification Outbox", table: "notification_outbox", sellerId, critical: false }),
+    await tableModule({ key: "security_guardrails", name: "Security Guardrails", table: "security_audit_events", sellerId, critical: false }),
     await tableModule({ key: "listing_drafts", name: "Listing Drafts", table: "listing_optimization_drafts", sellerId, critical: false }),
     await tableModule({ key: "creative_recommendations", name: "Creative Recommendations", table: "creative_recommendations", sellerId, critical: false }),
     await tableModule({ key: "activity_logs", name: "Activity Logs", table: "activity_log_events", sellerId, critical: false }),
@@ -120,8 +127,34 @@ export async function getProductionHealthSummary(sellerIdInput: string): Promise
     key: "safety_control",
     name: "Safety Control",
     status: safety.settings ? "PASS" : "WARN",
-    message: safety.settings ? "Safety Control is initialized and locked to shadow mode." : "Safety Control table is unavailable or not initialized; locked fallback is active.",
+    message: safety.settings ? "Safety Control is initialized with controlled flags." : "Safety Control table is unavailable or not initialized; locked fallback is active.",
     critical: true
+  }));
+
+  const ppcAdapter = getPpcLiveAdapterStatus();
+  modules.push(moduleResult({
+    key: "ppc_live_adapter",
+    name: "PPC live adapter configured status",
+    status: safety.settings?.ppcLiveExecutionEnabled && !ppcAdapter.configured ? "FAIL" : "PASS",
+    message: ppcAdapter.reason,
+    critical: true
+  }));
+
+  const listingAdapter = getListingLiveAdapterStatus();
+  modules.push(moduleResult({
+    key: "listing_live_adapter",
+    name: "Listing live adapter configured status",
+    status: safety.settings?.listingLiveExecutionEnabled && !listingAdapter.configured ? "FAIL" : "PASS",
+    message: listingAdapter.reason,
+    critical: true
+  }));
+
+  modules.push(moduleResult({
+    key: "launch_checklist",
+    name: "Launch Checklist",
+    status: "PASS",
+    message: "Launch Checklist API is mounted; readiness is computed on demand.",
+    critical: false
   }));
 
   await getAlertSummary(sellerId)
@@ -165,7 +198,7 @@ export async function getProductionHealthSummary(sellerIdInput: string): Promise
       key: "ai_gateway",
       name: "AI Gateway",
       status: "PASS",
-      message: "AI Gateway is reachable and AI calls are disabled.",
+      message: cost.aiCallsEnabled ? "AI Gateway is reachable and AI calls are controlled by settings." : "AI Gateway is reachable and AI calls are disabled.",
       critical: true,
       counts: { requestsToday: cost.requestsToday, requestsMonth: cost.requestsMonth }
     })))
@@ -178,12 +211,8 @@ export async function getProductionHealthSummary(sellerIdInput: string): Promise
   if (!safety.settings) {
     explicitBlockers.push("Safety Control is missing and using locked fallback settings.");
   }
-  if (safety.liveExecutionEnabled !== false) {
-    explicitBlockers.push("Live execution is enabled unexpectedly.");
-  }
-  if (safety.aiCallsEnabled !== false) {
-    explicitBlockers.push("AI calls are enabled unexpectedly.");
-  }
+  if (safety.liveExecutionEnabled) explicitWarnings.push("Live execution flag is enabled; live runs still require preflight gates.");
+  if (safety.aiCallsEnabled) explicitWarnings.push("AI calls flag is enabled; provider and budget guardrails still apply.");
 
   await getExecutionGatewayStatus(sellerId)
     .then((status) => {
@@ -193,7 +222,7 @@ export async function getProductionHealthSummary(sellerIdInput: string): Promise
 
   await getAiGatewayStatus(sellerId)
     .then((status) => {
-      if (status.aiCallsEnabled !== false) explicitBlockers.push("AI calls are enabled unexpectedly.");
+      if (status.aiCallsEnabled) explicitWarnings.push("AI calls are enabled; verify budget and provider guardrails.");
     })
     .catch(() => explicitWarnings.push("AI Gateway status is unavailable; fallback remains disabled."));
 
@@ -262,10 +291,10 @@ export async function getProductionHealthSummary(sellerIdInput: string): Promise
       "Review AI budget before enabling any AI call path."
     ],
     safety: {
-      shadowMode: true,
+      shadowMode: !safety.liveExecutionEnabled,
       externalExecution: false,
-      liveExecutionEnabled: false,
-      aiCallsEnabled: false
+      liveExecutionEnabled: safety.liveExecutionEnabled,
+      aiCallsEnabled: safety.aiCallsEnabled
     }
   };
 }

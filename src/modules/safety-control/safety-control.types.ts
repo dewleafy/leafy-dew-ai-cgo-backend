@@ -37,15 +37,15 @@ export type SafeSafetyControlSettings = {
   id: string;
   sellerId: string;
   globalMode: string;
-  liveExecutionEnabled: false;
-  ppcLiveExecutionEnabled: false;
-  listingLiveExecutionEnabled: false;
-  imageLiveExecutionEnabled: false;
-  aPlusLiveExecutionEnabled: false;
-  socialLiveExecutionEnabled: false;
-  aiCallsEnabled: false;
-  approvalRequired: true;
-  founderApprovalRequired: true;
+  liveExecutionEnabled: boolean;
+  ppcLiveExecutionEnabled: boolean;
+  listingLiveExecutionEnabled: boolean;
+  imageLiveExecutionEnabled: boolean;
+  aPlusLiveExecutionEnabled: boolean;
+  socialLiveExecutionEnabled: boolean;
+  aiCallsEnabled: boolean;
+  approvalRequired: boolean;
+  founderApprovalRequired: boolean;
   maxDailyEngineRuns: number;
   maxDailyAiCost: number;
   maxDailyExecutionAttempts: number;
@@ -57,13 +57,13 @@ export type SafeSafetyControlSettings = {
 };
 
 export type SafetySnapshot = {
-  shadowMode: true;
-  liveExecutionEnabled: false;
-  approvalRequired: true;
-  aiCallsEnabled: false;
-  externalExecution: false;
+  shadowMode: boolean;
+  liveExecutionEnabled: boolean;
+  approvalRequired: boolean;
+  aiCallsEnabled: boolean;
+  externalExecution: boolean;
   settings: SafeSafetyControlSettings | null;
-  message: "Live execution remains blocked in V1.";
+  message: string;
 };
 
 export type SafeSafetyAuditEvent = {

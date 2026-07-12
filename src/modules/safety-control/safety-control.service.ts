@@ -43,15 +43,15 @@ function toSafeSettings(row: SafetyControlSettingsRow): SafeSafetyControlSetting
     id: row.id,
     sellerId: row.seller_id,
     globalMode: row.global_mode,
-    liveExecutionEnabled: false,
-    ppcLiveExecutionEnabled: false,
-    listingLiveExecutionEnabled: false,
-    imageLiveExecutionEnabled: false,
-    aPlusLiveExecutionEnabled: false,
-    socialLiveExecutionEnabled: false,
-    aiCallsEnabled: false,
-    approvalRequired: true,
-    founderApprovalRequired: true,
+    liveExecutionEnabled: Boolean(row.live_execution_enabled),
+    ppcLiveExecutionEnabled: Boolean(row.ppc_live_execution_enabled),
+    listingLiveExecutionEnabled: Boolean(row.listing_live_execution_enabled),
+    imageLiveExecutionEnabled: Boolean(row.image_live_execution_enabled),
+    aPlusLiveExecutionEnabled: Boolean(row.a_plus_live_execution_enabled),
+    socialLiveExecutionEnabled: Boolean(row.social_live_execution_enabled),
+    aiCallsEnabled: Boolean(row.ai_calls_enabled),
+    approvalRequired: Boolean(row.approval_required),
+    founderApprovalRequired: Boolean(row.founder_approval_required),
     maxDailyEngineRuns: toNumber(row.max_daily_engine_runs, 50),
     maxDailyAiCost: toNumber(row.max_daily_ai_cost, 0),
     maxDailyExecutionAttempts: toNumber(row.max_daily_execution_attempts, 25),
@@ -79,13 +79,15 @@ function toSafeAuditEvent(row: SafetyAuditEventRow): SafeSafetyAuditEvent {
 
 export function buildSafetySnapshot(settings: SafeSafetyControlSettings | null): SafetySnapshot {
   return {
-    shadowMode: true,
-    liveExecutionEnabled: false,
-    approvalRequired: true,
-    aiCallsEnabled: false,
-    externalExecution: false,
+    shadowMode: !settings?.liveExecutionEnabled,
+    liveExecutionEnabled: Boolean(settings?.liveExecutionEnabled),
+    approvalRequired: settings?.approvalRequired ?? true,
+    aiCallsEnabled: Boolean(settings?.aiCallsEnabled),
+    externalExecution: Boolean(settings?.liveExecutionEnabled),
     settings,
-    message: "Live execution remains blocked in V1."
+    message: settings?.liveExecutionEnabled
+      ? "Live execution is enabled in Safety Control settings and remains gated by preflight."
+      : "Live execution remains OFF by default."
   };
 }
 
@@ -194,15 +196,15 @@ function buildUpdateRow(input: SafetyControlPatchInput): Record<string, unknown>
   };
 
   if (input.globalMode !== undefined) updateRow.global_mode = cleanText(input.globalMode) ?? "SHADOW";
-  updateRow.live_execution_enabled = false;
-  updateRow.ppc_live_execution_enabled = false;
-  updateRow.listing_live_execution_enabled = false;
-  updateRow.image_live_execution_enabled = false;
-  updateRow.a_plus_live_execution_enabled = false;
-  updateRow.social_live_execution_enabled = false;
-  updateRow.ai_calls_enabled = false;
-  updateRow.approval_required = true;
-  updateRow.founder_approval_required = true;
+  if (input.liveExecutionEnabled !== undefined) updateRow.live_execution_enabled = input.liveExecutionEnabled;
+  if (input.ppcLiveExecutionEnabled !== undefined) updateRow.ppc_live_execution_enabled = input.ppcLiveExecutionEnabled;
+  if (input.listingLiveExecutionEnabled !== undefined) updateRow.listing_live_execution_enabled = input.listingLiveExecutionEnabled;
+  if (input.imageLiveExecutionEnabled !== undefined) updateRow.image_live_execution_enabled = input.imageLiveExecutionEnabled;
+  if (input.aPlusLiveExecutionEnabled !== undefined) updateRow.a_plus_live_execution_enabled = input.aPlusLiveExecutionEnabled;
+  if (input.socialLiveExecutionEnabled !== undefined) updateRow.social_live_execution_enabled = input.socialLiveExecutionEnabled;
+  if (input.aiCallsEnabled !== undefined) updateRow.ai_calls_enabled = input.aiCallsEnabled;
+  if (input.approvalRequired !== undefined) updateRow.approval_required = input.approvalRequired;
+  if (input.founderApprovalRequired !== undefined) updateRow.founder_approval_required = input.founderApprovalRequired;
 
   if (input.maxDailyEngineRuns !== undefined) updateRow.max_daily_engine_runs = Math.max(Math.floor(input.maxDailyEngineRuns), 0);
   if (input.maxDailyAiCost !== undefined) updateRow.max_daily_ai_cost = Math.max(input.maxDailyAiCost, 0);
@@ -252,10 +254,10 @@ export async function patchSafetyControlSettings(input: {
     actor: input.patch.actor ?? "system",
     title: liveEnableBlocked ? "Live enable request blocked" : "Safety settings updated",
     message: liveEnableBlocked
-      ? "A request tried to enable live execution or AI calls and was blocked."
-      : "Safety settings were updated while keeping shadow-mode locks.",
+      ? "A request updated live execution or AI call flags. Controlled preflight gates still apply."
+      : "Safety settings were updated.",
     sourceModule: "safety-control",
-    metadata: { requestedPatch: input.patch, liveExecutionEnabled: false, aiCallsEnabled: false }
+    metadata: { requestedPatch: input.patch, liveExecutionEnabled: settings.liveExecutionEnabled, aiCallsEnabled: settings.aiCallsEnabled }
   });
 
   return { settings, snapshot: buildSafetySnapshot(settings), liveEnableBlocked };

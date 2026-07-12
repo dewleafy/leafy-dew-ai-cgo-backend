@@ -22,8 +22,12 @@ import { executionGatewayRouter } from "./modules/execution-gateway/execution-ga
 import { experimentRoutes } from "./modules/experiments/experiments.routes";
 import { learningLoopRouter } from "./modules/learning-loop/learning-loop.routes";
 import { learningSummaryRoutes } from "./modules/learning-summary/learning-summary.routes";
+import { launchChecklistRouter } from "./modules/launch-checklist/launch-checklist.routes";
+import { launchGateRouter } from "./modules/launch-gate/launch-gate.routes";
 import { listingDraftsRouter } from "./modules/listing-drafts/listing-drafts.routes";
 import { listingReadinessRoutes } from "./modules/listing-readiness/listing-readiness.routes";
+import { liveExecutionRouter } from "./modules/live-execution/live-execution.routes";
+import { notificationOutboxRouter } from "./modules/notification-outbox/notification-outbox.routes";
 import { productEconomicsRouter } from "./modules/product-economics/product-economics.routes";
 import { productPassportRoutes } from "./modules/product-passports/product-passports.routes";
 import { productionHealthRouter } from "./modules/production-health/production-health.routes";
@@ -33,6 +37,8 @@ import { recommendationOutcomeRoutes } from "./modules/recommendation-outcomes/r
 import { recommendationsRouter } from "./modules/recommendations/recommendations.routes";
 import { rollbackRouter } from "./modules/rollback/rollback.routes";
 import { safetyControlRouter } from "./modules/safety-control/safety-control.routes";
+import { schedulerControlRouter } from "./modules/scheduler-control/scheduler-control.routes";
+import { securityGuardrailsRouter } from "./modules/security-guardrails/security-guardrails.routes";
 import { todayCommandRouter } from "./modules/today-command/today-command.routes";
 import { logger } from "./utils/logger";
 
@@ -55,7 +61,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
     res.setHeader("Vary", "Origin");
   }
 
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-cron-secret");
   res.setHeader("Access-Control-Max-Age", "86400");
 
@@ -191,8 +197,12 @@ app.use("/api/execution-gateway", executionGatewayRouter);
 app.use("/api/experiments", experimentRoutes);
 app.use("/api/learning-loop", learningLoopRouter);
 app.use("/api/learning-summary", learningSummaryRoutes);
+app.use("/api/launch-checklist", launchChecklistRouter);
+app.use("/api/launch-gate", launchGateRouter);
 app.use("/api/listing-drafts", listingDraftsRouter);
 app.use("/api/listing-readiness", listingReadinessRoutes);
+app.use("/api/live-execution", liveExecutionRouter);
+app.use("/api/notification-outbox", notificationOutboxRouter);
 app.use("/api/product-economics", productEconomicsRouter);
 app.use("/api/product-passport", productPassportRoutes);
 app.use("/api/product-passports", productPassportRoutes);
@@ -203,6 +213,8 @@ app.use("/api/recommendation-outcomes", recommendationOutcomeRoutes);
 app.use("/api/recommendations", recommendationsRouter);
 app.use("/api/rollback", rollbackRouter);
 app.use("/api/safety-control", safetyControlRouter);
+app.use("/api/scheduler-control", schedulerControlRouter);
+app.use("/api/security-guardrails", securityGuardrailsRouter);
 app.use("/api/today-command", todayCommandRouter);
 
 app.use((_req: Request, res: Response) => {

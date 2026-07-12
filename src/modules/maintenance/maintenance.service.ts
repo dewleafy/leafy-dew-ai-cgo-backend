@@ -2,7 +2,9 @@ import { supabase } from "../../db/supabase";
 import { safeRecordActivityLog } from "../activity-logs/activity-logs.service";
 import { generateAlerts, seedDefaultAlertRules } from "../alert-center/alert-center.service";
 import { checkDataFreshness } from "../data-freshness/data-freshness.service";
+import { runLaunchGateChecks } from "../launch-gate/launch-gate.service";
 import { rebuildLearningSummaries } from "../learning-loop/learning-loop.service";
+import { initializeNotificationSettings } from "../notification-outbox/notification-outbox.service";
 import { getProductionHealthSummary } from "../production-health/production-health.service";
 import { initializeSafetyControl } from "../safety-control/safety-control.service";
 import { MaintenanceRunRow, SafeMaintenanceRun } from "./maintenance.types";
@@ -44,6 +46,34 @@ function toSafeRun(row: MaintenanceRunRow): SafeMaintenanceRun {
     errorMessage: row.error_message,
     createdAt: row.created_at
   };
+}
+
+async function seedSchedulerJobsForMaintenance(sellerId: string): Promise<number> {
+  const jobs = [
+    ["DAILY_SP_API_SYNC", "Daily SP-API Sync", "SYNC", "daily"],
+    ["DAILY_AMAZON_ADS_SYNC", "Daily Amazon Ads Sync", "SYNC", "daily"],
+    ["DAILY_AI_CGO", "Daily AI-CGO", "ORCHESTRATION", "daily shadow"],
+    ["DAILY_MAINTENANCE", "Daily Maintenance", "MAINTENANCE", "daily"],
+    ["DAILY_QA_SMOKE", "Daily QA Smoke", "QA", "daily"],
+    ["DAILY_ALERT_GENERATION", "Daily Alert Generation", "ALERTS", "daily"],
+    ["DAILY_DATA_FRESHNESS", "Daily Data Freshness", "DATA", "daily"],
+    ["DAILY_LEARNING_REBUILD", "Daily Learning Rebuild", "LEARNING", "daily"],
+    ["DAILY_PRODUCTION_HEALTH", "Daily Production Health", "HEALTH", "daily"]
+  ];
+  const { data, error } = await supabase
+    .from("scheduler_jobs")
+    .upsert(jobs.map(([jobKey, jobName, jobType, scheduleHint]) => ({
+      seller_id: sellerId,
+      job_key: jobKey,
+      job_name: jobName,
+      job_type: jobType,
+      enabled: true,
+      schedule_hint: scheduleHint,
+      updated_at: new Date().toISOString()
+    })), { onConflict: "seller_id,job_key" })
+    .select("id");
+  if (error) throw new Error(error.message);
+  return data?.length ?? 0;
 }
 
 async function createRun(sellerId: string, runType: string): Promise<SafeMaintenanceRun> {
@@ -112,9 +142,28 @@ export async function runMaintenance(input: {
     try {
       const safety = await initializeSafetyControl(sellerId, "maintenance");
       safetyInitialized = Boolean(safety.settings);
-      results.safety = { created: safety.created, liveExecutionEnabled: false, aiCallsEnabled: false };
+      results.safety = { created: safety.created, liveExecutionEnabled: safety.settings.liveExecutionEnabled, aiCallsEnabled: safety.settings.aiCallsEnabled };
     } catch (error) {
       warnings.push(`Safety Control initialization warning: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+
+    try {
+      const schedulerJobsSeeded = await seedSchedulerJobsForMaintenance(sellerId);
+      results.schedulerControl = { jobsSeeded: schedulerJobsSeeded };
+    } catch (error) {
+      warnings.push(`Scheduler job seed warning: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+
+    try {
+      const notificationSettings = await initializeNotificationSettings(sellerId);
+      results.notificationSettings = {
+        externalNotificationsEnabled: notificationSettings.externalNotificationsEnabled,
+        emailEnabled: notificationSettings.emailEnabled,
+        whatsappEnabled: notificationSettings.whatsappEnabled,
+        slackEnabled: notificationSettings.slackEnabled
+      };
+    } catch (error) {
+      warnings.push(`Notification settings initialization warning: ${error instanceof Error ? error.message : "unknown error"}`);
     }
 
     try {
@@ -163,6 +212,31 @@ export async function runMaintenance(input: {
       warnings.push(`Production Health warning: ${error instanceof Error ? error.message : "unknown error"}`);
     }
 
+    try {
+      const launchGate = await runLaunchGateChecks(sellerId);
+      results.launchGate = {
+        overallStatus: launchGate.overallStatus,
+        blockers: launchGate.blockers,
+        warnings: launchGate.warnings
+      };
+      warnings.push(...launchGate.warnings);
+    } catch (error) {
+      warnings.push(`Launch Gate warning: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+
+    try {
+      const { runLaunchChecklist } = await import("../launch-checklist/launch-checklist.service");
+      const checklist = await runLaunchChecklist(sellerId);
+      results.launchChecklist = {
+        overallLaunchStatus: checklist.overallLaunchStatus,
+        blockers: checklist.blockers,
+        warnings: checklist.warnings
+      };
+      warnings.push(...checklist.warnings);
+    } catch (error) {
+      warnings.push(`Launch Checklist warning: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+
     const runStatus = warnings.length ? "COMPLETED_WITH_WARNINGS" : "COMPLETED";
     const updated = await updateRun(run.id, {
       run_status: runStatus,
@@ -187,6 +261,18 @@ export async function runMaintenance(input: {
       message: "Maintenance run completed in shadow mode. No external action executed.",
       sourceModule: "maintenance",
       metadata: { runId: run.id, runStatus, warningsCount: warnings.length }
+    });
+
+    await safeRecordActivityLog({
+      sellerId,
+      eventType: "MAINTENANCE_LAUNCH_READINESS_UPDATED",
+      eventCategory: "MAINTENANCE",
+      severity: warnings.length ? "WARNING" : "SUCCESS",
+      actor: "maintenance",
+      title: "Launch readiness maintenance completed",
+      message: "Scheduler jobs, notification settings, launch gate, and launch checklist were refreshed.",
+      sourceModule: "maintenance",
+      metadata: { runId: run.id, launchGate: results.launchGate, launchChecklist: results.launchChecklist }
     });
 
     return {

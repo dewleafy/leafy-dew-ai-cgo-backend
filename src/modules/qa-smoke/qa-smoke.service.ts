@@ -1,7 +1,7 @@
 import { supabase } from "../../db/supabase";
 import { getActionLedgerSummary } from "../action-ledger/action-ledger.service";
 import { getActivityLogSummary, safeRecordActivityLog } from "../activity-logs/activity-logs.service";
-import { getAiGatewayStatus } from "../ai-gateway/ai-gateway.service";
+import { generateAiResponse, getAiGatewayStatus } from "../ai-gateway/ai-gateway.service";
 import { getAlertSummary } from "../alert-center/alert-center.service";
 import { getDataFreshnessSummary } from "../data-freshness/data-freshness.service";
 import { getDailyOrchestratorStatus } from "../daily-orchestrator/daily-orchestrator.service";
@@ -9,6 +9,12 @@ import { getEngineRouterSummary } from "../engine-router/engine-router.service";
 import { getEngineRegistrySummary } from "../engine-registry/engine-registry.service";
 import { getExecutionGatewayStatus } from "../execution-gateway/execution-gateway.service";
 import { getExperimentSummary } from "../experiments/experiments.service";
+import { getLaunchChecklistSummary } from "../launch-checklist/launch-checklist.service";
+import { getLaunchGateSummary } from "../launch-gate/launch-gate.service";
+import { getLiveExecutionStatus } from "../live-execution/live-execution.service";
+import { getNotificationOutboxSummary } from "../notification-outbox/notification-outbox.service";
+import { getSchedulerControlSummary } from "../scheduler-control/scheduler-control.service";
+import { getSecurityGuardrailsSummary } from "../security-guardrails/security-guardrails.service";
 import { listEngineLearningSummaries } from "../learning-loop/learning-loop.service";
 import { getListingDraftSummary } from "../listing-drafts/listing-drafts.service";
 import { getCreativeRecommendationSummary } from "../creative-recommendations/creative-recommendations.service";
@@ -141,13 +147,20 @@ export async function runQaSmokeTest(sellerIdInput: string): Promise<{
     runCheck({ key: "daily_orchestrator", name: "Daily Orchestrator status reachable", critical: false, fn: async () => { const status = await getDailyOrchestratorStatus(sellerId); return `Daily Orchestrator status is ${status.mode}.`; } }),
     runCheck({ key: "learning_loop", name: "Learning Loop summary reachable", critical: false, fn: async () => `Learning Loop reachable with ${(await listEngineLearningSummaries(sellerId)).length} engine summaries.` }),
     runCheck({ key: "execution_gateway", name: "Execution Gateway status reachable and live blocked", critical: true, fn: async () => { const status = await getExecutionGatewayStatus(sellerId); return status.liveExecutionEnabled === false ? "Execution Gateway live execution is blocked." : { status: "FAIL", message: "Execution Gateway live execution is unexpectedly enabled." }; } }),
+    runCheck({ key: "live_execution_status", name: "Live Execution status reachable", critical: true, fn: async () => { const status = await getLiveExecutionStatus(sellerId); return status.liveExecutionEnabled ? { status: "WARN", message: "Live execution flag is enabled; preflight gates still apply." } : "Live Execution status reachable and OFF by default."; } }),
+    runCheck({ key: "launch_gate_summary", name: "Launch Gate summary reachable", critical: false, fn: async () => { const summary = await getLaunchGateSummary(sellerId); return `Launch Gate is ${summary.overallStatus}.`; } }),
+    runCheck({ key: "scheduler_control_summary", name: "Scheduler Control summary reachable", critical: false, fn: async () => { const summary = await getSchedulerControlSummary(sellerId); return `Scheduler Control reachable with ${summary.totalJobs} jobs.`; } }),
+    runCheck({ key: "notification_outbox_summary", name: "Notification Outbox summary reachable", critical: false, fn: async () => { const summary = await getNotificationOutboxSummary(sellerId); return `Notification Outbox reachable with ${summary.queuedCount} queued messages.`; } }),
+    runCheck({ key: "security_guardrails_summary", name: "Security Guardrails summary reachable", critical: false, fn: async () => { const summary = await getSecurityGuardrailsSummary(sellerId); return `Security Guardrails reachable with ${summary.blockedEvents} blocked events.`; } }),
+    runCheck({ key: "launch_checklist_summary", name: "Launch Checklist summary reachable", critical: false, fn: async () => { const summary = await getLaunchChecklistSummary(sellerId); return `Launch Checklist is ${summary.overallLaunchStatus}.`; } }),
     runCheck({ key: "listing_drafts", name: "Listing Drafts summary reachable", critical: false, fn: async () => { const summary = await getListingDraftSummary(sellerId); return `Listing Drafts reachable with ${summary.totalDrafts} drafts.`; } }),
     runCheck({ key: "creative_recommendations", name: "Creative Recommendations summary reachable", critical: false, fn: async () => { const summary = await getCreativeRecommendationSummary(sellerId); return `Creative Recommendations reachable with ${summary.totalRecommendations} recommendations.`; } }),
-    runCheck({ key: "safety_control", name: "Safety Control status reachable", critical: true, fn: async () => { const snapshot = await getSafetyControlSnapshotSafe(sellerId); return snapshot.liveExecutionEnabled === false && snapshot.aiCallsEnabled === false ? "Safety Control is locked to shadow mode." : { status: "FAIL", message: "Safety Control is unexpectedly enabling live execution or AI." }; } }),
+    runCheck({ key: "safety_control", name: "Safety Control status reachable", critical: true, fn: async () => { const snapshot = await getSafetyControlSnapshotSafe(sellerId); return snapshot.settings ? "Safety Control is initialized and guarded." : { status: "FAIL", message: "Safety Control is missing." }; } }),
     runCheck({ key: "alert_center", name: "Alert Center summary reachable", critical: false, fn: async () => { const summary = await getAlertSummary(sellerId); return `Alert Center reachable with ${summary.openAlerts} open alerts.`; } }),
     runCheck({ key: "experiments", name: "Experiments summary reachable", critical: false, fn: async () => { const summary = await getExperimentSummary(sellerId); return `Experiments reachable with ${summary.runningExperiments} running experiments.`; } }),
     runCheck({ key: "data_freshness", name: "Data Freshness summary reachable", critical: true, fn: async () => { const summary = await getDataFreshnessSummary(sellerId); return `Data Freshness reachable with ${summary.freshSources}/${summary.totalSources} fresh sources.`; } }),
     runCheck({ key: "ai_gateway", name: "AI Gateway status reachable and AI disabled", critical: true, fn: async () => { const status = await getAiGatewayStatus(sellerId); return status.aiCallsEnabled === false ? "AI Gateway is disabled." : { status: "FAIL", message: "AI Gateway is unexpectedly enabled." }; } }),
+    runCheck({ key: "ai_gateway_generate_blocked", name: "AI Gateway generate blocks when disabled", critical: true, fn: async () => { const result = await generateAiResponse({ sellerId, moduleName: "CEO_REPORT", purpose: "qa_smoke", prompt: "health check" }); return result.ok === false && result.blockedReason ? `AI generate blocked with ${result.blockedReason}.` : { status: "FAIL", message: "AI generate was not blocked." }; } }),
     runCheck({ key: "production_health", name: "Production Health summary reachable", critical: true, fn: async () => { const summary = await getProductionHealthSummary(sellerId); return `Production Health is ${summary.overallStatus}.`; } }),
     runCheck({ key: "today_command", name: "Today Command summary reachable", critical: true, fn: async () => { const summary = await getTodayCommandSummary(sellerId); return summary.ok ? "Today Command returned ok true." : { status: "FAIL", message: "Today Command did not return ok true." }; } }),
     runCheck({ key: "activity_logs", name: "Activity Logs reachable", critical: false, fn: async () => { const summary = await getActivityLogSummary(sellerId); return `Activity Logs reachable with ${summary.totalEvents} events.`; } }),

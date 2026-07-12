@@ -19,6 +19,12 @@ export type TodayCommandSystemStatus = {
   approvalExecutionReady: boolean;
   maintenanceReady: boolean;
   qaSmokeReady: boolean;
+  liveExecutionReady: boolean;
+  launchGateReady: boolean;
+  launchChecklistReady: boolean;
+  schedulerControlReady: boolean;
+  notificationOutboxReady: boolean;
+  securityGuardrailsReady: boolean;
 };
 
 export type TodayCommandCounts = {
@@ -51,6 +57,10 @@ export type TodayCommandCounts = {
   qaPassCount: number;
   qaWarnCount: number;
   qaFailCount: number;
+  schedulerJobs: number;
+  notificationQueued: number;
+  liveExecutionRuns: number;
+  securityBlockedEvents: number;
 };
 
 export type TodayCommandSummary = {
@@ -62,11 +72,22 @@ export type TodayCommandSummary = {
   topRisks: unknown[];
   todayPriorities: unknown[];
   nextBestActions: unknown[];
+  launchGateStatus: string | null;
+  launchChecklistStatus: string | null;
+  schedulerJobs: number;
+  notificationQueued: number;
+  liveExecutionRuns: number;
+  latestDryRunStatus: string | null;
+  liveEligible: boolean;
+  ppcLiveEligible: boolean;
+  listingLiveEligible: boolean;
+  securityBlockedEvents: number;
+  launchNextSteps: unknown[];
   safety: {
-    shadowMode: true;
+    shadowMode: boolean;
     externalExecution: false;
-    liveExecutionEnabled: false;
-    aiCallsEnabled: false;
+    liveExecutionEnabled: boolean;
+    aiCallsEnabled: boolean;
   };
   warnings: string[];
 };

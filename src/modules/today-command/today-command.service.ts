@@ -5,7 +5,13 @@ import { getAiCostSummary } from "../ai-gateway/ai-gateway.service";
 import { getCriticalDataSourceSet, getDataFreshnessSummary } from "../data-freshness/data-freshness.service";
 import { getEngineRouterSummary } from "../engine-router/engine-router.service";
 import { getExperimentSummary } from "../experiments/experiments.service";
+import { getLaunchChecklistSummary } from "../launch-checklist/launch-checklist.service";
+import { getLaunchGateSummary } from "../launch-gate/launch-gate.service";
+import { listLiveExecutionRuns } from "../live-execution/live-execution.service";
+import { getNotificationOutboxSummary } from "../notification-outbox/notification-outbox.service";
 import { getProductionHealthSummary } from "../production-health/production-health.service";
+import { getSchedulerControlSummary } from "../scheduler-control/scheduler-control.service";
+import { getSecurityGuardrailsSummary } from "../security-guardrails/security-guardrails.service";
 import { getSafetyControlSnapshotSafe } from "../safety-control/safety-control.service";
 import { TodayCommandCounts, TodayCommandSummary, TodayCommandSystemStatus } from "./today-command.types";
 
@@ -279,6 +285,73 @@ async function safeProductionHealthReady(sellerId: string): Promise<{ ready: boo
   }
 }
 
+async function safeLaunchGate(sellerId: string): Promise<{ ready: boolean; status: string | null; liveEligible: boolean; ppcLiveEligible: boolean; listingLiveEligible: boolean; nextSteps: unknown[]; warning: string | null }> {
+  try {
+    const summary = await getLaunchGateSummary(sellerId);
+    return {
+      ready: true,
+      status: summary.overallStatus,
+      liveEligible: summary.liveEligible,
+      ppcLiveEligible: summary.ppcLiveEligible,
+      listingLiveEligible: summary.listingLiveEligible,
+      nextSteps: summary.nextSteps,
+      warning: summary.overallStatus === "PASS" ? null : `Launch Gate is ${summary.overallStatus}.`
+    };
+  } catch {
+    return { ready: false, status: null, liveEligible: false, ppcLiveEligible: false, listingLiveEligible: false, nextSteps: [], warning: "Launch Gate is not reachable." };
+  }
+}
+
+async function safeLaunchChecklist(sellerId: string): Promise<{ ready: boolean; status: string | null; warning: string | null }> {
+  try {
+    const summary = await getLaunchChecklistSummary(sellerId);
+    return {
+      ready: true,
+      status: summary.overallLaunchStatus,
+      warning: summary.overallLaunchStatus === "NOT_READY" ? "Launch Checklist is not ready." : null
+    };
+  } catch {
+    return { ready: false, status: null, warning: "Launch Checklist is not reachable." };
+  }
+}
+
+async function safeSchedulerSummary(sellerId: string): Promise<{ ready: boolean; jobs: number; warning: string | null }> {
+  try {
+    const summary = await getSchedulerControlSummary(sellerId);
+    return { ready: true, jobs: summary.totalJobs, warning: null };
+  } catch {
+    return { ready: false, jobs: 0, warning: "Scheduler Control is not reachable." };
+  }
+}
+
+async function safeNotificationSummary(sellerId: string): Promise<{ ready: boolean; queued: number; warning: string | null }> {
+  try {
+    const summary = await getNotificationOutboxSummary(sellerId);
+    return { ready: true, queued: summary.queuedCount, warning: null };
+  } catch {
+    return { ready: false, queued: 0, warning: "Notification Outbox is not reachable." };
+  }
+}
+
+async function safeLiveExecutionSummary(sellerId: string): Promise<{ ready: boolean; runs: number; latestDryRunStatus: string | null; warning: string | null }> {
+  try {
+    const rows = await listLiveExecutionRuns({ sellerId, limit: 50 });
+    const latestDryRun = rows.find((row) => row.liveStatus === "DRY_RUN_COMPLETED" || row.dryRunStatus);
+    return { ready: true, runs: rows.length, latestDryRunStatus: latestDryRun?.dryRunStatus ?? latestDryRun?.liveStatus ?? null, warning: null };
+  } catch {
+    return { ready: false, runs: 0, latestDryRunStatus: null, warning: "Live Execution is not reachable." };
+  }
+}
+
+async function safeSecuritySummary(sellerId: string): Promise<{ ready: boolean; blockedEvents: number; warning: string | null }> {
+  try {
+    const summary = await getSecurityGuardrailsSummary(sellerId);
+    return { ready: true, blockedEvents: summary.blockedEvents, warning: null };
+  } catch {
+    return { ready: false, blockedEvents: 0, warning: "Security Guardrails are not reachable." };
+  }
+}
+
 export async function getTodayCommandSummary(sellerIdInput: string): Promise<TodayCommandSummary> {
   const sellerId = cleanText(sellerIdInput) ?? "default";
   const warnings: string[] = [];
@@ -307,7 +380,13 @@ export async function getTodayCommandSummary(sellerIdInput: string): Promise<Tod
     rollbackSnapshotCount,
     executableApprovedActions,
     latestMaintenance,
-    latestQa
+    latestQa,
+    launchGate,
+    launchChecklist,
+    schedulerControl,
+    notificationOutbox,
+    liveExecution,
+    securityGuardrails
   ] = await Promise.all([
     safeActionSummary(sellerId),
     safePriorities(sellerId),
@@ -331,7 +410,13 @@ export async function getTodayCommandSummary(sellerIdInput: string): Promise<Tod
     safeCount({ table: "rollback_snapshots", sellerId }),
     safeCount({ table: "action_ledger", sellerId, filters: [{ column: "approval_status", value: "APPROVED" }, { column: "requires_approval", value: true }] }),
     safeLatestRow({ table: "maintenance_runs", sellerId, orderColumn: "started_at" }),
-    safeLatestRow({ table: "qa_smoke_test_runs", sellerId, orderColumn: "started_at" })
+    safeLatestRow({ table: "qa_smoke_test_runs", sellerId, orderColumn: "started_at" }),
+    safeLaunchGate(sellerId),
+    safeLaunchChecklist(sellerId),
+    safeSchedulerSummary(sellerId),
+    safeNotificationSummary(sellerId),
+    safeLiveExecutionSummary(sellerId),
+    safeSecuritySummary(sellerId)
   ]);
 
   for (const warning of [
@@ -357,7 +442,13 @@ export async function getTodayCommandSummary(sellerIdInput: string): Promise<Tod
     rollbackSnapshotCount.warning,
     executableApprovedActions.warning,
     latestMaintenance.warning,
-    latestQa.warning
+    latestQa.warning,
+    launchGate.warning,
+    launchChecklist.warning,
+    schedulerControl.warning,
+    notificationOutbox.warning,
+    liveExecution.warning,
+    securityGuardrails.warning
   ]) {
     if (warning) warnings.push(warning);
   }
@@ -390,7 +481,13 @@ export async function getTodayCommandSummary(sellerIdInput: string): Promise<Tod
     rollbackReady: rollbackSnapshotCount.ready,
     approvalExecutionReady: executableApprovedActions.ready,
     maintenanceReady: latestMaintenance.ready,
-    qaSmokeReady: latestQa.ready
+    qaSmokeReady: latestQa.ready,
+    liveExecutionReady: liveExecution.ready,
+    launchGateReady: launchGate.ready,
+    launchChecklistReady: launchChecklist.ready,
+    schedulerControlReady: schedulerControl.ready,
+    notificationOutboxReady: notificationOutbox.ready,
+    securityGuardrailsReady: securityGuardrails.ready
   };
 
   const latestMaintenanceStatus = typeof latestMaintenance.row?.run_status === "string" ? latestMaintenance.row.run_status : null;
@@ -428,7 +525,11 @@ export async function getTodayCommandSummary(sellerIdInput: string): Promise<Tod
     latestQaStatus,
     qaPassCount,
     qaWarnCount,
-    qaFailCount
+    qaFailCount,
+    schedulerJobs: schedulerControl.jobs,
+    notificationQueued: notificationOutbox.queued,
+    liveExecutionRuns: liveExecution.runs,
+    securityBlockedEvents: securityGuardrails.blockedEvents
   };
 
   const failedReadiness = Object.entries(systemStatus)
@@ -461,6 +562,17 @@ export async function getTodayCommandSummary(sellerIdInput: string): Promise<Tod
       latestQaStatus: counts.latestQaStatus,
       failedReadiness
     }),
+    launchGateStatus: launchGate.status,
+    launchChecklistStatus: launchChecklist.status,
+    schedulerJobs: schedulerControl.jobs,
+    notificationQueued: notificationOutbox.queued,
+    liveExecutionRuns: liveExecution.runs,
+    latestDryRunStatus: liveExecution.latestDryRunStatus,
+    liveEligible: launchGate.liveEligible,
+    ppcLiveEligible: launchGate.ppcLiveEligible,
+    listingLiveEligible: launchGate.listingLiveEligible,
+    securityBlockedEvents: securityGuardrails.blockedEvents,
+    launchNextSteps: launchGate.nextSteps,
     safety: {
       shadowMode: true,
       externalExecution: false,

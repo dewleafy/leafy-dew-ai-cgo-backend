@@ -51,7 +51,7 @@ export type SafeAiCostLedgerEntry = {
 export type SafeAiGatewaySettings = {
   id: string;
   sellerId: string;
-  aiCallsEnabled: false;
+  aiCallsEnabled: boolean;
   dailyBudget: number;
   monthlyBudget: number;
   allowedModules: unknown[];
@@ -77,4 +77,10 @@ export type AiEstimateInput = {
 export type AiBlockedInput = AiEstimateInput & {
   requestId?: string | null;
   blockedReason?: string | null;
+};
+
+export type AiGenerateInput = AiEstimateInput & {
+  requestId?: string | null;
+  maxOutputTokens?: number;
+  actor?: string | null;
 };
