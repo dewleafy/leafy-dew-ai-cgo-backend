@@ -1,4 +1,13 @@
-export type ProductImageStatus = "AVAILABLE" | "MISSING_FROM_SOURCE";
+export type ProductImageStatus =
+  | "AVAILABLE"
+  | "MISSING_FROM_SOURCE"
+  | "FOUND"
+  | "CATALOG_FOUND_NO_IMAGES"
+  | "CATALOG_FETCH_FAILED"
+  | "NO_ASIN"
+  | "NOT_SYNCED";
+
+export type NormalizedProductImageStatus = Extract<ProductImageStatus, "AVAILABLE" | "MISSING_FROM_SOURCE">;
 
 export type NormalizedProductMedia = {
   mainImageUrl: string | null;
@@ -7,7 +16,7 @@ export type NormalizedProductMedia = {
   imageSource: string | null;
   lastImageSyncAt: string | null;
   images: string[];
-  imageStatus: ProductImageStatus;
+  imageStatus: NormalizedProductImageStatus;
 };
 
 type ImageCandidate = {
@@ -48,6 +57,14 @@ const PRIORITY_IMAGE_PATHS: PathSegment[][] = [
   ["product_image_url"],
   ["amazonImageUrl"],
   ["amazon_image_url"],
+  ["item"],
+  ["item", "summaries", 0, "mainImage", "link"],
+  ["item", "summaries", 0, "mainImage", "url"],
+  ["item", "images", 0, "images", 0, "link"],
+  ["item", "images", 0, "images", 0, "url"],
+  ["item", "images", 0, "link"],
+  ["item", "images", 0, "url"],
+  ["items"],
   ["summaries", 0, "mainImage", "link"],
   ["summaries", 0, "mainImage", "url"],
   ["images", 0, "images", 0, "link"],
@@ -58,6 +75,10 @@ const PRIORITY_IMAGE_PATHS: PathSegment[][] = [
   ["includedData", "images", 0, "images", 0, "url"],
   ["attributes", "main_product_image_locator"],
   ["attributes", "other_product_image_locator_1"],
+  ["attributes", "other_product_image_locator_2"],
+  ["attributes", "other_product_image_locator_3"],
+  ["attributes", "other_product_image_locator_4"],
+  ["attributes", "other_product_image_locator_5"],
   ["imageUrls"],
   ["image_urls"],
   ["images"],
@@ -173,6 +194,23 @@ function collectCandidatesFromInput(productOrRaw: unknown): ImageCandidate[] {
 
 export function normalizeProductImage(productOrRaw: unknown): string | null {
   return collectCandidatesFromInput(productOrRaw)[0]?.url ?? null;
+}
+
+export function extractCatalogImages(catalogResponse: unknown): {
+  mainImageUrl: string | null;
+  imageUrls: string[];
+  imageSource: string | null;
+  imageStatus: Extract<ProductImageStatus, "FOUND" | "CATALOG_FOUND_NO_IMAGES">;
+} {
+  const candidates = collectCandidatesFromInput(catalogResponse);
+  const first = candidates[0] ?? null;
+
+  return {
+    mainImageUrl: first?.url ?? null,
+    imageUrls: candidates.map((candidate) => candidate.url),
+    imageSource: first?.source ?? null,
+    imageStatus: first ? "FOUND" : "CATALOG_FOUND_NO_IMAGES"
+  };
 }
 
 export function normalizeProductMedia(

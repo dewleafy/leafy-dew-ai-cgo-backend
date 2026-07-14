@@ -1,3 +1,5 @@
+import type { ProductImageStatus } from "../product-media/product-media-normalizer";
+
 export type ProductPassportStatus = "DRAFT" | "ACTIVE" | "NEEDS_REVIEW" | "ARCHIVED";
 
 export type ProductPassportInput = {
@@ -97,7 +99,7 @@ export type SafeProductPassportRow = {
   imageSource: string | null;
   lastImageSyncAt: string | null;
   images: string[];
-  imageStatus: "AVAILABLE" | "MISSING_FROM_SOURCE";
+  imageStatus: ProductImageStatus | string;
   supplierName: string | null;
   supplierCost: number | null;
   packagingNotes: string | null;

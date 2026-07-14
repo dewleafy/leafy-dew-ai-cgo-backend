@@ -92,6 +92,12 @@ function getStatusFromQuery(req: Request): ProductPassportStatus | undefined {
   return isProductPassportStatus(req.query.status) ? req.query.status : undefined;
 }
 
+function getLimitFromQuery(req: Request): number {
+  const rawLimit = typeof req.query.limit === "string" ? Number(req.query.limit) : 100;
+  const limit = Number.isFinite(rawLimit) ? Math.floor(rawLimit) : 100;
+  return Math.min(Math.max(limit, 1), 500);
+}
+
 function sendValidationError(res: Response, issues: Array<{ path: PropertyKey[]; message: string }>): void {
   res.status(400).json({
     ok: false,
@@ -125,7 +131,7 @@ export async function getProductPassports(req: Request, res: Response): Promise<
   }
 
   try {
-    const rows = await listProductPassports({ sellerId, status });
+    const rows = await listProductPassports({ sellerId, status, limit: getLimitFromQuery(req) });
 
     res.json({
       ok: true,

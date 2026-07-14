@@ -2,7 +2,7 @@ import { env } from "../../config/env";
 import { supabase } from "../../db/supabase";
 import { logger } from "../../utils/logger";
 import { AmazonSpListingRow } from "../amazon-sp/amazon-sp.types";
-import { normalizeProductMedia } from "../product-media/product-media-normalizer";
+import { normalizeProductMedia, ProductImageStatus } from "../product-media/product-media-normalizer";
 import {
   ProductPassportInput,
   ProductPassportRow,
@@ -17,6 +17,21 @@ export const PRODUCT_PASSPORT_STATUSES: ProductPassportStatus[] = [
   "NEEDS_REVIEW",
   "ARCHIVED"
 ];
+
+type ProductMediaRow = {
+  id: string;
+  seller_id: string;
+  sku: string | null;
+  asin: string | null;
+  product_name: string | null;
+  main_image_url: string | null;
+  image_urls: unknown[] | null;
+  image_source: string | null;
+  image_status: ProductImageStatus | string | null;
+  last_image_sync_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
 
 function toNumberOrNull(value: unknown): number | null {
   if (value === null || value === undefined || value === "") {
@@ -60,6 +75,12 @@ function logProductPassportError(context: string, error: { message?: string; cod
 
 function normalizeKey(value: unknown): string | null {
   return cleanText(value == null ? null : String(value))?.toLowerCase() ?? null;
+}
+
+function cleanImageUrls(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.map((item) => cleanText(item == null ? null : String(item))).filter((item): item is string => Boolean(item))
+    : [];
 }
 
 function latestTimestamp(values: Array<string | null | undefined>): string | null {
@@ -114,16 +135,73 @@ async function loadListingsForSeller(sellerId: string): Promise<AmazonSpListingR
   return (data ?? []) as AmazonSpListingRow[];
 }
 
+async function loadProductMediaForSeller(sellerId: string): Promise<ProductMediaRow[]> {
+  const { data, error } = await supabase
+    .from("product_media")
+    .select("*")
+    .eq("seller_id", cleanText(sellerId) ?? "default")
+    .order("updated_at", { ascending: false })
+    .limit(1000);
+
+  if (error) {
+    logProductPassportError("Could not load product_media for product passport images.", error);
+    return [];
+  }
+
+  return (data ?? []) as ProductMediaRow[];
+}
+
+function buildProductMediaMaps(rows: ProductMediaRow[]): {
+  bySku: Map<string, ProductMediaRow>;
+  byAsin: Map<string, ProductMediaRow>;
+} {
+  const bySku = new Map<string, ProductMediaRow>();
+  const byAsin = new Map<string, ProductMediaRow>();
+
+  for (const row of rows) {
+    const skuKey = normalizeKey(row.sku);
+    const asinKey = normalizeKey(row.asin);
+    if (skuKey && !bySku.has(skuKey)) bySku.set(skuKey, row);
+    if (asinKey && !byAsin.has(asinKey)) byAsin.set(asinKey, row);
+  }
+
+  return { bySku, byAsin };
+}
+
+function matchProductMediaForPassport(
+  row: ProductPassportRow,
+  maps: { bySku: Map<string, ProductMediaRow>; byAsin: Map<string, ProductMediaRow> }
+): ProductMediaRow | null {
+  const skuKey = normalizeKey(row.sku);
+  const asinKey = normalizeKey(row.asin);
+  return (asinKey ? maps.byAsin.get(asinKey) : undefined) ?? (skuKey ? maps.bySku.get(skuKey) : undefined) ?? null;
+}
+
 async function findListingForPassport(row: ProductPassportRow): Promise<AmazonSpListingRow | null> {
   const listings = await loadListingsForSeller(row.seller_id);
   return matchListingForPassport(row, buildListingMaps(listings));
 }
 
-function toSafeProductPassport(row: ProductPassportRow, listing: AmazonSpListingRow | null = null): SafeProductPassportRow {
-  const media = normalizeProductMedia([listing, row], {
+async function findProductMediaForPassport(row: ProductPassportRow): Promise<ProductMediaRow | null> {
+  const rows = await loadProductMediaForSeller(row.seller_id);
+  return matchProductMediaForPassport(row, buildProductMediaMaps(rows));
+}
+
+function toSafeProductPassport(
+  row: ProductPassportRow,
+  listing: AmazonSpListingRow | null = null,
+  productMedia: ProductMediaRow | null = null
+): SafeProductPassportRow {
+  const fallbackMedia = normalizeProductMedia([listing, row], {
     lastImageSyncAt: latestTimestamp([listing?.last_synced_at, listing?.updated_at, row.updated_at]),
     amazonImagePreferred: Boolean(listing)
   });
+  const productMediaImageUrls = cleanImageUrls(productMedia?.image_urls);
+  const mainImageUrl = productMedia ? productMedia.main_image_url : fallbackMedia.mainImageUrl;
+  const imageUrls = productMedia ? productMediaImageUrls : fallbackMedia.images;
+  const imageStatus = productMedia?.image_status ?? (mainImageUrl ? fallbackMedia.imageStatus : "NOT_SYNCED");
+  const imageSource = productMedia?.image_source ?? (mainImageUrl ? fallbackMedia.imageSource : null);
+  const lastImageSyncAt = productMedia?.last_image_sync_at ?? (mainImageUrl ? fallbackMedia.lastImageSyncAt : null);
 
   return {
     id: row.id,
@@ -146,14 +224,14 @@ function toSafeProductPassport(row: ProductPassportRow, listing: AmazonSpListing
     keyFeatures: row.key_features ?? [],
     customerObjections: row.customer_objections ?? [],
     competitorAsins: row.competitor_asins ?? [],
-    imageUrls: row.image_urls ?? [],
-    mainImageUrl: media.mainImageUrl,
-    imageUrl: media.imageUrl,
-    amazonImageUrl: media.amazonImageUrl,
-    imageSource: media.imageSource,
-    lastImageSyncAt: media.lastImageSyncAt,
-    images: media.images,
-    imageStatus: media.imageStatus,
+    imageUrls,
+    mainImageUrl,
+    imageUrl: mainImageUrl,
+    amazonImageUrl: mainImageUrl,
+    imageSource,
+    lastImageSyncAt,
+    images: imageUrls,
+    imageStatus,
     supplierName: row.supplier_name,
     supplierCost: toNumberOrNull(row.supplier_cost),
     packagingNotes: row.packaging_notes,
@@ -244,13 +322,15 @@ export function isProductPassportStatus(status: string): status is ProductPasspo
 export async function listProductPassports(input: {
   sellerId: string;
   status?: ProductPassportStatus;
+  limit?: number;
 }): Promise<SafeProductPassportRow[]> {
+  const limit = Math.min(Math.max(Math.floor(input.limit ?? 100), 1), 500);
   let query = supabase
     .from("product_passports")
     .select("*")
     .eq("seller_id", cleanText(input.sellerId) ?? "default")
     .order("created_at", { ascending: false })
-    .limit(100);
+    .limit(limit);
 
   if (input.status) {
     query = query.eq("status", input.status);
@@ -264,10 +344,19 @@ export async function listProductPassports(input: {
   }
 
   const rows = (data ?? []) as ProductPassportRow[];
-  const listings = await loadListingsForSeller(cleanText(input.sellerId) ?? "default");
+  const sellerId = cleanText(input.sellerId) ?? "default";
+  const [listings, productMediaRows] = await Promise.all([
+    loadListingsForSeller(sellerId),
+    loadProductMediaForSeller(sellerId)
+  ]);
   const listingMaps = buildListingMaps(listings);
+  const productMediaMaps = buildProductMediaMaps(productMediaRows);
 
-  return rows.map((row) => toSafeProductPassport(row, matchListingForPassport(row, listingMaps)));
+  return rows.map((row) => toSafeProductPassport(
+    row,
+    matchListingForPassport(row, listingMaps),
+    matchProductMediaForPassport(row, productMediaMaps)
+  ));
 }
 
 export async function getProductPassportById(id: string): Promise<SafeProductPassportRow | null> {
@@ -282,7 +371,7 @@ export async function getProductPassportById(id: string): Promise<SafeProductPas
     throw new Error("Could not load product passport from Supabase.");
   }
 
-  return data ? toSafeProductPassport(data, await findListingForPassport(data)) : null;
+  return data ? toSafeProductPassport(data, await findListingForPassport(data), await findProductMediaForPassport(data)) : null;
 }
 
 export async function createProductPassport(input: ProductPassportInput): Promise<SafeProductPassportRow> {
@@ -299,7 +388,7 @@ export async function createProductPassport(input: ProductPassportInput): Promis
     throw new Error(error?.code === "23505" ? "Product passport already exists for this seller." : "Could not create product passport in Supabase.");
   }
 
-  return toSafeProductPassport(data, await findListingForPassport(data));
+  return toSafeProductPassport(data, await findListingForPassport(data), await findProductMediaForPassport(data));
 }
 
 export async function updateProductPassport(input: {
@@ -326,7 +415,7 @@ export async function updateProductPassport(input: {
     throw new Error(error?.code === "23505" ? "Product passport already exists for this seller." : "Could not update product passport in Supabase.");
   }
 
-  return toSafeProductPassport(data, await findListingForPassport(data));
+  return toSafeProductPassport(data, await findListingForPassport(data), await findProductMediaForPassport(data));
 }
 
 export async function archiveProductPassport(id: string): Promise<SafeProductPassportRow | null> {
@@ -353,5 +442,5 @@ export async function archiveProductPassport(id: string): Promise<SafeProductPas
     throw new Error("Could not archive product passport in Supabase.");
   }
 
-  return toSafeProductPassport(data, await findListingForPassport(data));
+  return toSafeProductPassport(data, await findListingForPassport(data), await findProductMediaForPassport(data));
 }

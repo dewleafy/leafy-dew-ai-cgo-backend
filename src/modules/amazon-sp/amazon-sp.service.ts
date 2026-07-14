@@ -1029,7 +1029,7 @@ async function upsertProductPassportsFromListings(sellerId: string, listings: Li
   return count;
 }
 
-async function requireConnectedConnection(sellerId: string): Promise<AmazonSpConnectionRow> {
+export async function requireConnectedConnection(sellerId: string): Promise<AmazonSpConnectionRow> {
   const connection = await getConnection(sellerId);
 
   if (connection && (connection.token_status === "CONNECTED" || env.SP_API_REFRESH_TOKEN)) {
