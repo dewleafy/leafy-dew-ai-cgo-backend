@@ -1,6 +1,8 @@
 import { env } from "../../config/env";
 import { supabase } from "../../db/supabase";
 import { logger } from "../../utils/logger";
+import { AmazonSpListingRow } from "../amazon-sp/amazon-sp.types";
+import { normalizeProductMedia } from "../product-media/product-media-normalizer";
 import {
   ProductPassportInput,
   ProductPassportRow,
@@ -56,7 +58,73 @@ function logProductPassportError(context: string, error: { message?: string; cod
   });
 }
 
-function toSafeProductPassport(row: ProductPassportRow): SafeProductPassportRow {
+function normalizeKey(value: unknown): string | null {
+  return cleanText(value == null ? null : String(value))?.toLowerCase() ?? null;
+}
+
+function latestTimestamp(values: Array<string | null | undefined>): string | null {
+  const timestamps = values
+    .filter((value): value is string => Boolean(value))
+    .map((value) => ({ value, millis: Date.parse(value) }))
+    .filter((item) => Number.isFinite(item.millis))
+    .sort((a, b) => b.millis - a.millis);
+
+  return timestamps[0]?.value ?? null;
+}
+
+function buildListingMaps(listings: AmazonSpListingRow[]): {
+  bySku: Map<string, AmazonSpListingRow>;
+  byAsin: Map<string, AmazonSpListingRow>;
+} {
+  const bySku = new Map<string, AmazonSpListingRow>();
+  const byAsin = new Map<string, AmazonSpListingRow>();
+
+  for (const listing of listings) {
+    const skuKey = normalizeKey(listing.sku);
+    const asinKey = normalizeKey(listing.asin);
+    if (skuKey && !bySku.has(skuKey)) bySku.set(skuKey, listing);
+    if (asinKey && !byAsin.has(asinKey)) byAsin.set(asinKey, listing);
+  }
+
+  return { bySku, byAsin };
+}
+
+function matchListingForPassport(
+  row: ProductPassportRow,
+  maps: { bySku: Map<string, AmazonSpListingRow>; byAsin: Map<string, AmazonSpListingRow> }
+): AmazonSpListingRow | null {
+  const skuKey = normalizeKey(row.sku);
+  const asinKey = normalizeKey(row.asin);
+  return (skuKey ? maps.bySku.get(skuKey) : undefined) ?? (asinKey ? maps.byAsin.get(asinKey) : undefined) ?? null;
+}
+
+async function loadListingsForSeller(sellerId: string): Promise<AmazonSpListingRow[]> {
+  const { data, error } = await supabase
+    .from("amazon_sp_listings")
+    .select("*")
+    .eq("seller_id", cleanText(sellerId) ?? "default")
+    .order("last_synced_at", { ascending: false })
+    .limit(1000);
+
+  if (error) {
+    logProductPassportError("Could not load Amazon listings for product passport images.", error);
+    return [];
+  }
+
+  return (data ?? []) as AmazonSpListingRow[];
+}
+
+async function findListingForPassport(row: ProductPassportRow): Promise<AmazonSpListingRow | null> {
+  const listings = await loadListingsForSeller(row.seller_id);
+  return matchListingForPassport(row, buildListingMaps(listings));
+}
+
+function toSafeProductPassport(row: ProductPassportRow, listing: AmazonSpListingRow | null = null): SafeProductPassportRow {
+  const media = normalizeProductMedia([listing, row], {
+    lastImageSyncAt: latestTimestamp([listing?.last_synced_at, listing?.updated_at, row.updated_at]),
+    amazonImagePreferred: Boolean(listing)
+  });
+
   return {
     id: row.id,
     sellerId: row.seller_id,
@@ -79,6 +147,13 @@ function toSafeProductPassport(row: ProductPassportRow): SafeProductPassportRow 
     customerObjections: row.customer_objections ?? [],
     competitorAsins: row.competitor_asins ?? [],
     imageUrls: row.image_urls ?? [],
+    mainImageUrl: media.mainImageUrl,
+    imageUrl: media.imageUrl,
+    amazonImageUrl: media.amazonImageUrl,
+    imageSource: media.imageSource,
+    lastImageSyncAt: media.lastImageSyncAt,
+    images: media.images,
+    imageStatus: media.imageStatus,
     supplierName: row.supplier_name,
     supplierCost: toNumberOrNull(row.supplier_cost),
     packagingNotes: row.packaging_notes,
@@ -188,7 +263,11 @@ export async function listProductPassports(input: {
     throw new Error("Could not load product passports from Supabase.");
   }
 
-  return ((data ?? []) as ProductPassportRow[]).map(toSafeProductPassport);
+  const rows = (data ?? []) as ProductPassportRow[];
+  const listings = await loadListingsForSeller(cleanText(input.sellerId) ?? "default");
+  const listingMaps = buildListingMaps(listings);
+
+  return rows.map((row) => toSafeProductPassport(row, matchListingForPassport(row, listingMaps)));
 }
 
 export async function getProductPassportById(id: string): Promise<SafeProductPassportRow | null> {
@@ -203,7 +282,7 @@ export async function getProductPassportById(id: string): Promise<SafeProductPas
     throw new Error("Could not load product passport from Supabase.");
   }
 
-  return data ? toSafeProductPassport(data) : null;
+  return data ? toSafeProductPassport(data, await findListingForPassport(data)) : null;
 }
 
 export async function createProductPassport(input: ProductPassportInput): Promise<SafeProductPassportRow> {
@@ -220,7 +299,7 @@ export async function createProductPassport(input: ProductPassportInput): Promis
     throw new Error(error?.code === "23505" ? "Product passport already exists for this seller." : "Could not create product passport in Supabase.");
   }
 
-  return toSafeProductPassport(data);
+  return toSafeProductPassport(data, await findListingForPassport(data));
 }
 
 export async function updateProductPassport(input: {
@@ -247,7 +326,7 @@ export async function updateProductPassport(input: {
     throw new Error(error?.code === "23505" ? "Product passport already exists for this seller." : "Could not update product passport in Supabase.");
   }
 
-  return toSafeProductPassport(data);
+  return toSafeProductPassport(data, await findListingForPassport(data));
 }
 
 export async function archiveProductPassport(id: string): Promise<SafeProductPassportRow | null> {
@@ -274,5 +353,5 @@ export async function archiveProductPassport(id: string): Promise<SafeProductPas
     throw new Error("Could not archive product passport in Supabase.");
   }
 
-  return toSafeProductPassport(data);
+  return toSafeProductPassport(data, await findListingForPassport(data));
 }

@@ -21,6 +21,13 @@ export type ProductPassportCostCompletionRow = {
   currentProfitStatus: ProductProfitStatus | null;
   targetAcos: number | null;
   breakEvenAcos: number | null;
+  mainImageUrl: string | null;
+  imageUrl: string | null;
+  amazonImageUrl: string | null;
+  imageSource: string | null;
+  lastImageSyncAt: string | null;
+  images: string[];
+  imageStatus: "AVAILABLE" | "MISSING_FROM_SOURCE";
   missingFields: string[];
   costStatus: ProductPassportCostStatus;
   source: ProductPassportCostCompletionSource;

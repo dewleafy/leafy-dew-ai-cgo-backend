@@ -29,6 +29,8 @@ import { listingReadinessRoutes } from "./modules/listing-readiness/listing-read
 import { liveExecutionRouter } from "./modules/live-execution/live-execution.routes";
 import { notificationOutboxRouter } from "./modules/notification-outbox/notification-outbox.routes";
 import { productEconomicsRouter } from "./modules/product-economics/product-economics.routes";
+import { listAmazonSpListingsController } from "./modules/amazon-sp/amazon-sp.controller";
+import { productMediaRouter } from "./modules/product-media/product-media.routes";
 import { productPassportRoutes } from "./modules/product-passports/product-passports.routes";
 import { productionHealthRouter } from "./modules/production-health/production-health.routes";
 import { maintenanceRouter } from "./modules/maintenance/maintenance.routes";
@@ -40,6 +42,7 @@ import { safetyControlRouter } from "./modules/safety-control/safety-control.rou
 import { schedulerControlRouter } from "./modules/scheduler-control/scheduler-control.routes";
 import { securityGuardrailsRouter } from "./modules/security-guardrails/security-guardrails.routes";
 import { todayCommandRouter } from "./modules/today-command/today-command.routes";
+import { asyncHandler } from "./utils/async-handler";
 import { logger } from "./utils/logger";
 
 const app = express();
@@ -204,8 +207,11 @@ app.use("/api/listing-readiness", listingReadinessRoutes);
 app.use("/api/live-execution", liveExecutionRouter);
 app.use("/api/notification-outbox", notificationOutboxRouter);
 app.use("/api/product-economics", productEconomicsRouter);
+app.use("/api/product-media", productMediaRouter);
 app.use("/api/product-passport", productPassportRoutes);
 app.use("/api/product-passports", productPassportRoutes);
+app.use("/api/products", productPassportRoutes);
+app.get("/api/listings", asyncHandler(listAmazonSpListingsController));
 app.use("/api/production-health", productionHealthRouter);
 app.use("/api/maintenance", maintenanceRouter);
 app.use("/api/qa-smoke", qaSmokeRouter);

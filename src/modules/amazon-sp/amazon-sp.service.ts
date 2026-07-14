@@ -18,6 +18,10 @@ import {
   getAmazonSpAccessToken
 } from "./amazon-sp-token.service";
 import {
+  normalizeProductImage,
+  normalizeProductMedia
+} from "../product-media/product-media-normalizer";
+import {
   AmazonSpConnectionRow,
   AmazonSpListingRow,
   AmazonSpOrderItemRow,
@@ -173,6 +177,11 @@ function sellerIdOrDefault(sellerId?: string): string {
 }
 
 function toSafeListing(row: AmazonSpListingRow): SafeAmazonSpListing {
+  const media = normalizeProductMedia(row, {
+    lastImageSyncAt: row.last_synced_at,
+    amazonImagePreferred: true
+  });
+
   return {
     id: row.id,
     sellerId: row.seller_id,
@@ -187,7 +196,13 @@ function toSafeListing(row: AmazonSpListingRow): SafeAmazonSpListing {
     currency: row.currency,
     quantity: row.quantity,
     productType: row.product_type,
-    mainImageUrl: row.main_image_url,
+    mainImageUrl: media.mainImageUrl,
+    imageUrl: media.imageUrl,
+    amazonImageUrl: media.amazonImageUrl,
+    imageSource: media.imageSource,
+    lastImageSyncAt: media.lastImageSyncAt,
+    images: media.images,
+    imageStatus: media.imageStatus,
     lastSyncedAt: row.last_synced_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at
@@ -544,7 +559,7 @@ function extractListings(response: unknown): { items: ListingSyncItem[]; nextTok
         const availability = Array.isArray(item.fulfillmentAvailability) ? item.fulfillmentAvailability as Record<string, unknown>[] : [];
         const firstAvailability = availability[0] ?? {};
         const price = offer.price && typeof offer.price === "object" ? offer.price as Record<string, unknown> : {};
-        const images = Array.isArray(summary.mainImage) ? [] : summary.mainImage && typeof summary.mainImage === "object" ? [summary.mainImage as Record<string, unknown>] : [];
+        const mainImageUrl = normalizeProductImage(item);
         return {
           sku: String(item.sku ?? ""),
           asin: cleanText(String(summary.asin ?? item.asin ?? "")),
@@ -555,7 +570,7 @@ function extractListings(response: unknown): { items: ListingSyncItem[]; nextTok
           currency: cleanText(String(price.currencyCode ?? "")),
           quantity: toIntegerOrNull(firstAvailability.quantity),
           productType: cleanText(String(summary.productType ?? item.productType ?? "")),
-          mainImageUrl: cleanText(String(images[0]?.link ?? "")),
+          mainImageUrl,
           rawPayload: item
         };
       })

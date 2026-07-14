@@ -91,6 +91,13 @@ export type SafeProductPassportRow = {
   customerObjections: unknown[];
   competitorAsins: unknown[];
   imageUrls: unknown[];
+  mainImageUrl: string | null;
+  imageUrl: string | null;
+  amazonImageUrl: string | null;
+  imageSource: string | null;
+  lastImageSyncAt: string | null;
+  images: string[];
+  imageStatus: "AVAILABLE" | "MISSING_FROM_SOURCE";
   supplierName: string | null;
   supplierCost: number | null;
   packagingNotes: string | null;

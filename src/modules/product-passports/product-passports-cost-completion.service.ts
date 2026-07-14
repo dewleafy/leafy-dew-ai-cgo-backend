@@ -13,6 +13,7 @@ import {
   saveProductEconomics,
   toSafeProductEconomicsRow
 } from "../product-economics/product-economics.service";
+import { normalizeProductMedia } from "../product-media/product-media-normalizer";
 import { ProductPassportRow } from "./product-passports.types";
 import {
   ProductPassportCostCompletionBulkItem,
@@ -187,6 +188,10 @@ function buildCompletionRow(input: {
     positiveNumber(economics?.sellingPrice) ??
     positiveNumber(passport?.selling_price) ??
     positiveNumber(listing?.price);
+  const media = normalizeProductMedia([listing, passport], {
+    lastImageSyncAt: latestTimestamp([listing?.last_synced_at, listing?.updated_at, passport?.updated_at]),
+    amazonImagePreferred: Boolean(listing)
+  });
   const missingFields = buildMissingFields({
     sku,
     productCost,
@@ -213,6 +218,13 @@ function buildCompletionRow(input: {
     currentProfitStatus: economics?.profitStatus ?? null,
     targetAcos: economics?.targetAcos ?? null,
     breakEvenAcos: economics?.breakEvenAcos ?? null,
+    mainImageUrl: media.mainImageUrl,
+    imageUrl: media.imageUrl,
+    amazonImageUrl: media.amazonImageUrl,
+    imageSource: media.imageSource,
+    lastImageSyncAt: media.lastImageSyncAt,
+    images: media.images,
+    imageStatus: media.imageStatus,
     missingFields,
     costStatus: costStatusFromMissingFields(missingFields),
     source: sourceForProduct({ economics, passport, listing }),

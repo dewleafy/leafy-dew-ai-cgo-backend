@@ -103,6 +103,12 @@ export type SafeAmazonSpListing = {
   quantity: number | null;
   productType: string | null;
   mainImageUrl: string | null;
+  imageUrl: string | null;
+  amazonImageUrl: string | null;
+  imageSource: string | null;
+  lastImageSyncAt: string | null;
+  images: string[];
+  imageStatus: "AVAILABLE" | "MISSING_FROM_SOURCE";
   lastSyncedAt: string;
   createdAt: string;
   updatedAt: string;

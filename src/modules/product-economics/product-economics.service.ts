@@ -16,6 +16,7 @@ import {
 import { AmazonSpListingRow } from "../amazon-sp/amazon-sp.types";
 import { ProductPassportRow } from "../product-passports/product-passports.types";
 import { ensureActionLedgerAction } from "../action-ledger/action-ledger.service";
+import { normalizeProductMedia } from "../product-media/product-media-normalizer";
 
 function toNumber(value: unknown): number {
   const numeric = Number(value ?? 0);
@@ -38,6 +39,16 @@ function cleanText(value: string | null | undefined): string | null {
 function normalizeKey(value: string | null | undefined): string | null {
   const cleaned = cleanText(value);
   return cleaned ? cleaned.toLowerCase() : null;
+}
+
+function latestTimestamp(values: Array<string | null | undefined>): string | null {
+  const timestamps = values
+    .filter((value): value is string => Boolean(value))
+    .map((value) => ({ value, millis: Date.parse(value) }))
+    .filter((item) => Number.isFinite(item.millis))
+    .sort((a, b) => b.millis - a.millis);
+
+  return timestamps[0]?.value ?? null;
 }
 
 function noteValue(notes: string | null | undefined, label: string): string | null {
@@ -1009,6 +1020,7 @@ export async function getCostCompletionQueue(sellerIdInput: string): Promise<Cos
     sku: string | null;
     asin: string | null;
     productName: string | null;
+    listing?: AmazonSpListingRow | null;
     listingPrice?: unknown;
     listingProductType?: string | null;
     listingFulfillmentType?: string | null;
@@ -1037,6 +1049,10 @@ export async function getCostCompletionQueue(sellerIdInput: string): Promise<Cos
     const fulfillmentType = noteValue(notes, "Fulfillment Type") ?? cleanText(input.listingFulfillmentType);
     const productType = noteValue(notes, "Product Type") ?? cleanText(passport?.product_type) ?? cleanText(input.listingProductType);
     const weightKg = toNumber(noteValue(notes, "Weight kg")) || parseWeightKg(passport?.weight);
+    const media = normalizeProductMedia([input.listing ?? null, passport], {
+      lastImageSyncAt: latestTimestamp([input.listing?.last_synced_at, input.listing?.updated_at, passport?.updated_at]),
+      amazonImagePreferred: Boolean(input.listing)
+    });
     const missingFields: string[] = [];
     const hasSubcategoryMatch = Boolean(subcategory && referralFeeRules[normalizeCategory(subcategory) ?? ""]);
 
@@ -1081,6 +1097,13 @@ export async function getCostCompletionQueue(sellerIdInput: string): Promise<Cos
       costStatus,
       profitStatus: existingEconomics?.profitStatus ?? null,
       profitDataStatus: existingEconomics?.profitDataStatus ?? (costStatus === "INCOMPLETE" ? "INCOMPLETE" : null),
+      mainImageUrl: media.mainImageUrl,
+      imageUrl: media.imageUrl,
+      amazonImageUrl: media.amazonImageUrl,
+      imageSource: media.imageSource,
+      lastImageSyncAt: media.lastImageSyncAt,
+      images: media.images,
+      imageStatus: media.imageStatus,
       missingFields,
       targetAcos: existingEconomics?.targetAcos ?? null,
       breakEvenAcos: existingEconomics?.breakEvenAcos ?? null,
@@ -1094,6 +1117,7 @@ export async function getCostCompletionQueue(sellerIdInput: string): Promise<Cos
       sku: listing.sku,
       asin: listing.asin,
       productName: listing.product_name,
+      listing,
       listingPrice: listing.price,
       listingProductType: listing.product_type,
       listingFulfillmentType: listing.fulfillment_channel

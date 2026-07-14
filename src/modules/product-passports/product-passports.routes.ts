@@ -19,6 +19,7 @@ import {
 export const productPassportRoutes = Router();
 
 productPassportRoutes.get("/", asyncHandler(getProductPassports));
+productPassportRoutes.get("/list", asyncHandler(getProductPassports));
 productPassportRoutes.get("/readiness/summary", asyncHandler(getProductPassportReadinessSummaryController));
 productPassportRoutes.get("/cost-completion", asyncHandler(getProductPassportCostCompletion));
 productPassportRoutes.post("/cost-completion/bulk-update", asyncHandler(postProductPassportCostCompletionBulkUpdate));
