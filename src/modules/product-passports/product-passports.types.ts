@@ -100,6 +100,11 @@ export type SafeProductPassportRow = {
   lastImageSyncAt: string | null;
   images: string[];
   imageStatus: ProductImageStatus | string;
+  mediaJoinMatched: boolean;
+  mediaJoinKeyUsed: "asin" | "sku" | null;
+  mediaAsin: string | null;
+  mediaSku: string | null;
+  mediaTableId: string | null;
   supplierName: string | null;
   supplierCost: number | null;
   packagingNotes: string | null;

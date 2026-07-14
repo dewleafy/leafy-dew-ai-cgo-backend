@@ -2,7 +2,7 @@ import { env } from "../../config/env";
 import { supabase } from "../../db/supabase";
 import { logger } from "../../utils/logger";
 import { AmazonSpListingRow } from "../amazon-sp/amazon-sp.types";
-import { normalizeProductMedia, ProductImageStatus } from "../product-media/product-media-normalizer";
+import { ProductImageStatus } from "../product-media/product-media-normalizer";
 import {
   ProductPassportInput,
   ProductPassportRow,
@@ -77,6 +77,18 @@ function normalizeKey(value: unknown): string | null {
   return cleanText(value == null ? null : String(value))?.toLowerCase() ?? null;
 }
 
+function normalizeSellerId(value: unknown): string {
+  return cleanText(value == null ? null : String(value)) ?? "default";
+}
+
+function normalizeAsin(value: unknown): string | null {
+  return cleanText(value == null ? null : String(value))?.toUpperCase() ?? null;
+}
+
+function normalizeSku(value: unknown): string | null {
+  return cleanText(value == null ? null : String(value));
+}
+
 function cleanImageUrls(value: unknown): string[] {
   return Array.isArray(value)
     ? value.map((item) => cleanText(item == null ? null : String(item))).filter((item): item is string => Boolean(item))
@@ -135,20 +147,94 @@ async function loadListingsForSeller(sellerId: string): Promise<AmazonSpListingR
   return (data ?? []) as AmazonSpListingRow[];
 }
 
-async function loadProductMediaForSeller(sellerId: string): Promise<ProductMediaRow[]> {
-  const { data, error } = await supabase
-    .from("product_media")
-    .select("*")
-    .eq("seller_id", cleanText(sellerId) ?? "default")
-    .order("updated_at", { ascending: false })
-    .limit(1000);
+async function loadProductMediaForPassports(sellerId: string, rows: ProductPassportRow[]): Promise<ProductMediaRow[]> {
+  const normalizedSellerId = normalizeSellerId(sellerId);
+  const asinKeys = new Set(rows.map((row) => normalizeAsin(row.asin)).filter((value): value is string => Boolean(value)));
+  const skuKeys = new Set(rows.map((row) => normalizeSku(row.sku)).filter((value): value is string => Boolean(value)));
 
-  if (error) {
-    logProductPassportError("Could not load product_media for product passport images.", error);
+  if (!asinKeys.size && !skuKeys.size) {
     return [];
   }
 
-  return (data ?? []) as ProductMediaRow[];
+  const matchedRows = new Map<string, ProductMediaRow>();
+  const addMatchedRows = (mediaRows: ProductMediaRow[]) => {
+    for (const mediaRow of mediaRows) {
+      const asinKey = normalizeAsin(mediaRow.asin);
+      const skuKey = normalizeSku(mediaRow.sku);
+      if ((asinKey && asinKeys.has(asinKey)) || (skuKey && skuKeys.has(skuKey))) {
+        matchedRows.set(mediaRow.id, mediaRow);
+      }
+    }
+  };
+
+  const [asinResult, skuResult] = await Promise.all([
+    asinKeys.size
+      ? supabase
+          .from("product_media")
+          .select("*")
+          .eq("seller_id", normalizedSellerId)
+          .in("asin", Array.from(asinKeys))
+          .order("updated_at", { ascending: false })
+      : Promise.resolve({ data: [], error: null }),
+    skuKeys.size
+      ? supabase
+          .from("product_media")
+          .select("*")
+          .eq("seller_id", normalizedSellerId)
+          .in("sku", Array.from(skuKeys))
+          .order("updated_at", { ascending: false })
+      : Promise.resolve({ data: [], error: null })
+  ]);
+
+  if (asinResult.error) {
+    logProductPassportError("Could not load product_media by ASIN for product passport images.", asinResult.error);
+  } else {
+    addMatchedRows((asinResult.data ?? []) as ProductMediaRow[]);
+  }
+
+  if (skuResult.error) {
+    logProductPassportError("Could not load product_media by SKU for product passport images.", skuResult.error);
+  } else {
+    addMatchedRows((skuResult.data ?? []) as ProductMediaRow[]);
+  }
+
+  const needsNormalizedFallback = rows.some((row) => {
+    const asinKey = normalizeAsin(row.asin);
+    const skuKey = normalizeSku(row.sku);
+    return !Array.from(matchedRows.values()).some((mediaRow) => {
+      const mediaAsinKey = normalizeAsin(mediaRow.asin);
+      const mediaSkuKey = normalizeSku(mediaRow.sku);
+      return (asinKey && mediaAsinKey === asinKey) || (skuKey && mediaSkuKey === skuKey);
+    });
+  });
+
+  if (!needsNormalizedFallback) {
+    return Array.from(matchedRows.values());
+  }
+
+  const pageSize = 1000;
+  for (let from = 0; ; from += pageSize) {
+    const { data, error } = await supabase
+      .from("product_media")
+      .select("*")
+      .eq("seller_id", normalizedSellerId)
+      .order("updated_at", { ascending: false })
+      .range(from, from + pageSize - 1);
+
+    if (error) {
+      logProductPassportError("Could not load normalized product_media fallback for product passport images.", error);
+      break;
+    }
+
+    const pageRows = (data ?? []) as ProductMediaRow[];
+    addMatchedRows(pageRows);
+
+    if (pageRows.length < pageSize) {
+      break;
+    }
+  }
+
+  return Array.from(matchedRows.values());
 }
 
 function buildProductMediaMaps(rows: ProductMediaRow[]): {
@@ -159,8 +245,8 @@ function buildProductMediaMaps(rows: ProductMediaRow[]): {
   const byAsin = new Map<string, ProductMediaRow>();
 
   for (const row of rows) {
-    const skuKey = normalizeKey(row.sku);
-    const asinKey = normalizeKey(row.asin);
+    const skuKey = normalizeSku(row.sku);
+    const asinKey = normalizeAsin(row.asin);
     if (skuKey && !bySku.has(skuKey)) bySku.set(skuKey, row);
     if (asinKey && !byAsin.has(asinKey)) byAsin.set(asinKey, row);
   }
@@ -168,13 +254,28 @@ function buildProductMediaMaps(rows: ProductMediaRow[]): {
   return { bySku, byAsin };
 }
 
+type ProductMediaMatch = {
+  row: ProductMediaRow | null;
+  keyUsed: "asin" | "sku" | null;
+};
+
 function matchProductMediaForPassport(
   row: ProductPassportRow,
   maps: { bySku: Map<string, ProductMediaRow>; byAsin: Map<string, ProductMediaRow> }
-): ProductMediaRow | null {
-  const skuKey = normalizeKey(row.sku);
-  const asinKey = normalizeKey(row.asin);
-  return (asinKey ? maps.byAsin.get(asinKey) : undefined) ?? (skuKey ? maps.bySku.get(skuKey) : undefined) ?? null;
+): ProductMediaMatch {
+  const asinKey = normalizeAsin(row.asin);
+  const skuKey = normalizeSku(row.sku);
+  const asinMatch = asinKey ? maps.byAsin.get(asinKey) : undefined;
+  if (asinMatch) {
+    return { row: asinMatch, keyUsed: "asin" };
+  }
+
+  const skuMatch = skuKey ? maps.bySku.get(skuKey) : undefined;
+  if (skuMatch) {
+    return { row: skuMatch, keyUsed: "sku" };
+  }
+
+  return { row: null, keyUsed: null };
 }
 
 async function findListingForPassport(row: ProductPassportRow): Promise<AmazonSpListingRow | null> {
@@ -182,26 +283,24 @@ async function findListingForPassport(row: ProductPassportRow): Promise<AmazonSp
   return matchListingForPassport(row, buildListingMaps(listings));
 }
 
-async function findProductMediaForPassport(row: ProductPassportRow): Promise<ProductMediaRow | null> {
-  const rows = await loadProductMediaForSeller(row.seller_id);
+async function findProductMediaForPassport(row: ProductPassportRow): Promise<ProductMediaMatch> {
+  const rows = await loadProductMediaForPassports(row.seller_id, [row]);
   return matchProductMediaForPassport(row, buildProductMediaMaps(rows));
 }
 
 function toSafeProductPassport(
   row: ProductPassportRow,
   listing: AmazonSpListingRow | null = null,
-  productMedia: ProductMediaRow | null = null
+  productMediaMatch: ProductMediaMatch | ProductMediaRow | null = null
 ): SafeProductPassportRow {
-  const fallbackMedia = normalizeProductMedia([listing, row], {
-    lastImageSyncAt: latestTimestamp([listing?.last_synced_at, listing?.updated_at, row.updated_at]),
-    amazonImagePreferred: Boolean(listing)
-  });
+  const productMedia = productMediaMatch && "row" in productMediaMatch ? productMediaMatch.row : productMediaMatch;
+  const mediaJoinKeyUsed = productMediaMatch && "row" in productMediaMatch ? productMediaMatch.keyUsed : productMedia ? "asin" : null;
   const productMediaImageUrls = cleanImageUrls(productMedia?.image_urls);
-  const mainImageUrl = productMedia ? productMedia.main_image_url : fallbackMedia.mainImageUrl;
-  const imageUrls = productMedia ? productMediaImageUrls : fallbackMedia.images;
-  const imageStatus = productMedia?.image_status ?? (mainImageUrl ? fallbackMedia.imageStatus : "NOT_SYNCED");
-  const imageSource = productMedia?.image_source ?? (mainImageUrl ? fallbackMedia.imageSource : null);
-  const lastImageSyncAt = productMedia?.last_image_sync_at ?? (mainImageUrl ? fallbackMedia.lastImageSyncAt : null);
+  const mainImageUrl = productMedia ? cleanText(productMedia.main_image_url) : null;
+  const imageUrls = productMedia ? productMediaImageUrls : [];
+  const imageStatus = productMedia ? cleanText(productMedia.image_status) ?? "FOUND" : "NOT_SYNCED";
+  const imageSource = productMedia ? cleanText(productMedia.image_source) : null;
+  const lastImageSyncAt = productMedia ? productMedia.last_image_sync_at : null;
 
   return {
     id: row.id,
@@ -232,6 +331,11 @@ function toSafeProductPassport(
     lastImageSyncAt,
     images: imageUrls,
     imageStatus,
+    mediaJoinMatched: Boolean(productMedia),
+    mediaJoinKeyUsed,
+    mediaAsin: productMedia?.asin ?? null,
+    mediaSku: productMedia?.sku ?? null,
+    mediaTableId: productMedia?.id ?? null,
     supplierName: row.supplier_name,
     supplierCost: toNumberOrNull(row.supplier_cost),
     packagingNotes: row.packaging_notes,
@@ -344,10 +448,10 @@ export async function listProductPassports(input: {
   }
 
   const rows = (data ?? []) as ProductPassportRow[];
-  const sellerId = cleanText(input.sellerId) ?? "default";
+  const sellerId = normalizeSellerId(input.sellerId);
   const [listings, productMediaRows] = await Promise.all([
     loadListingsForSeller(sellerId),
-    loadProductMediaForSeller(sellerId)
+    loadProductMediaForPassports(sellerId, rows)
   ]);
   const listingMaps = buildListingMaps(listings);
   const productMediaMaps = buildProductMediaMaps(productMediaRows);
