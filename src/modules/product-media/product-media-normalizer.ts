@@ -4,6 +4,7 @@ export type ProductImageStatus =
   | "FOUND"
   | "CATALOG_FOUND_NO_IMAGES"
   | "CATALOG_FETCH_FAILED"
+  | "DB_UPSERT_FAILED"
   | "NO_ASIN"
   | "NOT_SYNCED";
 

@@ -61,6 +61,16 @@ type ProductMediaSaveInput = {
   lastImageSyncAt?: string | null;
 };
 
+type ProductMediaSyncSample = {
+  sku: string | null;
+  asin: string | null;
+  productName: string | null;
+  mainImageUrl: string | null;
+  imageStatus: string | null;
+  imageSource: string | null;
+  error?: unknown;
+};
+
 const FRONTEND_PRODUCT_LIST_ENDPOINT = "/api/product-passport/list";
 const CATALOG_INCLUDED_DATA = ["images", "summaries", "attributes"];
 
@@ -102,6 +112,30 @@ function rawKeys(value: unknown): string[] {
   return value && typeof value === "object" && !Array.isArray(value)
     ? Object.keys(value as Record<string, unknown>).slice(0, 60)
     : [];
+}
+
+function errorCode(error: unknown): string | null {
+  return error && typeof error === "object" && "code" in error
+    ? cleanText((error as { code?: unknown }).code)
+    : null;
+}
+
+function errorMessage(error: unknown): string | null {
+  return error instanceof Error
+    ? cleanText(error.message)
+    : error && typeof error === "object" && "message" in error
+      ? cleanText((error as { message?: unknown }).message)
+      : cleanText(error);
+}
+
+function isMissingProductMediaTableError(error: unknown): boolean {
+  const code = errorCode(error);
+  const message = errorMessage(error)?.toLowerCase() ?? "";
+
+  return code === "PGRST205" ||
+    message.includes("public.product_media") ||
+    message.includes("relation \"product_media\" does not exist") ||
+    message.includes("relation \"public.product_media\" does not exist");
 }
 
 function mapProductMediaRows(rows: ProductMediaRow[]): ProductMediaMaps {
@@ -170,6 +204,9 @@ async function loadProductMediaRows(input: {
 
   if (error) {
     logSafeAmazonSpError("Could not load product media rows.", error);
+    if (isMissingProductMediaTableError(error)) {
+      throw error;
+    }
     throw new Error("Could not load product_media from Supabase.");
   }
 
@@ -189,10 +226,50 @@ async function countProductMediaRows(sellerId: string, filters: ProductMediaFilt
 
   if (error) {
     logSafeAmazonSpError("Could not count product media rows.", error);
+    if (isMissingProductMediaTableError(error)) {
+      throw error;
+    }
     throw new Error("Could not count product_media rows in Supabase.");
   }
 
   return count ?? 0;
+}
+
+async function loadProductMediaSnapshot(input: {
+  sellerId: string;
+  limit?: number;
+  filters?: ProductMediaFilters;
+}): Promise<{
+  rows: ProductMediaRow[];
+  count: number;
+  tableExists: boolean;
+  tableStatus: "OK" | "MISSING";
+  tableError: string | null;
+}> {
+  try {
+    const rows = await loadProductMediaRows(input);
+    const count = await countProductMediaRows(input.sellerId, input.filters ?? {});
+
+    return {
+      rows,
+      count,
+      tableExists: true,
+      tableStatus: "OK",
+      tableError: null
+    };
+  } catch (error) {
+    if (!isMissingProductMediaTableError(error)) {
+      throw error;
+    }
+
+    return {
+      rows: [],
+      count: 0,
+      tableExists: false,
+      tableStatus: "MISSING",
+      tableError: errorMessage(error) ?? "product_media table is missing."
+    };
+  }
 }
 
 async function loadProductCandidates(input: {
@@ -411,12 +488,11 @@ export async function getProductMediaDebug(input: {
     asin: cleanText(input.asin),
     sku: cleanText(input.sku)
   };
-  const [candidateResult, productMediaRows, productMediaRowsCount] = await Promise.all([
+  const [candidateResult, productMediaSnapshot] = await Promise.all([
     loadProductCandidates({ sellerId, limit, filters }),
-    loadProductMediaRows({ sellerId, limit: 1000, filters }),
-    countProductMediaRows(sellerId, filters)
+    loadProductMediaSnapshot({ sellerId, limit: 1000, filters })
   ]);
-  const maps = mapProductMediaRows(productMediaRows);
+  const maps = mapProductMediaRows(productMediaSnapshot.rows);
   const samples = candidateResult.candidates.map((candidate) => sampleFromCandidate({
     candidate,
     mediaRow: findProductMedia(candidate, maps)
@@ -426,7 +502,10 @@ export async function getProductMediaDebug(input: {
   return {
     ok: true,
     sellerId,
-    productMediaRows: productMediaRowsCount,
+    productMediaRows: productMediaSnapshot.count,
+    productMediaTableExists: productMediaSnapshot.tableExists,
+    productMediaTableStatus: productMediaSnapshot.tableStatus,
+    productMediaTableError: productMediaSnapshot.tableError,
     productPassportRowsChecked: candidateResult.productPassportRowsChecked,
     amazonListingRowsChecked: candidateResult.amazonListingRowsChecked,
     sourceEndpointUsedByFrontend: FRONTEND_PRODUCT_LIST_ENDPOINT,
@@ -461,7 +540,7 @@ export async function syncCatalogImages(input: {
     return {
       ok: false,
       reason: "CATALOG_CLIENT_NOT_AVAILABLE",
-      nextStep: "Implement Catalog Items API client using existing SP-API auth",
+      nextStep: "Connect Seller Central or configure SP-API refresh token so the existing Catalog Items API client can run.",
       error: safeErrorMessage(error)
     };
   }
@@ -474,15 +553,7 @@ export async function syncCatalogImages(input: {
   let foundImages = 0;
   let missingImages = 0;
   let failed = 0;
-  const samples: Array<{
-    sku: string | null;
-    asin: string | null;
-    productName: string | null;
-    mainImageUrl: string | null;
-    imageStatus: string | null;
-    imageSource: string | null;
-    error?: unknown;
-  }> = [];
+  const samples: ProductMediaSyncSample[] = [];
 
   for (const candidate of candidateResult.candidates) {
     checked += 1;
@@ -491,26 +562,42 @@ export async function syncCatalogImages(input: {
 
     if (!asin) {
       missingImages += 1;
-      const row = await upsertProductMediaRow({
-        sellerId,
-        sku: candidate.sku,
-        asin: null,
-        productName: candidate.productName,
-        mainImageUrl: null,
-        imageUrls: [],
-        imageSource: null,
-        imageStatus: "NO_ASIN",
-        catalogPayload: null
-      });
-      samples.push({
-        sku: candidate.sku,
-        asin: candidate.asin,
-        productName: candidate.productName,
-        mainImageUrl: null,
-        imageStatus: row.image_status,
-        imageSource: row.image_source,
-        error: "NO_ASIN"
-      });
+      try {
+        const row = await upsertProductMediaRow({
+          sellerId,
+          sku: candidate.sku,
+          asin: null,
+          productName: candidate.productName,
+          mainImageUrl: null,
+          imageUrls: [],
+          imageSource: null,
+          imageStatus: "NO_ASIN",
+          catalogPayload: null
+        });
+        samples.push({
+          sku: candidate.sku,
+          asin: candidate.asin,
+          productName: candidate.productName,
+          mainImageUrl: null,
+          imageStatus: row.image_status,
+          imageSource: row.image_source,
+          error: "NO_ASIN"
+        });
+      } catch (error) {
+        failed += 1;
+        samples.push({
+          sku: candidate.sku,
+          asin: candidate.asin,
+          productName: candidate.productName,
+          mainImageUrl: null,
+          imageStatus: "DB_UPSERT_FAILED",
+          imageSource: null,
+          error: {
+            reason: "DB_UPSERT_FAILED",
+            details: safeErrorMessage(error)
+          }
+        });
+      }
       continue;
     }
 
@@ -527,18 +614,61 @@ export async function syncCatalogImages(input: {
       continue;
     }
 
+    let catalogPayload: Record<string, unknown>;
+
     try {
-      const catalogPayload = await amazonSpGet<Record<string, unknown>>({
+      catalogPayload = await amazonSpGet<Record<string, unknown>>({
         path: `/catalog/2022-04-01/items/${encodeURIComponent(asin)}`,
         accessToken,
         region: connection.region,
         stage: "GET_CATALOG_ITEM_IMAGES",
         query: {
-          marketplaceIds: connection.marketplace_id,
+          marketplaceIds: [connection.marketplace_id],
           includedData: CATALOG_INCLUDED_DATA
         }
       });
-      const extracted = extractCatalogImages(catalogPayload);
+    } catch (error) {
+      failed += 1;
+      const reason = classifyCatalogError(error);
+      const savedRow = await upsertProductMediaRow({
+        sellerId,
+        sku: candidate.sku,
+        asin,
+        productName: candidate.productName,
+        mainImageUrl: null,
+        imageUrls: [],
+        imageSource: "AMAZON_CATALOG",
+        imageStatus: "CATALOG_FETCH_FAILED",
+        catalogPayload: {
+          reason,
+          error: safeCatalogError(error)
+        },
+        lastImageSyncAt: new Date().toISOString()
+      }).catch((saveError) => ({
+        image_status: "DB_UPSERT_FAILED",
+        image_source: "AMAZON_CATALOG",
+        saveError
+      }));
+
+      samples.push({
+        sku: candidate.sku,
+        asin,
+        productName: candidate.productName,
+        mainImageUrl: null,
+        imageStatus: savedRow.image_status,
+        imageSource: savedRow.image_source,
+        error: {
+          reason,
+          details: safeCatalogError(error),
+          dbStatusSaveError: "saveError" in savedRow ? safeErrorMessage(savedRow.saveError) : undefined
+        }
+      });
+      continue;
+    }
+
+    const extracted = extractCatalogImages(catalogPayload);
+
+    try {
       const row = await upsertProductMediaRow({
         sellerId,
         sku: candidate.sku,
@@ -565,33 +695,16 @@ export async function syncCatalogImages(input: {
       });
     } catch (error) {
       failed += 1;
-      const reason = classifyCatalogError(error);
-      const savedRow = await upsertProductMediaRow({
-        sellerId,
-        sku: candidate.sku,
-        asin,
-        productName: candidate.productName,
-        mainImageUrl: null,
-        imageUrls: [],
-        imageSource: "AMAZON_CATALOG",
-        imageStatus: "CATALOG_FETCH_FAILED",
-        catalogPayload: {
-          reason,
-          error: safeCatalogError(error)
-        },
-        lastImageSyncAt: new Date().toISOString()
-      }).catch(() => null);
-
       samples.push({
         sku: candidate.sku,
         asin,
         productName: candidate.productName,
-        mainImageUrl: null,
-        imageStatus: savedRow?.image_status ?? "CATALOG_FETCH_FAILED",
-        imageSource: savedRow?.image_source ?? "AMAZON_CATALOG",
+        mainImageUrl: extracted.mainImageUrl,
+        imageStatus: "DB_UPSERT_FAILED",
+        imageSource: extracted.imageSource ?? "AMAZON_CATALOG",
         error: {
-          reason,
-          details: safeCatalogError(error)
+          reason: "DB_UPSERT_FAILED",
+          details: safeErrorMessage(error)
         }
       });
     }

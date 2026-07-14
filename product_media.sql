@@ -30,11 +30,17 @@ alter table public.product_media
   add column if not exists created_at timestamptz not null default now(),
   add column if not exists updated_at timestamptz not null default now();
 
-create unique index if not exists idx_product_media_seller_asin_unique
-  on public.product_media (seller_id, asin);
+drop index if exists public.idx_product_media_seller_asin_unique;
 
-create unique index if not exists idx_product_media_seller_sku_unique
-  on public.product_media (seller_id, sku);
+drop index if exists public.idx_product_media_seller_sku_unique;
+
+create unique index if not exists product_media_seller_asin_uidx
+  on public.product_media (seller_id, asin)
+  where asin is not null;
+
+create unique index if not exists product_media_seller_sku_uidx
+  on public.product_media (seller_id, sku)
+  where sku is not null;
 
 create index if not exists idx_product_media_seller_id
   on public.product_media (seller_id);
