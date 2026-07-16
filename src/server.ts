@@ -47,14 +47,17 @@ import { logger } from "./utils/logger";
 
 const app = express();
 const port = Number(process.env.PORT) || 3000;
-const allowedCorsOrigins = new Set([
+const allowedCorsOrigins = new Set<string>([
   "http://localhost:5173",
   "http://localhost:5174",
   "https://leafydew.in",
   "https://www.leafydew.in",
   "https://app.leafydew.in",
   "https://leafy-dew-ai-cgo-frontend.vercel.app",
+  "https://leafy-dew-ai-cgo-frontend-hbtvzjmy8-dewleafy-9519s-projects.vercel.app",
 ]);
+const corsAllowMethods = "GET,POST,PUT,PATCH,DELETE,OPTIONS";
+const corsAllowHeaders = "Content-Type,Authorization,x-cron-secret";
 
 app.use((req: Request, res: Response, next: NextFunction) => {
   const origin = req.headers.origin;
@@ -64,8 +67,8 @@ app.use((req: Request, res: Response, next: NextFunction) => {
     res.setHeader("Vary", "Origin");
   }
 
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-cron-secret");
+  res.setHeader("Access-Control-Allow-Methods", corsAllowMethods);
+  res.setHeader("Access-Control-Allow-Headers", corsAllowHeaders);
   res.setHeader("Access-Control-Max-Age", "86400");
 
   if (req.method === "OPTIONS") {
