@@ -89,20 +89,25 @@ function normalizeSku(value: unknown): string | null {
   return cleanText(value == null ? null : String(value));
 }
 
-function cleanImageUrls(value: unknown): string[] {
-  return Array.isArray(value)
-    ? value.map((item) => cleanText(item == null ? null : String(item))).filter((item): item is string => Boolean(item))
-    : [];
+function normalizeSkuKey(value: unknown): string | null {
+  return normalizeKey(value);
 }
 
-function latestTimestamp(values: Array<string | null | undefined>): string | null {
-  const timestamps = values
-    .filter((value): value is string => Boolean(value))
-    .map((value) => ({ value, millis: Date.parse(value) }))
-    .filter((item) => Number.isFinite(item.millis))
-    .sort((a, b) => b.millis - a.millis);
+function cleanImageUrls(value: unknown): string[] {
+  const seen = new Set<string>();
+  const urls = (Array.isArray(value) ? value : [])
+    .map((item) => cleanText(item == null ? null : String(item)))
+    .filter((item): item is string => Boolean(item));
 
-  return timestamps[0]?.value ?? null;
+  return urls.filter((url) => {
+    if (seen.has(url)) return false;
+    seen.add(url);
+    return true;
+  });
+}
+
+function mergeImageUrls(...values: unknown[]): string[] {
+  return cleanImageUrls(values.flatMap((value) => Array.isArray(value) ? value : [value]));
 }
 
 function buildListingMaps(listings: AmazonSpListingRow[]): {
@@ -150,9 +155,10 @@ async function loadListingsForSeller(sellerId: string): Promise<AmazonSpListingR
 async function loadProductMediaForPassports(sellerId: string, rows: ProductPassportRow[]): Promise<ProductMediaRow[]> {
   const normalizedSellerId = normalizeSellerId(sellerId);
   const asinKeys = new Set(rows.map((row) => normalizeAsin(row.asin)).filter((value): value is string => Boolean(value)));
-  const skuKeys = new Set(rows.map((row) => normalizeSku(row.sku)).filter((value): value is string => Boolean(value)));
+  const skuValues = new Set(rows.map((row) => normalizeSku(row.sku)).filter((value): value is string => Boolean(value)));
+  const skuKeys = new Set(rows.map((row) => normalizeSkuKey(row.sku)).filter((value): value is string => Boolean(value)));
 
-  if (!asinKeys.size && !skuKeys.size) {
+  if (!asinKeys.size && !skuValues.size) {
     return [];
   }
 
@@ -160,7 +166,7 @@ async function loadProductMediaForPassports(sellerId: string, rows: ProductPassp
   const addMatchedRows = (mediaRows: ProductMediaRow[]) => {
     for (const mediaRow of mediaRows) {
       const asinKey = normalizeAsin(mediaRow.asin);
-      const skuKey = normalizeSku(mediaRow.sku);
+      const skuKey = normalizeSkuKey(mediaRow.sku);
       if ((asinKey && asinKeys.has(asinKey)) || (skuKey && skuKeys.has(skuKey))) {
         matchedRows.set(mediaRow.id, mediaRow);
       }
@@ -176,12 +182,12 @@ async function loadProductMediaForPassports(sellerId: string, rows: ProductPassp
           .in("asin", Array.from(asinKeys))
           .order("updated_at", { ascending: false })
       : Promise.resolve({ data: [], error: null }),
-    skuKeys.size
+    skuValues.size
       ? supabase
           .from("product_media")
           .select("*")
           .eq("seller_id", normalizedSellerId)
-          .in("sku", Array.from(skuKeys))
+          .in("sku", Array.from(skuValues))
           .order("updated_at", { ascending: false })
       : Promise.resolve({ data: [], error: null })
   ]);
@@ -200,10 +206,10 @@ async function loadProductMediaForPassports(sellerId: string, rows: ProductPassp
 
   const needsNormalizedFallback = rows.some((row) => {
     const asinKey = normalizeAsin(row.asin);
-    const skuKey = normalizeSku(row.sku);
+    const skuKey = normalizeSkuKey(row.sku);
     return !Array.from(matchedRows.values()).some((mediaRow) => {
       const mediaAsinKey = normalizeAsin(mediaRow.asin);
-      const mediaSkuKey = normalizeSku(mediaRow.sku);
+      const mediaSkuKey = normalizeSkuKey(mediaRow.sku);
       return (asinKey && mediaAsinKey === asinKey) || (skuKey && mediaSkuKey === skuKey);
     });
   });
@@ -245,7 +251,7 @@ function buildProductMediaMaps(rows: ProductMediaRow[]): {
   const byAsin = new Map<string, ProductMediaRow>();
 
   for (const row of rows) {
-    const skuKey = normalizeSku(row.sku);
+    const skuKey = normalizeSkuKey(row.sku);
     const asinKey = normalizeAsin(row.asin);
     if (skuKey && !bySku.has(skuKey)) bySku.set(skuKey, row);
     if (asinKey && !byAsin.has(asinKey)) byAsin.set(asinKey, row);
@@ -264,15 +270,15 @@ function matchProductMediaForPassport(
   maps: { bySku: Map<string, ProductMediaRow>; byAsin: Map<string, ProductMediaRow> }
 ): ProductMediaMatch {
   const asinKey = normalizeAsin(row.asin);
-  const skuKey = normalizeSku(row.sku);
-  const asinMatch = asinKey ? maps.byAsin.get(asinKey) : undefined;
-  if (asinMatch) {
-    return { row: asinMatch, keyUsed: "asin" };
-  }
-
+  const skuKey = normalizeSkuKey(row.sku);
   const skuMatch = skuKey ? maps.bySku.get(skuKey) : undefined;
   if (skuMatch) {
     return { row: skuMatch, keyUsed: "sku" };
+  }
+
+  const asinMatch = asinKey ? maps.byAsin.get(asinKey) : undefined;
+  if (asinMatch) {
+    return { row: asinMatch, keyUsed: "asin" };
   }
 
   return { row: null, keyUsed: null };
@@ -295,9 +301,11 @@ function toSafeProductPassport(
 ): SafeProductPassportRow {
   const productMedia = productMediaMatch && "row" in productMediaMatch ? productMediaMatch.row : productMediaMatch;
   const mediaJoinKeyUsed = productMediaMatch && "row" in productMediaMatch ? productMediaMatch.keyUsed : productMedia ? "asin" : null;
-  const productMediaImageUrls = cleanImageUrls(productMedia?.image_urls);
-  const mainImageUrl = productMedia ? cleanText(productMedia.main_image_url) : null;
-  const imageUrls = productMedia ? productMediaImageUrls : [];
+  const passportImageUrls = cleanImageUrls(row.image_urls);
+  const productMediaImageUrls = mergeImageUrls(productMedia?.main_image_url, productMedia?.image_urls);
+  const productMediaMainImageUrl = cleanText(productMedia?.main_image_url) ?? productMediaImageUrls[0] ?? null;
+  const imageUrls = mergeImageUrls(productMediaImageUrls, passportImageUrls);
+  const mainImageUrl = productMediaMainImageUrl ?? passportImageUrls[0] ?? null;
   const imageStatus = productMedia ? cleanText(productMedia.image_status) ?? "FOUND" : "NOT_SYNCED";
   const imageSource = productMedia ? cleanText(productMedia.image_source) : null;
   const lastImageSyncAt = productMedia ? productMedia.last_image_sync_at : null;
@@ -326,7 +334,7 @@ function toSafeProductPassport(
     imageUrls,
     mainImageUrl,
     imageUrl: mainImageUrl,
-    amazonImageUrl: mainImageUrl,
+    amazonImageUrl: productMediaMainImageUrl,
     imageSource,
     lastImageSyncAt,
     images: imageUrls,
