@@ -1057,6 +1057,182 @@ export async function requireConnectedConnection(sellerId: string): Promise<Amaz
   throw new Error("SP-API refresh token is not configured.");
 }
 
+type AmazonSpAttributeValue = Record<string, unknown>;
+type AmazonSpAttributesMap = Record<string, AmazonSpAttributeValue[] | undefined>;
+
+function firstAttributeValue(attributes: AmazonSpAttributesMap | undefined, keys: string[]): AmazonSpAttributeValue | undefined {
+  if (!attributes) return undefined;
+  for (const key of keys) {
+    const entries = attributes[key];
+    if (Array.isArray(entries) && entries.length > 0 && entries[0] && typeof entries[0] === "object") {
+      return entries[0];
+    }
+  }
+  return undefined;
+}
+
+function readAttrText(entry: AmazonSpAttributeValue | undefined, keys: string[] = ["value"]): string | null {
+  if (!entry) return null;
+  for (const key of keys) {
+    const value = entry[key];
+    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  }
+  return null;
+}
+
+function formatDimensionEntry(entry: AmazonSpAttributeValue | undefined): string | null {
+  if (!entry || typeof entry !== "object") return null;
+
+  const readMeasure = (field: string): { value: number; unit: string } | null => {
+    const raw = entry[field];
+    if (!raw || typeof raw !== "object") return null;
+    const record = raw as Record<string, unknown>;
+    const value = typeof record.value === "number" ? record.value : Number(record.value);
+    const unit = typeof record.unit === "string" ? record.unit : "";
+    if (!Number.isFinite(value)) return null;
+    return { value, unit };
+  };
+
+  const length = readMeasure("length");
+  const width = readMeasure("width");
+  const height = readMeasure("height");
+
+  if (!length && !width && !height) return null;
+
+  const parts = [length, width, height].filter((part): part is { value: number; unit: string } => part !== null);
+  if (parts.length === 0) return null;
+
+  const unit = parts[0].unit || "";
+  const numbers = parts.map((part) => trimTrailingZeros(part.value)).join(" x ");
+  return unit ? `${numbers} ${unit}` : numbers;
+}
+
+function formatWeightEntry(entry: AmazonSpAttributeValue | undefined): string | null {
+  if (!entry || typeof entry !== "object") return null;
+  const record = entry as Record<string, unknown>;
+  const value = typeof record.value === "number" ? record.value : Number(record.value);
+  const unit = typeof record.unit === "string" ? record.unit : "";
+  if (!Number.isFinite(value)) return null;
+  return unit ? `${trimTrailingZeros(value)} ${unit}` : trimTrailingZeros(value);
+}
+
+function trimTrailingZeros(value: number): string {
+  return Number(value.toFixed(3)).toString();
+}
+
+function extractPhysicalAttributes(attributes: AmazonSpAttributesMap | undefined): {
+  dimensions: string | null;
+  weight: string | null;
+  material: string | null;
+  color: string | null;
+} {
+  const dimensionsEntry = firstAttributeValue(attributes, ["item_dimensions", "package_dimensions", "item_package_dimensions"]);
+  const weightEntry = firstAttributeValue(attributes, ["item_weight", "item_package_weight", "package_weight"]);
+  const colorEntry = firstAttributeValue(attributes, ["color", "color_name", "colour"]);
+  const materialEntry = firstAttributeValue(attributes, ["material_type", "material", "fabric_type", "outer_material_type"]);
+
+  return {
+    dimensions: formatDimensionEntry(dimensionsEntry),
+    weight: formatWeightEntry(weightEntry),
+    color: readAttrText(colorEntry, ["value"]),
+    material: readAttrText(materialEntry, ["value"])
+  };
+}
+
+export async function syncAmazonSpListingAttributes(input: { sellerId: string; limit?: number }) {
+  const sellerId = sellerIdOrDefault(input.sellerId);
+  const limit = Math.min(Math.max(toIntegerOrNull(input.limit ?? undefined) ?? 25, 1), 100);
+  const connection = await requireConnectedConnection(sellerId);
+  const accessToken = await getAmazonSpAccessToken(connection.id);
+  const amazonSellerId = connection.amazon_seller_id;
+
+  if (!amazonSellerId) {
+    throw new Error("Amazon seller ID is not available on this connection yet. Run the status/doctor check first.");
+  }
+
+  await logSpActivity({
+    sellerId,
+    action: "SYNC_LISTING_ATTRIBUTES_STARTED",
+    status: "INFO",
+    message: "Amazon SP-API listing attribute sync started."
+  });
+
+  const { data: rows, error: selectError } = await supabase
+    .from("product_passports")
+    .select("id, sku, dimensions, weight, material, color")
+    .eq("seller_id", sellerId)
+    .not("sku", "is", null)
+    .or("dimensions.is.null,weight.is.null,material.is.null,color.is.null")
+    .limit(limit);
+
+  if (selectError) {
+    throw new Error(safeErrorMessage(selectError));
+  }
+
+  const candidates = rows ?? [];
+  let updatedCount = 0;
+  let skippedCount = 0;
+  const warnings: string[] = [];
+
+  for (const row of candidates) {
+    try {
+      const response = await amazonSpGet<{ attributes?: AmazonSpAttributesMap }>({
+        path: `/listings/2021-08-01/items/${amazonSellerId}/${encodeURIComponent(row.sku)}`,
+        query: {
+          marketplaceIds: [connection.marketplace_id],
+          includedData: ["attributes"]
+        },
+        accessToken,
+        region: connection.region,
+        stage: "GET_LISTINGS_ITEM"
+      });
+
+      const extracted = extractPhysicalAttributes(response?.attributes);
+      const updateRow: Record<string, unknown> = { updated_at: new Date().toISOString() };
+
+      if (!row.dimensions && extracted.dimensions) updateRow.dimensions = extracted.dimensions;
+      if (!row.weight && extracted.weight) updateRow.weight = extracted.weight;
+      if (!row.material && extracted.material) updateRow.material = extracted.material;
+      if (!row.color && extracted.color) updateRow.color = extracted.color;
+
+      if (Object.keys(updateRow).length > 1) {
+        const { error: updateError } = await supabase.from("product_passports").update(updateRow).eq("id", row.id);
+        if (updateError) {
+          logSafeAmazonSpError("Could not save Amazon listing attributes to product passport.", updateError);
+          warnings.push(`SKU ${row.sku}: fetched attributes but could not save them.`);
+        } else {
+          updatedCount += 1;
+        }
+      } else {
+        skippedCount += 1;
+        warnings.push(`SKU ${row.sku}: Amazon did not return dimensions/weight/material/color for this listing.`);
+      }
+    } catch (itemError) {
+      skippedCount += 1;
+      warnings.push(`SKU ${row.sku}: ${safeErrorMessage(itemError)}`);
+    }
+
+    await smallDelay(400);
+  }
+
+  await logSpActivity({
+    sellerId,
+    action: "SYNC_LISTING_ATTRIBUTES_COMPLETED",
+    status: "SUCCESS",
+    message: "Amazon SP-API listing attribute sync completed.",
+    metadata: { checked: candidates.length, updatedCount, skippedCount }
+  });
+
+  return {
+    ok: true,
+    checked: candidates.length,
+    updatedCount,
+    skippedCount,
+    warnings
+  };
+}
+
 async function updateConnectionError(connectionId: string, lastError: string | null): Promise<void> {
   if (connectionId === AMAZON_SP_ENV_CONNECTION_ID) {
     return;
