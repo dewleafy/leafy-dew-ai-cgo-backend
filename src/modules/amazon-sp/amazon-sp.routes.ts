@@ -13,6 +13,7 @@ import {
   listAmazonSpListingsController,
   listAmazonSpOrdersController,
   processAmazonSpReportJobsController,
+  syncAmazonSpListingAttributesController,
   syncAmazonSpListingsController,
   syncAmazonSpOrderReportController,
   syncAmazonSpOrderReportChunkedController,
@@ -28,6 +29,8 @@ amazonSpRouter.get("/status", asyncHandler(getAmazonSpStatusController));
 amazonSpRouter.get("/doctor", asyncHandler(getAmazonSpDoctorController));
 amazonSpRouter.get("/sync-listings", asyncHandler(syncAmazonSpListingsController));
 amazonSpRouter.post("/sync-listings", asyncHandler(syncAmazonSpListingsController));
+amazonSpRouter.get("/sync-listing-attributes", asyncHandler(syncAmazonSpListingAttributesController));
+amazonSpRouter.post("/sync-listing-attributes", asyncHandler(syncAmazonSpListingAttributesController));
 amazonSpRouter.get("/listings", asyncHandler(listAmazonSpListingsController));
 amazonSpRouter.get("/sync-orders", asyncHandler(syncAmazonSpOrdersController));
 amazonSpRouter.post("/sync-orders", asyncHandler(syncAmazonSpOrdersController));
