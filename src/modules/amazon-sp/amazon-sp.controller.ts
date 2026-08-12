@@ -13,6 +13,7 @@ import {
   listAmazonSpOrders,
   processAmazonSpReportJobs,
   runAmazonSpDoctor,
+  syncAmazonSpListingAttributes,
   syncAmazonSpListings,
   syncAmazonSpOrderReport,
   syncAmazonSpOrderReportChunked,
@@ -153,6 +154,17 @@ export async function syncAmazonSpListingsController(req: Request, res: Response
     }));
   } catch (error) {
     sendSafeError(res, "Could not sync Amazon SP-API listings.", error);
+  }
+}
+
+export async function syncAmazonSpListingAttributesController(req: Request, res: Response): Promise<void> {
+  try {
+    res.json(await syncAmazonSpListingAttributes({
+      sellerId: getSellerId(req),
+      limit: getLimit(req)
+    }));
+  } catch (error) {
+    sendSafeError(res, "Could not sync Amazon SP-API listing attributes.", error);
   }
 }
 
