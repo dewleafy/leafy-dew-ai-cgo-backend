@@ -1220,7 +1220,13 @@ export async function syncAmazonSpListingAttributes(input: { sellerId: string; l
       }
     } catch (itemError) {
       skippedCount += 1;
-      warnings.push(`SKU ${row.sku}: ${safeErrorMessage(itemError)}`);
+      const details = safeErrorDetails(itemError);
+      if (typeof details === "string") {
+        warnings.push(`SKU ${row.sku}: ${details}`);
+      } else {
+        const reason = details.amazonErrorMessage || details.amazonErrorCode || `HTTP ${details.httpStatus}`;
+        warnings.push(`SKU ${row.sku}: Amazon said "${reason}"${details.amazonErrorCode ? ` (${details.amazonErrorCode})` : ""}.`);
+      }
     }
 
     await smallDelay(400);
