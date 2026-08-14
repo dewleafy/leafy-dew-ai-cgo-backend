@@ -1225,7 +1225,10 @@ export async function syncAmazonSpListingAttributes(input: { sellerId: string; l
         warnings.push(`SKU ${row.sku}: ${details}`);
       } else {
         const reason = details.amazonErrorMessage || details.amazonErrorCode || `HTTP ${details.httpStatus}`;
-        warnings.push(`SKU ${row.sku}: Amazon said "${reason}"${details.amazonErrorCode ? ` (${details.amazonErrorCode})` : ""}.`);
+        const queryDump = details.safeQuery ? JSON.stringify(details.safeQuery) : "(none)";
+        warnings.push(
+          `SKU ${row.sku}: Amazon said "${reason}"${details.amazonErrorCode ? ` (${details.amazonErrorCode})` : ""}. Request sent: ${details.method} ${details.path} query=${queryDump}`
+        );
       }
     }
 
