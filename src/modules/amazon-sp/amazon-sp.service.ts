@@ -1127,10 +1127,17 @@ function extractPhysicalAttributes(attributes: AmazonSpAttributesMap | undefined
   material: string | null;
   color: string | null;
 } {
-  const dimensionsEntry = firstAttributeValue(attributes, ["item_dimensions", "package_dimensions", "item_package_dimensions"]);
-  const weightEntry = firstAttributeValue(attributes, ["item_weight", "item_package_weight", "package_weight"]);
-  const colorEntry = firstAttributeValue(attributes, ["color", "color_name", "colour"]);
-  const materialEntry = firstAttributeValue(attributes, ["material_type", "material", "fabric_type", "outer_material_type"]);
+  const dimensionsEntry = firstAttributeValue(attributes, [
+    "item_dimensions", "package_dimensions", "item_package_dimensions",
+    "item_display_dimensions", "item_pallet_dimensions"
+  ]);
+  const weightEntry = firstAttributeValue(attributes, [
+    "item_weight", "item_package_weight", "package_weight", "item_display_weight"
+  ]);
+  const colorEntry = firstAttributeValue(attributes, ["color", "color_name", "colour", "color_map"]);
+  const materialEntry = firstAttributeValue(attributes, [
+    "material_type", "material", "fabric_type", "outer_material_type", "cushion_material_type"
+  ]);
 
   return {
     dimensions: formatDimensionEntry(dimensionsEntry),
@@ -1174,6 +1181,7 @@ export async function syncAmazonSpListingAttributes(input: { sellerId: string; l
   let updatedCount = 0;
   let skippedCount = 0;
   const warnings: string[] = [];
+  const seenAttributeKeys = new Set<string>();
 
   for (const row of candidates) {
     try {
@@ -1187,6 +1195,9 @@ export async function syncAmazonSpListingAttributes(input: { sellerId: string; l
         region: connection.region,
         stage: "GET_LISTINGS_ITEM"
       });
+
+      const attributeKeys = response?.attributes ? Object.keys(response.attributes) : [];
+      attributeKeys.forEach((key) => seenAttributeKeys.add(key));
 
       const extracted = extractPhysicalAttributes(response?.attributes);
       const updateRow: Record<string, unknown> = { updated_at: new Date().toISOString() };
@@ -1206,7 +1217,6 @@ export async function syncAmazonSpListingAttributes(input: { sellerId: string; l
         }
       } else {
         skippedCount += 1;
-        warnings.push(`SKU ${row.sku}: Amazon did not return dimensions/weight/material/color for this listing.`);
       }
     } catch (itemError) {
       skippedCount += 1;
@@ -1216,12 +1226,21 @@ export async function syncAmazonSpListingAttributes(input: { sellerId: string; l
     await smallDelay(400);
   }
 
+  if (updatedCount === 0 && candidates.length > 0) {
+    const keyList = Array.from(seenAttributeKeys).sort().join(", ");
+    warnings.unshift(
+      keyList
+        ? `Diagnostic: Amazon returned these attribute names for your products, none matched what we look for: ${keyList}`
+        : "Diagnostic: Amazon returned no attributes object at all for these SKUs."
+    );
+  }
+
   await logSpActivity({
     sellerId,
     action: "SYNC_LISTING_ATTRIBUTES_COMPLETED",
     status: "SUCCESS",
     message: "Amazon SP-API listing attribute sync completed.",
-    metadata: { checked: candidates.length, updatedCount, skippedCount }
+    metadata: { checked: candidates.length, updatedCount, skippedCount, seenAttributeKeys: Array.from(seenAttributeKeys) }
   });
 
   return {
