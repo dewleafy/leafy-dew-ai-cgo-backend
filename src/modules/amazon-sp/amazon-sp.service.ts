@@ -1125,6 +1125,15 @@ function trimTrailingZeros(value: number): string {
   return Number(value.toFixed(3)).toString();
 }
 
+function formatSingleMeasureEntry(entry: AmazonSpAttributeValue | undefined): string | null {
+  if (!entry || typeof entry !== "object") return null;
+  const record = entry as Record<string, unknown>;
+  const value = typeof record.value === "number" ? record.value : Number(record.value);
+  const unit = typeof record.unit === "string" ? record.unit : "";
+  if (!Number.isFinite(value)) return null;
+  return unit ? `${trimTrailingZeros(value)} ${unit}` : trimTrailingZeros(value);
+}
+
 function extractPhysicalAttributes(attributes: AmazonSpAttributesMap | undefined): {
   dimensions: string | null;
   weight: string | null;
@@ -1133,22 +1142,65 @@ function extractPhysicalAttributes(attributes: AmazonSpAttributesMap | undefined
 } {
   const dimensionsEntry = firstAttributeValue(attributes, [
     "item_dimensions", "package_dimensions", "item_package_dimensions",
-    "item_display_dimensions", "item_pallet_dimensions"
+    "item_display_dimensions", "item_pallet_dimensions",
+    "item_length_width_height", "item_depth_width_height"
   ]);
   const weightEntry = firstAttributeValue(attributes, [
     "item_weight", "item_package_weight", "package_weight", "item_display_weight"
   ]);
+  const diameterEntry = firstAttributeValue(attributes, ["item_diameter"]);
   const colorEntry = firstAttributeValue(attributes, ["color", "color_name", "colour", "color_map"]);
   const materialEntry = firstAttributeValue(attributes, [
     "material_type", "material", "fabric_type", "outer_material_type", "cushion_material_type"
   ]);
 
+  const dimensions = formatDimensionEntry(dimensionsEntry) ??
+    (diameterEntry ? (() => {
+      const diameterText = formatSingleMeasureEntry(diameterEntry);
+      return diameterText ? `${diameterText} diameter` : null;
+    })() : null);
+
   return {
-    dimensions: formatDimensionEntry(dimensionsEntry),
+    dimensions,
     weight: formatWeightEntry(weightEntry),
     color: readAttrText(colorEntry, ["value"]),
     material: readAttrText(materialEntry, ["value"])
   };
+}
+
+function extractBulletPoints(attributes: AmazonSpAttributesMap | undefined): string[] {
+  if (!attributes) return [];
+  const entries = attributes["bullet_point"];
+  if (!Array.isArray(entries)) return [];
+
+  return entries
+    .map((entry) => readAttrText(entry, ["value"]))
+    .filter((value): value is string => Boolean(value));
+}
+
+function extractImageUrls(attributes: AmazonSpAttributesMap | undefined): string[] {
+  if (!attributes) return [];
+
+  const locatorKeys = [
+    "main_product_image_locator",
+    "other_product_image_locator_1",
+    "other_product_image_locator_2",
+    "other_product_image_locator_3",
+    "other_product_image_locator_4",
+    "other_product_image_locator_5",
+    "other_product_image_locator_6",
+    "other_product_image_locator_7",
+    "other_product_image_locator_8"
+  ];
+
+  const urls: string[] = [];
+  for (const key of locatorKeys) {
+    const entry = firstAttributeValue(attributes, [key]);
+    const url = readAttrText(entry, ["media_location", "value", "url"]);
+    if (url) urls.push(url);
+  }
+
+  return urls;
 }
 
 export async function syncAmazonSpListingAttributes(input: { sellerId: string; limit?: number }) {
@@ -1171,10 +1223,10 @@ export async function syncAmazonSpListingAttributes(input: { sellerId: string; l
 
   const { data: rows, error: selectError } = await supabase
     .from("product_passports")
-    .select("id, sku, dimensions, weight, material, color")
+    .select("id, sku, dimensions, weight, material, color, key_features, image_urls")
     .eq("seller_id", sellerId)
     .not("sku", "is", null)
-    .or("dimensions.is.null,weight.is.null,material.is.null,color.is.null")
+    .or("dimensions.is.null,weight.is.null,material.is.null,color.is.null,key_features.is.null,image_urls.is.null")
     .limit(limit);
 
   if (selectError) {
@@ -1204,12 +1256,20 @@ export async function syncAmazonSpListingAttributes(input: { sellerId: string; l
       attributeKeys.forEach((key) => seenAttributeKeys.add(key));
 
       const extracted = extractPhysicalAttributes(response?.attributes);
+      const extractedBullets = extractBulletPoints(response?.attributes);
+      const extractedImages = extractImageUrls(response?.attributes);
       const updateRow: Record<string, unknown> = { updated_at: new Date().toISOString() };
 
       if (!row.dimensions && extracted.dimensions) updateRow.dimensions = extracted.dimensions;
       if (!row.weight && extracted.weight) updateRow.weight = extracted.weight;
       if (!row.material && extracted.material) updateRow.material = extracted.material;
       if (!row.color && extracted.color) updateRow.color = extracted.color;
+      if ((!row.key_features || row.key_features.length === 0) && extractedBullets.length > 0) {
+        updateRow.key_features = extractedBullets;
+      }
+      if ((!row.image_urls || row.image_urls.length === 0) && extractedImages.length > 0) {
+        updateRow.image_urls = extractedImages;
+      }
 
       if (Object.keys(updateRow).length > 1) {
         const { error: updateError } = await supabase.from("product_passports").update(updateRow).eq("id", row.id);
