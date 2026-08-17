@@ -1033,7 +1033,7 @@ export async function requireConnectedConnection(sellerId: string): Promise<Amaz
   const connection = await getConnection(sellerId);
 
   if (connection && (connection.token_status === "CONNECTED" || env.SP_API_REFRESH_TOKEN)) {
-    const resolvedAmazonSellerId = cleanText(connection.amazon_seller_id) ?? cleanText(env.SP_API_AMAZON_SELLER_ID) ?? connection.amazon_seller_id;
+    const resolvedAmazonSellerId = cleanText(env.SP_API_AMAZON_SELLER_ID) ?? cleanText(connection.amazon_seller_id) ?? connection.amazon_seller_id;
     return {
       ...connection,
       amazon_seller_id: resolvedAmazonSellerId
