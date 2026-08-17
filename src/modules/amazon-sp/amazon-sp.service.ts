@@ -1290,7 +1290,9 @@ export async function syncAmazonSpListingAttributes(input: { sellerId: string; l
           warnings.push(
             `SKU ${row.sku}: this product's own attribute keys: ${ownKeys}. ` +
             `bullet_point raw: ${rawBulletPoint ? JSON.stringify(rawBulletPoint).slice(0, 300) : "(missing)"}. ` +
-            `main_product_image_locator raw: ${rawMainImage ? JSON.stringify(rawMainImage).slice(0, 300) : "(missing)"}.`
+            `main_product_image_locator raw: ${rawMainImage ? JSON.stringify(rawMainImage).slice(0, 300) : "(missing)"}. ` +
+            `EXTRACTED bullets count=${extractedBullets.length}, images count=${extractedImages.length}. ` +
+            `CURRENT DB key_features=${JSON.stringify(row.key_features)}, image_urls=${JSON.stringify(row.image_urls)}.`
           );
         }
       }
