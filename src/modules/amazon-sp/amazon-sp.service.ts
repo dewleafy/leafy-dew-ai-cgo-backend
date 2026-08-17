@@ -1238,6 +1238,7 @@ export async function syncAmazonSpListingAttributes(input: { sellerId: string; l
   let skippedCount = 0;
   const warnings: string[] = [];
   const seenAttributeKeys = new Set<string>();
+  let noUpdateDiagnosticsShown = 0;
 
   for (const row of candidates) {
     try {
@@ -1281,6 +1282,17 @@ export async function syncAmazonSpListingAttributes(input: { sellerId: string; l
         }
       } else {
         skippedCount += 1;
+        if (noUpdateDiagnosticsShown < 5) {
+          noUpdateDiagnosticsShown += 1;
+          const ownKeys = attributeKeys.slice().sort().join(", ") || "(no attributes at all)";
+          const rawBulletPoint = response?.attributes?.["bullet_point"];
+          const rawMainImage = response?.attributes?.["main_product_image_locator"];
+          warnings.push(
+            `SKU ${row.sku}: this product's own attribute keys: ${ownKeys}. ` +
+            `bullet_point raw: ${rawBulletPoint ? JSON.stringify(rawBulletPoint).slice(0, 300) : "(missing)"}. ` +
+            `main_product_image_locator raw: ${rawMainImage ? JSON.stringify(rawMainImage).slice(0, 300) : "(missing)"}.`
+          );
+        }
       }
     } catch (itemError) {
       skippedCount += 1;
