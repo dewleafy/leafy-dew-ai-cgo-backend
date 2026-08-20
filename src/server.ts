@@ -25,6 +25,7 @@ import { learningSummaryRoutes } from "./modules/learning-summary/learning-summa
 import { launchChecklistRouter } from "./modules/launch-checklist/launch-checklist.routes";
 import { launchGateRouter } from "./modules/launch-gate/launch-gate.routes";
 import { listingDraftsRouter } from "./modules/listing-drafts/listing-drafts.routes";
+import { listingSchemaRouter } from "./modules/listing-schema/listing-schema.routes";
 import { listingReadinessRoutes } from "./modules/listing-readiness/listing-readiness.routes";
 import { liveExecutionRouter } from "./modules/live-execution/live-execution.routes";
 import { notificationOutboxRouter } from "./modules/notification-outbox/notification-outbox.routes";
@@ -206,6 +207,7 @@ app.use("/api/learning-summary", learningSummaryRoutes);
 app.use("/api/launch-checklist", launchChecklistRouter);
 app.use("/api/launch-gate", launchGateRouter);
 app.use("/api/listing-drafts", listingDraftsRouter);
+app.use("/api/listing-schema", listingSchemaRouter);
 app.use("/api/listing-readiness", listingReadinessRoutes);
 app.use("/api/live-execution", liveExecutionRouter);
 app.use("/api/notification-outbox", notificationOutboxRouter);
