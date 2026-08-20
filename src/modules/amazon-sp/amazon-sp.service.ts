@@ -1242,11 +1242,14 @@ export async function syncAmazonSpListingAttributes(input: { sellerId: string; l
 
   for (const row of candidates) {
     try {
-      const response = await amazonSpGet<{ attributes?: AmazonSpAttributesMap }>({
+      const response = await amazonSpGet<{
+        attributes?: AmazonSpAttributesMap;
+        summaries?: Array<{ productType?: string }>;
+      }>({
         path: `/listings/2021-08-01/items/${amazonSellerId}/${encodeURIComponent(row.sku)}`,
         query: {
           marketplaceIds: [connection.marketplace_id],
-          includedData: ["attributes"]
+          includedData: ["attributes", "summaries"]
         },
         accessToken,
         region: connection.region,
@@ -1259,7 +1262,10 @@ export async function syncAmazonSpListingAttributes(input: { sellerId: string; l
       const extracted = extractPhysicalAttributes(response?.attributes);
       const extractedBullets = extractBulletPoints(response?.attributes);
       const extractedImages = extractImageUrls(response?.attributes);
+      const extractedProductType = response?.summaries?.[0]?.productType || null;
       const updateRow: Record<string, unknown> = { updated_at: new Date().toISOString() };
+
+      if (extractedProductType) updateRow.product_type = extractedProductType;
 
       // This sync is an explicit, manually-triggered action ("Sync from Amazon"), so it
       // always refreshes with Amazon's current data rather than only filling blanks —
