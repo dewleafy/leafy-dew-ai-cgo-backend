@@ -1226,7 +1226,7 @@ export async function syncAmazonSpListingAttributes(input: { sellerId: string; l
     .select("id, sku, dimensions, weight, material, color, key_features, image_urls")
     .eq("seller_id", sellerId)
     .not("sku", "is", null)
-    .or("dimensions.is.null,weight.is.null,material.is.null,color.is.null,key_features.is.null,image_urls.is.null")
+    .order("updated_at", { ascending: true, nullsFirst: true })
     .limit(limit);
 
   if (selectError) {
@@ -1261,14 +1261,18 @@ export async function syncAmazonSpListingAttributes(input: { sellerId: string; l
       const extractedImages = extractImageUrls(response?.attributes);
       const updateRow: Record<string, unknown> = { updated_at: new Date().toISOString() };
 
-      if (!row.dimensions && extracted.dimensions) updateRow.dimensions = extracted.dimensions;
-      if (!row.weight && extracted.weight) updateRow.weight = extracted.weight;
-      if (!row.material && extracted.material) updateRow.material = extracted.material;
-      if (!row.color && extracted.color) updateRow.color = extracted.color;
-      if ((!row.key_features || row.key_features.length === 0) && extractedBullets.length > 0) {
+      // This sync is an explicit, manually-triggered action ("Sync from Amazon"), so it
+      // always refreshes with Amazon's current data rather than only filling blanks —
+      // otherwise a founder who later edits the real Amazon listing would keep seeing
+      // stale first-synced values here forever.
+      if (extracted.dimensions) updateRow.dimensions = extracted.dimensions;
+      if (extracted.weight) updateRow.weight = extracted.weight;
+      if (extracted.material) updateRow.material = extracted.material;
+      if (extracted.color) updateRow.color = extracted.color;
+      if (extractedBullets.length > 0) {
         updateRow.key_features = extractedBullets;
       }
-      if ((!row.image_urls || row.image_urls.length === 0) && extractedImages.length > 0) {
+      if (extractedImages.length > 0) {
         updateRow.image_urls = extractedImages;
       }
 
