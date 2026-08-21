@@ -1221,6 +1221,12 @@ export async function syncAmazonSpListingAttributes(input: { sellerId: string; l
     message: "Amazon SP-API listing attribute sync started."
   });
 
+  const { count: totalEligible } = await supabase
+    .from("product_passports")
+    .select("id", { count: "exact", head: true })
+    .eq("seller_id", sellerId)
+    .not("sku", "is", null);
+
   const { data: rows, error: selectError } = await supabase
     .from("product_passports")
     .select("id, sku, dimensions, weight, material, color, key_features, image_urls")
@@ -1345,6 +1351,7 @@ export async function syncAmazonSpListingAttributes(input: { sellerId: string; l
     checked: candidates.length,
     updatedCount,
     skippedCount,
+    totalEligible: totalEligible ?? candidates.length,
     warnings
   };
 }
