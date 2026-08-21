@@ -304,8 +304,8 @@ function toSafeProductPassport(
   const passportImageUrls = cleanImageUrls(row.image_urls);
   const productMediaImageUrls = mergeImageUrls(productMedia?.main_image_url, productMedia?.image_urls);
   const productMediaMainImageUrl = cleanText(productMedia?.main_image_url) ?? productMediaImageUrls[0] ?? null;
-  const imageUrls = mergeImageUrls(productMediaImageUrls, passportImageUrls);
-  const mainImageUrl = productMediaMainImageUrl ?? passportImageUrls[0] ?? null;
+  const imageUrls = mergeImageUrls(passportImageUrls, productMediaImageUrls);
+  const mainImageUrl = passportImageUrls[0] ?? productMediaMainImageUrl ?? null;
   const imageStatus = productMedia ? cleanText(productMedia.image_status) ?? "FOUND" : "NOT_SYNCED";
   const imageSource = productMedia ? cleanText(productMedia.image_source) : null;
   const lastImageSyncAt = productMedia ? productMedia.last_image_sync_at : null;
