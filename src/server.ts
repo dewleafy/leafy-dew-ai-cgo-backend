@@ -26,6 +26,8 @@ import { launchChecklistRouter } from "./modules/launch-checklist/launch-checkli
 import { launchGateRouter } from "./modules/launch-gate/launch-gate.routes";
 import { listingDraftsRouter } from "./modules/listing-drafts/listing-drafts.routes";
 import { listingSchemaRouter } from "./modules/listing-schema/listing-schema.routes";
+import { backgroundSyncRouter } from "./modules/background-sync/background-sync.routes";
+import { startBackgroundAmazonSyncScheduler } from "./modules/background-sync/background-sync.service";
 import { listingReadinessRoutes } from "./modules/listing-readiness/listing-readiness.routes";
 import { liveExecutionRouter } from "./modules/live-execution/live-execution.routes";
 import { notificationOutboxRouter } from "./modules/notification-outbox/notification-outbox.routes";
@@ -208,6 +210,7 @@ app.use("/api/launch-checklist", launchChecklistRouter);
 app.use("/api/launch-gate", launchGateRouter);
 app.use("/api/listing-drafts", listingDraftsRouter);
 app.use("/api/listing-schema", listingSchemaRouter);
+app.use("/api/background-sync", backgroundSyncRouter);
 app.use("/api/listing-readiness", listingReadinessRoutes);
 app.use("/api/live-execution", liveExecutionRouter);
 app.use("/api/notification-outbox", notificationOutboxRouter);
@@ -256,4 +259,5 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
 
 app.listen(port, () => {
   logger.info(`Leafy Dew AI-CGO backend running on port ${port}`);
+  startBackgroundAmazonSyncScheduler();
 });
