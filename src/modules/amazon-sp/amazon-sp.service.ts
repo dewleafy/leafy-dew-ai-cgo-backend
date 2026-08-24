@@ -1203,6 +1203,30 @@ function extractImageUrls(attributes: AmazonSpAttributesMap | undefined): string
   return urls;
 }
 
+type AmazonSpImagesResponse = Array<{
+  marketplaceId?: string;
+  images?: Array<{ variant?: string; link?: string }>;
+}>;
+
+function extractImageUrlsFromImagesField(imagesResponse: AmazonSpImagesResponse | undefined, marketplaceId: string): string[] {
+  if (!Array.isArray(imagesResponse) || imagesResponse.length === 0) return [];
+
+  const marketplaceEntry = imagesResponse.find((entry) => entry.marketplaceId === marketplaceId) ?? imagesResponse[0];
+  const images = Array.isArray(marketplaceEntry?.images) ? marketplaceEntry.images : [];
+
+  const variantOrder = (variant: string | undefined): number => {
+    if (variant === "MAIN") return 0;
+    const match = /^PT(\d+)$/.exec(variant ?? "");
+    return match ? Number(match[1]) : 99;
+  };
+
+  return images
+    .slice()
+    .sort((a, b) => variantOrder(a.variant) - variantOrder(b.variant))
+    .map((image) => image.link)
+    .filter((link): link is string => typeof link === "string" && link.trim().length > 0);
+}
+
 export async function syncAmazonSpListingAttributes(input: { sellerId: string; limit?: number }) {
   const sellerId = sellerIdOrDefault(input.sellerId);
   const limit = Math.min(Math.max(toIntegerOrNull(input.limit ?? undefined) ?? 25, 1), 100);
@@ -1251,11 +1275,12 @@ export async function syncAmazonSpListingAttributes(input: { sellerId: string; l
       const response = await amazonSpGet<{
         attributes?: AmazonSpAttributesMap;
         summaries?: Array<{ productType?: string }>;
+        images?: AmazonSpImagesResponse;
       }>({
         path: `/listings/2021-08-01/items/${amazonSellerId}/${encodeURIComponent(row.sku)}`,
         query: {
           marketplaceIds: [connection.marketplace_id],
-          includedData: ["attributes", "summaries"]
+          includedData: ["attributes", "summaries", "images"]
         },
         accessToken,
         region: connection.region,
@@ -1267,7 +1292,8 @@ export async function syncAmazonSpListingAttributes(input: { sellerId: string; l
 
       const extracted = extractPhysicalAttributes(response?.attributes);
       const extractedBullets = extractBulletPoints(response?.attributes);
-      const extractedImages = extractImageUrls(response?.attributes);
+      const imagesFromImagesField = extractImageUrlsFromImagesField(response?.images, connection.marketplace_id);
+      const extractedImages = imagesFromImagesField.length > 0 ? imagesFromImagesField : extractImageUrls(response?.attributes);
       const extractedProductType = response?.summaries?.[0]?.productType || null;
       const updateRow: Record<string, unknown> = { updated_at: new Date().toISOString() };
 
