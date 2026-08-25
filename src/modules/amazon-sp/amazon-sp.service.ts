@@ -908,7 +908,8 @@ export async function syncAmazonSpListings(input: { sellerId: string; reportId?:
     const { listings, skippedCount } = parseListingReportText(reportText);
 
     await upsertAmazonSpListingRows({ sellerId, connection, listings });
-    const passportCount = await upsertProductPassportsFromListings(sellerId, listings);
+    const { inserted: newProductsCount, updated: updatedProductsCount } = await upsertProductPassportsFromListings(sellerId, listings);
+    const passportCount = newProductsCount + updatedProductsCount;
     await updateConnectionError(connection.id, null);
     await logSpActivity({
       sellerId,
@@ -920,6 +921,8 @@ export async function syncAmazonSpListings(input: { sellerId: string; reportId?:
         reportId,
         syncedCount: listings.length,
         upsertedProductPassports: passportCount,
+        newProductsCount,
+        updatedProductsCount,
         skippedCount
       }
     });
@@ -931,6 +934,8 @@ export async function syncAmazonSpListings(input: { sellerId: string; reportId?:
       reportId,
       syncedCount: listings.length,
       upsertedProductPassports: passportCount,
+      newProductsCount,
+      updatedProductsCount,
       skippedCount,
       warnings
     };
@@ -982,8 +987,9 @@ async function findProductPassportForListing(
   return Array.isArray(asinRows) ? asinRows[0] as Record<string, unknown> | undefined : undefined;
 }
 
-async function upsertProductPassportsFromListings(sellerId: string, listings: ListingSyncItem[]): Promise<number> {
-  let count = 0;
+async function upsertProductPassportsFromListings(sellerId: string, listings: ListingSyncItem[]): Promise<{ inserted: number; updated: number }> {
+  let inserted = 0;
+  let updated = 0;
 
   for (const listing of listings) {
     const existing = await findProductPassportForListing(sellerId, listing);
@@ -993,16 +999,22 @@ async function upsertProductPassportsFromListings(sellerId: string, listings: Li
       const updateRow: Record<string, unknown> = { updated_at: new Date().toISOString() };
       if (!existing.sku && listing.sku) updateRow.sku = listing.sku;
       if (!existing.asin && listing.asin) updateRow.asin = listing.asin;
-      if (!existing.product_name && listing.productName) updateRow.product_name = listing.productName;
-      if (!existing.product_type && listing.productType) updateRow.product_type = listing.productType;
-      if (!existing.category && listing.productType) updateRow.category = listing.productType;
-      if (!existing.selling_price && listing.price !== null) updateRow.selling_price = listing.price;
-      if (existing.status === "DRAFT") updateRow.status = status;
+      // Always refresh these from Amazon's current listings report — this runs
+      // automatically in the background now, so a founder never clicks a button to
+      // "confirm" it's really time to trust Amazon's data. Only skip overwriting a
+      // manually-set product name if Amazon's report doesn't have one at all.
+      if (listing.productName) updateRow.product_name = listing.productName;
+      if (listing.productType) {
+        updateRow.product_type = listing.productType;
+        updateRow.category = listing.productType;
+      }
+      if (listing.price !== null && listing.price !== undefined) updateRow.selling_price = listing.price;
+      if (existing.status === "DRAFT" || existing.status !== status) updateRow.status = status;
 
       if (Object.keys(updateRow).length > 1) {
         const { error } = await supabase.from("product_passports").update(updateRow).eq("id", existing.id);
         if (error) logSafeAmazonSpError("Could not update product passport from Amazon listing.", error);
-        else count += 1;
+        else updated += 1;
       }
       continue;
     }
@@ -1022,11 +1034,11 @@ async function upsertProductPassportsFromListings(sellerId: string, listings: Li
     if (error) {
       logSafeAmazonSpError("Could not create product passport from Amazon listing.", error);
     } else {
-      count += 1;
+      inserted += 1;
     }
   }
 
-  return count;
+  return { inserted, updated };
 }
 
 export async function requireConnectedConnection(sellerId: string): Promise<AmazonSpConnectionRow> {
@@ -2444,11 +2456,11 @@ async function processDoneReportJob(input: {
       connection: input.connection,
       listings: parsed.listings
     });
-    const passportCount = await upsertProductPassportsFromListings(input.job.seller_id, parsed.listings);
+    const { inserted, updated } = await upsertProductPassportsFromListings(input.job.seller_id, parsed.listings);
 
     return {
       syncedListings: parsed.listings.length,
-      upsertedProductPassports: passportCount,
+      upsertedProductPassports: inserted + updated,
       skippedCount: parsed.skippedCount
     };
   }
