@@ -32,6 +32,11 @@ async function runListingsDiscovery(sellerId: string): Promise<string> {
 
     pendingListingsReportIdBySeller.delete(sellerId);
     const synced = "syncedCount" in result ? result.syncedCount : 0;
+    const newCount = "newProductsCount" in result ? result.newProductsCount : undefined;
+    const updatedCount = "updatedProductsCount" in result ? result.updatedProductsCount : undefined;
+    if (typeof newCount === "number" && typeof updatedCount === "number") {
+      return `Listings: found ${synced} on Amazon, ${newCount} new product(s) added, ${updatedCount} existing refreshed.`;
+    }
     const upserted = "upsertedProductPassports" in result ? result.upsertedProductPassports : 0;
     return `Listings: found ${synced}, added/updated ${upserted}.`;
   } catch (error) {
