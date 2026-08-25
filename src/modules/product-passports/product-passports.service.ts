@@ -436,26 +436,42 @@ export async function listProductPassports(input: {
   status?: ProductPassportStatus;
   limit?: number;
 }): Promise<SafeProductPassportRow[]> {
-  const limit = Math.min(Math.max(Math.floor(input.limit ?? 100), 1), 500);
-  let query = supabase
-    .from("product_passports")
-    .select("*")
-    .eq("seller_id", cleanText(input.sellerId) ?? "default")
-    .order("created_at", { ascending: false })
-    .limit(limit);
+  const sellerIdValue = cleanText(input.sellerId) ?? "default";
 
-  if (input.status) {
-    query = query.eq("status", input.status);
+  // A founder should never see a silently-truncated catalog. If a caller passes an
+  // explicit limit, respect it (used by internal batch jobs); otherwise page through
+  // every row so the full catalog always comes back, regardless of size.
+  const explicitLimit = input.limit ? Math.min(Math.max(Math.floor(input.limit), 1), 500) : undefined;
+  const pageSize = 500;
+  const allRows: ProductPassportRow[] = [];
+
+  for (let from = 0; ; from += pageSize) {
+    let query = supabase
+      .from("product_passports")
+      .select("*")
+      .eq("seller_id", sellerIdValue)
+      .order("created_at", { ascending: false })
+      .range(from, from + pageSize - 1);
+
+    if (input.status) {
+      query = query.eq("status", input.status);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      logProductPassportError("Could not list product passports.", error);
+      throw new Error("Could not load product passports from Supabase.");
+    }
+
+    const pageRows = (data ?? []) as ProductPassportRow[];
+    allRows.push(...pageRows);
+
+    if (explicitLimit && allRows.length >= explicitLimit) break;
+    if (pageRows.length < pageSize) break;
   }
 
-  const { data, error } = await query;
-
-  if (error) {
-    logProductPassportError("Could not list product passports.", error);
-    throw new Error("Could not load product passports from Supabase.");
-  }
-
-  const rows = (data ?? []) as ProductPassportRow[];
+  const rows = explicitLimit ? allRows.slice(0, explicitLimit) : allRows;
   const sellerId = normalizeSellerId(input.sellerId);
   const [listings, productMediaRows] = await Promise.all([
     loadListingsForSeller(sellerId),
