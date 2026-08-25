@@ -92,10 +92,11 @@ function getStatusFromQuery(req: Request): ProductPassportStatus | undefined {
   return isProductPassportStatus(req.query.status) ? req.query.status : undefined;
 }
 
-function getLimitFromQuery(req: Request): number {
-  const rawLimit = typeof req.query.limit === "string" ? Number(req.query.limit) : 100;
-  const limit = Number.isFinite(rawLimit) ? Math.floor(rawLimit) : 100;
-  return Math.min(Math.max(limit, 1), 500);
+function getLimitFromQuery(req: Request): number | undefined {
+  if (typeof req.query.limit !== "string" || !req.query.limit.trim()) return undefined;
+  const rawLimit = Number(req.query.limit);
+  if (!Number.isFinite(rawLimit)) return undefined;
+  return Math.min(Math.max(Math.floor(rawLimit), 1), 500);
 }
 
 function sendValidationError(res: Response, issues: Array<{ path: PropertyKey[]; message: string }>): void {
