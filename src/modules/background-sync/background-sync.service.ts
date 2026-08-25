@@ -52,18 +52,21 @@ async function runListingsDiscovery(sellerId: string): Promise<string> {
 async function runAttributeSync(sellerId: string): Promise<string> {
   let totalChecked = 0;
   let totalUpdated = 0;
+  let totalEligible: number | undefined;
 
   try {
     for (let batch = 1; batch <= ATTRIBUTE_SYNC_MAX_BATCHES; batch += 1) {
       const result = await syncAmazonSpListingAttributes({ sellerId, limit: ATTRIBUTE_SYNC_BATCH_SIZE });
       totalChecked += result.checked;
       totalUpdated += result.updatedCount;
+      totalEligible = result.totalEligible;
 
       const reachedEndOfBatch = result.checked < ATTRIBUTE_SYNC_BATCH_SIZE;
       const coveredFullCatalog = typeof result.totalEligible === "number" && totalChecked >= result.totalEligible;
       if (reachedEndOfBatch || coveredFullCatalog) break;
     }
-    return `Attributes: checked ${totalChecked}, updated ${totalUpdated}.`;
+    const totalText = typeof totalEligible === "number" ? ` (your database actually has ${totalEligible} product passport rows total)` : "";
+    return `Attributes: checked ${totalChecked}, updated ${totalUpdated}.${totalText}`;
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     logger.warn("Background attribute sync failed.", { message });
