@@ -647,7 +647,7 @@ function parseListingReportText(text: string): { listings: ListingSyncItem[]; sk
     .filter((line) => line.trim().length > 0);
 
   if (lines.length === 0) {
-    return { listings: [], skippedCount: 0 };
+    return { listings: [], skippedCount: 0, distinctSkuCount: 0 };
   }
 
   const headers = splitTabDelimitedLine(lines[0]).map((header) => header.trim().toLowerCase());
