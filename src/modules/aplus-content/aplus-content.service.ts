@@ -139,7 +139,7 @@ async function fetchAndCacheAplusContent(sellerId: string, asin: string): Promis
 
   if (!contentReferenceKey) {
     const now = new Date().toISOString();
-    const row = {
+    const dbRow = {
       seller_id: sellerId,
       asin,
       content_reference_key: null,
@@ -148,8 +148,8 @@ async function fetchAndCacheAplusContent(sellerId: string, asin: string): Promis
       fetched_at: now,
       updated_at: now
     };
-    await supabase.from("amazon_aplus_content_cache").upsert(row, { onConflict: "seller_id,asin" });
-    return row as AplusContentCacheRow;
+    await supabase.from("amazon_aplus_content_cache").upsert(dbRow, { onConflict: "seller_id,asin" });
+    return { id: "", created_at: now, ...dbRow };
   }
 
   const document = await amazonSpGet<{
