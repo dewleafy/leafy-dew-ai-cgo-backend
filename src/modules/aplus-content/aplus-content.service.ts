@@ -121,13 +121,11 @@ async function getCachedAplusContent(sellerId: string, asin: string): Promise<Ap
   return data as AplusContentCacheRow;
 }
 
-async function fetchAndCacheAplusContent(sellerId: string, asin: string): Promise<AplusContentCacheRow> {
+async function fetchAndCacheAplusContent(sellerId: string, asin: string): Promise<{ row: AplusContentCacheRow; diagnostic?: string }> {
   const connection = await requireConnectedConnection(sellerId);
   const accessToken = await getAmazonSpAccessToken(connection.id);
 
-  const publishRecords = await amazonSpGet<{
-    contentPublishRecordList?: Array<{ contentMetadataRecord?: { contentReferenceKey?: string } }>;
-  }>({
+  const publishRecords = await amazonSpGet<Record<string, unknown>>({
     path: "/aplus/2020-11-01/contentPublishRecords",
     query: { asin, marketplaceId: connection.marketplace_id },
     accessToken,
@@ -135,7 +133,11 @@ async function fetchAndCacheAplusContent(sellerId: string, asin: string): Promis
     stage: "GET_APLUS_PUBLISH_RECORDS"
   });
 
-  const contentReferenceKey = publishRecords?.contentPublishRecordList?.[0]?.contentMetadataRecord?.contentReferenceKey;
+  const recordList = (publishRecords?.contentPublishRecordList ?? publishRecords?.publishRecordList) as
+    | Array<{ contentMetadataRecord?: { contentReferenceKey?: string }; contentReferenceKey?: string }>
+    | undefined;
+  const firstRecord = Array.isArray(recordList) ? recordList[0] : undefined;
+  const contentReferenceKey = firstRecord?.contentMetadataRecord?.contentReferenceKey ?? firstRecord?.contentReferenceKey;
 
   if (!contentReferenceKey) {
     const now = new Date().toISOString();
@@ -149,7 +151,9 @@ async function fetchAndCacheAplusContent(sellerId: string, asin: string): Promis
       updated_at: now
     };
     await supabase.from("amazon_aplus_content_cache").upsert(dbRow, { onConflict: "seller_id,asin" });
-    return { id: "", created_at: now, ...dbRow };
+    const diagnosticKeys = publishRecords && typeof publishRecords === "object" ? Object.keys(publishRecords) : [];
+    const diagnostic = `Diagnostic — Amazon's response top-level keys: [${diagnosticKeys.join(", ") || "(empty object)"}]. Raw (first 500 chars): ${JSON.stringify(publishRecords).slice(0, 500)}`;
+    return { row: { id: "", created_at: now, ...dbRow }, diagnostic };
   }
 
   const document = await amazonSpGet<{
@@ -179,7 +183,7 @@ async function fetchAndCacheAplusContent(sellerId: string, asin: string): Promis
   };
 
   await supabase.from("amazon_aplus_content_cache").upsert(row, { onConflict: "seller_id,asin" });
-  return row as AplusContentCacheRow;
+  return { row: row as AplusContentCacheRow };
 }
 
 export async function getAplusContentPreview(input: { sellerId: string; asin: string }): Promise<AplusContentReport> {
@@ -203,7 +207,7 @@ export async function getAplusContentPreview(input: { sellerId: string; asin: st
   }
 
   try {
-    const fresh = await fetchAndCacheAplusContent(sellerId, asin);
+    const { row: fresh, diagnostic } = await fetchAndCacheAplusContent(sellerId, asin);
     return {
       ok: true,
       asin,
@@ -211,7 +215,8 @@ export async function getAplusContentPreview(input: { sellerId: string; asin: st
       moduleCount: fresh.content_module_list.length,
       modules: fresh.content_module_list,
       fetchedAt: fresh.fetched_at,
-      source: "FETCHED_LIVE"
+      source: "FETCHED_LIVE",
+      warning: diagnostic
     };
   } catch (error) {
     return {
