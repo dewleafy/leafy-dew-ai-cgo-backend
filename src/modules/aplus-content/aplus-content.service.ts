@@ -26,6 +26,12 @@ function extractImageUrl(node: unknown): string | undefined {
     const value = record[key];
     if (typeof value === "string" && value.trim()) return value.trim();
   }
+  // Amazon's A+ Content API returns images as an internal storage path
+  // ("uploadDestinationId"), not a direct URL — build the real CDN URL from it.
+  const uploadDestinationId = record["uploadDestinationId"];
+  if (typeof uploadDestinationId === "string" && uploadDestinationId.trim()) {
+    return `https://m.media-amazon.com/images/S/${uploadDestinationId.trim()}`;
+  }
   return undefined;
 }
 
@@ -170,7 +176,8 @@ async function fetchAndCacheAplusContent(sellerId: string, asin: string): Promis
     stage: "GET_APLUS_CONTENT_DOCUMENT"
   });
 
-  const contentDocument = document?.contentDocument as Record<string, unknown> | undefined;
+  const contentRecord = document?.contentRecord as Record<string, unknown> | undefined;
+  const contentDocument = (contentRecord?.contentDocument ?? document?.contentDocument) as Record<string, unknown> | undefined;
   const rawModules = (contentDocument?.contentModuleList ?? document?.contentModuleList ?? []) as Array<Record<string, unknown>>;
   const modules = rawModules.map((module) => normalizeModule(module));
   const status: AplusContentStatus = (contentDocument?.status as AplusContentStatus) ?? "FOUND";
