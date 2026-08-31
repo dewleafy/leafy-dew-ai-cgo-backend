@@ -8,6 +8,7 @@ function sellerIdFromQuery(req: Request): string {
 export async function getAplusContentPreviewRoute(req: Request, res: Response): Promise<void> {
   const asin = typeof req.query.asin === "string" ? req.query.asin.trim() : "";
   const forceRefresh = req.query.refresh === "true" || req.query.refresh === "1";
+  const debugRaw = req.query.debug === "true" || req.query.debug === "1";
 
   if (!asin) {
     res.status(400).json({ ok: false, message: "An asin query parameter is required." });
@@ -15,7 +16,7 @@ export async function getAplusContentPreviewRoute(req: Request, res: Response): 
   }
 
   try {
-    const report = await getAplusContentPreview({ sellerId: sellerIdFromQuery(req), asin, forceRefresh });
+    const report = await getAplusContentPreview({ sellerId: sellerIdFromQuery(req), asin, forceRefresh, debugRaw });
     res.json(report);
   } catch (error) {
     res.status(503).json({
