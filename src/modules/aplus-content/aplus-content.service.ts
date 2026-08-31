@@ -220,7 +220,7 @@ async function getCachedAplusContent(sellerId: string, asin: string): Promise<Ap
   return data as AplusContentCacheRow;
 }
 
-async function fetchAndCacheAplusContent(sellerId: string, asin: string): Promise<{ row: AplusContentCacheRow; diagnostic?: string }> {
+async function fetchAndCacheAplusContent(sellerId: string, asin: string, debugRaw = false): Promise<{ row: AplusContentCacheRow; diagnostic?: string }> {
   const connection = await requireConnectedConnection(sellerId);
   const accessToken = await getAmazonSpAccessToken(connection.id);
 
@@ -267,6 +267,27 @@ async function fetchAndCacheAplusContent(sellerId: string, asin: string): Promis
   const contentDocument = (contentRecord?.contentDocument ?? document?.contentDocument) as Record<string, unknown> | undefined;
   const rawModules = (contentDocument?.contentModuleList ?? document?.contentModuleList ?? []) as Array<Record<string, unknown>>;
   const modules = rawModules.map((module) => normalizeModule(module));
+
+  // Temporary, opt-in diagnostic: when explicitly asked for (?debug=true), dump
+  // Amazon's exact raw module JSON regardless of how parsing went, so a real parsing
+  // gap can be fixed from ground truth instead of guesswork. Never triggered in
+  // normal use — the empty-modules diagnostic below still covers that path.
+  if (debugRaw) {
+    return {
+      row: {
+        id: "",
+        created_at: new Date().toISOString(),
+        seller_id: sellerId,
+        asin,
+        content_reference_key: contentReferenceKey,
+        status: (contentDocument?.status as AplusContentStatus) ?? "FOUND",
+        content_module_list: modules,
+        fetched_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      },
+      diagnostic: `RAW DEBUG DUMP — rawModules: ${JSON.stringify(rawModules).slice(0, 6000)}`
+    };
+  }
   const status: AplusContentStatus = (contentDocument?.status as AplusContentStatus) ?? "FOUND";
   const now = new Date().toISOString();
 
@@ -292,14 +313,14 @@ async function fetchAndCacheAplusContent(sellerId: string, asin: string): Promis
   return { row: row as AplusContentCacheRow, diagnostic };
 }
 
-export async function getAplusContentPreview(input: { sellerId: string; asin: string; forceRefresh?: boolean }): Promise<AplusContentReport> {
-  const { sellerId, asin, forceRefresh } = input;
+export async function getAplusContentPreview(input: { sellerId: string; asin: string; forceRefresh?: boolean; debugRaw?: boolean }): Promise<AplusContentReport> {
+  const { sellerId, asin, forceRefresh, debugRaw } = input;
 
   if (!asin) {
     throw new Error("This product has no ASIN on file yet, so A+ Content can't be looked up.");
   }
 
-  const cached = forceRefresh ? null : await getCachedAplusContent(sellerId, asin);
+  const cached = forceRefresh || debugRaw ? null : await getCachedAplusContent(sellerId, asin);
   if (cached) {
     return {
       ok: true,
@@ -313,7 +334,7 @@ export async function getAplusContentPreview(input: { sellerId: string; asin: st
   }
 
   try {
-    const { row: fresh, diagnostic } = await fetchAndCacheAplusContent(sellerId, asin);
+    const { row: fresh, diagnostic } = await fetchAndCacheAplusContent(sellerId, asin, debugRaw);
     return {
       ok: true,
       asin,
