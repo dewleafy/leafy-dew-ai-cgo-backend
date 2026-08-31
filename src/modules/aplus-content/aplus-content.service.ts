@@ -148,7 +148,17 @@ function walkModuleContent(content: Record<string, unknown>, depth = 0): {
 
 function normalizeModule(rawModule: Record<string, unknown>): NormalizedAplusModule {
   const type = typeof rawModule.contentModuleType === "string" ? rawModule.contentModuleType : "UNKNOWN";
-  const contentKey = Object.keys(rawModule).find((key) => key !== "contentModuleType");
+  // Amazon's real A+ Content API response includes EVERY possible module-type key on
+  // every module object (standardCompanyLogo, standardFourImageText, ...) — the ones
+  // that don't apply are explicitly set to null, not omitted. The actual content for
+  // this module is whichever key is a real (non-null) object, which is NOT
+  // necessarily the first key after contentModuleType — that was always
+  // "standardCompanyLogo" regardless of the module's real type, since it happens to
+  // be listed first, so every module except an actual company-logo one was reading
+  // null as its content and had nothing to parse.
+  const contentKey = Object.keys(rawModule).find(
+    (key) => key !== "contentModuleType" && rawModule[key] !== null && rawModule[key] !== undefined
+  );
   const content = contentKey ? rawModule[contentKey] : undefined;
   const walked = content && typeof content === "object"
     ? walkModuleContent(content as Record<string, unknown>)
