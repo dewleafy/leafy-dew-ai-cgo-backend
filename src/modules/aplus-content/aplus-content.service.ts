@@ -195,20 +195,22 @@ async function getCachedAplusContent(sellerId: string, asin: string): Promise<Ap
   // Only trust the cache for a genuine, successful find with real content. A "not
   // found" or empty-modules result might reflect a bug or permission issue rather
   // than reality — never let that silently hide behind a multi-day cache. This also
-  // guards against a *parsing* bug: if every cached module came back with no
+  // guards against a *parsing* bug: if ANY cached module came back with no
   // headline/body/image/items (e.g. because an older version of the parser couldn't
-  // read that module's shape), the cache is self-healing — it's treated as empty so
-  // the next request re-fetches and re-parses with the current code, rather than
-  // replaying a stale bad parse for up to CACHE_MAX_AGE_DAYS.
+  // read that module's shape), the cache is self-healing — the whole document is
+  // treated as untrustworthy so the next request re-fetches and re-parses with the
+  // current code, rather than replaying a partially-broken parse for up to
+  // CACHE_MAX_AGE_DAYS just because one other module in the same document parsed
+  // fine. A real A+ module is never legitimately empty, so requiring every module to
+  // have content is the correct bar, not an overly strict one.
   const modules: NormalizedAplusModule[] = Array.isArray(data.content_module_list) ? data.content_module_list : [];
-  const hasReadableModule = modules.some(
-    (module: NormalizedAplusModule) =>
-      Boolean(module?.headline) ||
-      Boolean(module?.body) ||
-      (Array.isArray(module?.images) && module.images.length > 0) ||
-      (Array.isArray(module?.items) && module.items.length > 0)
-  );
-  const hasRealContent = data.status !== "NOT_FOUND" && modules.length > 0 && hasReadableModule;
+  const isModuleReadable = (module: NormalizedAplusModule): boolean =>
+    Boolean(module?.headline) ||
+    Boolean(module?.body) ||
+    (Array.isArray(module?.images) && module.images.length > 0) ||
+    (Array.isArray(module?.items) && module.items.length > 0);
+  const allModulesReadable = modules.length > 0 && modules.every(isModuleReadable);
+  const hasRealContent = data.status !== "NOT_FOUND" && allModulesReadable;
   if (!hasRealContent) return null;
 
   const ageMs = Date.now() - new Date(data.fetched_at).getTime();
