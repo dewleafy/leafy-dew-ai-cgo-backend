@@ -114,10 +114,11 @@ async function getCachedAplusContent(sellerId: string, asin: string): Promise<Ap
 
   if (error || !data) return null;
 
-  // Only trust the cache for a genuine, successful find. A "not found" result might
-  // reflect a bug or permission issue rather than reality — never let that silently
-  // hide behind a multi-day cache. Always re-check with Amazon in that case.
-  if (data.status === "NOT_FOUND") return null;
+  // Only trust the cache for a genuine, successful find with real content. A "not
+  // found" or empty-modules result might reflect a bug or permission issue rather
+  // than reality — never let that silently hide behind a multi-day cache.
+  const hasRealContent = data.status !== "NOT_FOUND" && Array.isArray(data.content_module_list) && data.content_module_list.length > 0;
+  if (!hasRealContent) return null;
 
   const ageMs = Date.now() - new Date(data.fetched_at).getTime();
   const maxAgeMs = CACHE_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
@@ -161,10 +162,7 @@ async function fetchAndCacheAplusContent(sellerId: string, asin: string): Promis
     return { row: { id: "", created_at: now, ...dbRow }, diagnostic };
   }
 
-  const document = await amazonSpGet<{
-    contentDocument?: { contentModuleList?: Array<Record<string, unknown>>; status?: string };
-    contentModuleList?: Array<Record<string, unknown>>;
-  }>({
+  const document = await amazonSpGet<Record<string, unknown>>({
     path: `/aplus/2020-11-01/contentDocuments/${encodeURIComponent(contentReferenceKey)}`,
     query: { marketplaceId: connection.marketplace_id, includedDataSet: ["CONTENTS"] },
     accessToken,
@@ -172,9 +170,10 @@ async function fetchAndCacheAplusContent(sellerId: string, asin: string): Promis
     stage: "GET_APLUS_CONTENT_DOCUMENT"
   });
 
-  const rawModules = document?.contentDocument?.contentModuleList ?? document?.contentModuleList ?? [];
+  const contentDocument = document?.contentDocument as Record<string, unknown> | undefined;
+  const rawModules = (contentDocument?.contentModuleList ?? document?.contentModuleList ?? []) as Array<Record<string, unknown>>;
   const modules = rawModules.map((module) => normalizeModule(module));
-  const status: AplusContentStatus = (document?.contentDocument?.status as AplusContentStatus) ?? "FOUND";
+  const status: AplusContentStatus = (contentDocument?.status as AplusContentStatus) ?? "FOUND";
   const now = new Date().toISOString();
 
   const row = {
@@ -188,7 +187,15 @@ async function fetchAndCacheAplusContent(sellerId: string, asin: string): Promis
   };
 
   await supabase.from("amazon_aplus_content_cache").upsert(row, { onConflict: "seller_id,asin" });
-  return { row: row as AplusContentCacheRow };
+
+  let diagnostic: string | undefined;
+  if (modules.length === 0) {
+    const docKeys = document && typeof document === "object" ? Object.keys(document) : [];
+    const contentDocKeys = contentDocument && typeof contentDocument === "object" ? Object.keys(contentDocument) : [];
+    diagnostic = `Diagnostic — a content reference was found (${contentReferenceKey}), but no modules were parsed from the document. Response top-level keys: [${docKeys.join(", ") || "(empty)"}]. contentDocument keys: [${contentDocKeys.join(", ") || "(none)"}]. Raw (first 500 chars): ${JSON.stringify(document).slice(0, 500)}`;
+  }
+
+  return { row: row as AplusContentCacheRow, diagnostic };
 }
 
 export async function getAplusContentPreview(input: { sellerId: string; asin: string }): Promise<AplusContentReport> {
