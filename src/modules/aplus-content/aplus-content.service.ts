@@ -114,6 +114,11 @@ async function getCachedAplusContent(sellerId: string, asin: string): Promise<Ap
 
   if (error || !data) return null;
 
+  // Only trust the cache for a genuine, successful find. A "not found" result might
+  // reflect a bug or permission issue rather than reality — never let that silently
+  // hide behind a multi-day cache. Always re-check with Amazon in that case.
+  if (data.status === "NOT_FOUND") return null;
+
   const ageMs = Date.now() - new Date(data.fetched_at).getTime();
   const maxAgeMs = CACHE_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
   if (ageMs > maxAgeMs) return null;
