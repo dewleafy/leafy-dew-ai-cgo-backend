@@ -12,10 +12,27 @@ import {
 
 const CACHE_MAX_AGE_DAYS = 7;
 
+// Amazon's A+ Content API represents plain "headline" style text as a TextComponent
+// ({ value: string }) but represents "body" style text as a richer ParagraphComponent
+// ({ textList: [{ value: string }, ...] }). The previous version of this function only
+// ever unwrapped the TextComponent shape, so body copy silently never rendered for
+// ANY module type — this was the single biggest reason A+ modules looked empty.
 function extractText(node: unknown): string | undefined {
   if (!node || typeof node !== "object") return undefined;
   const record = node as Record<string, unknown>;
-  if (typeof record.value === "string" && record.value.trim()) return record.value.trim();
+
+  if (typeof record.value === "string" && record.value.trim()) {
+    return record.value.trim();
+  }
+
+  if (Array.isArray(record.textList)) {
+    const parts = record.textList
+      .map((entry) => (entry && typeof entry === "object" ? (entry as Record<string, unknown>).value : undefined))
+      .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+      .map((value) => value.trim());
+    if (parts.length > 0) return parts.join(" ");
+  }
+
   return undefined;
 }
 
@@ -35,11 +52,38 @@ function extractImageUrl(node: unknown): string | undefined {
   return undefined;
 }
 
+// Unconditional safety net: walk the ENTIRE module content tree, regardless of key
+// names, and collect every image found anywhere. This guarantees no image Amazon
+// actually sent is ever dropped just because it sits under a key name the structural
+// walker below doesn't happen to recognize.
+function deepCollectImages(node: unknown, seen: Set<string>, out: string[], depth = 0) {
+  if (depth > 8 || !node || typeof node !== "object") return;
+
+  if (Array.isArray(node)) {
+    for (const entry of node) deepCollectImages(entry, seen, out, depth + 1);
+    return;
+  }
+
+  const record = node as Record<string, unknown>;
+  const url = extractImageUrl(record);
+  if (url && !seen.has(url)) {
+    seen.add(url);
+    out.push(url);
+  }
+  for (const value of Object.values(record)) {
+    if (value && typeof value === "object") deepCollectImages(value, seen, out, depth + 1);
+  }
+}
+
 // Amazon has ~20 different A+ module types, each with its own nested shape. Rather
 // than hand-writing a parser per type, this walks any module's content object looking
 // for headline/body/image-shaped fields at any depth, plus repeated sub-blocks (image
 // grids, comparison rows, feature lists) — producing one common shape every module
-// type can be rendered from.
+// type can be rendered from. Any nested object we don't specifically recognize is
+// still treated as a candidate sub-block and recursed into, rather than being skipped:
+// Amazon's ~20 module types don't share one container-naming convention (block1..4,
+// a single "block", comparison rows, spec lists, ...), so gating recursion behind a
+// fixed whitelist of key names silently dropped whichever module types didn't match.
 function walkModuleContent(content: Record<string, unknown>, depth = 0): {
   headline?: string;
   body?: string;
@@ -82,18 +126,21 @@ function walkModuleContent(content: Record<string, unknown>, depth = 0): {
           if (sub.headline || sub.body || sub.images.length > 0) {
             items.push({ headline: sub.headline, body: sub.body, image: sub.images[0] });
           }
+          for (const extra of sub.images.slice(1)) images.push(extra);
+          for (const nested of sub.items) items.push(nested);
         }
       }
       continue;
     }
 
-    if (/^(block|product|metric|item|column)s?\d*$/i.test(key)) {
-      const sub = walkModuleContent(value as Record<string, unknown>, depth + 1);
-      if (sub.headline || sub.body || sub.images.length > 0) {
-        items.push({ headline: sub.headline, body: sub.body, image: sub.images[0] });
-      }
-      continue;
+    // Any other nested object — block1/block2/block, a comparison row, a spec list,
+    // whatever this particular module type calls it — is a candidate content block.
+    const sub = walkModuleContent(value as Record<string, unknown>, depth + 1);
+    if (sub.headline || sub.body || sub.images.length > 0) {
+      items.push({ headline: sub.headline, body: sub.body, image: sub.images[0] });
     }
+    for (const extra of sub.images.slice(1)) images.push(extra);
+    for (const nested of sub.items) items.push(nested);
   }
 
   return { headline, body, images, items };
@@ -107,7 +154,32 @@ function normalizeModule(rawModule: Record<string, unknown>): NormalizedAplusMod
     ? walkModuleContent(content as Record<string, unknown>)
     : { headline: undefined, body: undefined, images: [] as string[], items: [] as NormalizedAplusBlock[] };
 
-  return { type, headline: walked.headline, body: walked.body, images: walked.images, items: walked.items };
+  // Safety net: also do an unconditional deep scan for every image anywhere in the
+  // module, and fold in anything the structural walk above missed.
+  const deepImages: string[] = [];
+  if (content && typeof content === "object") {
+    deepCollectImages(content, new Set<string>(), deepImages);
+  }
+
+  const usedImages = new Set(walked.items.map((item) => item.image).filter((value): value is string => Boolean(value)));
+  const finalImages: string[] = [];
+  const seenImages = new Set<string>();
+  for (const url of [...walked.images, ...deepImages]) {
+    if (usedImages.has(url) || seenImages.has(url)) continue;
+    seenImages.add(url);
+    finalImages.push(url);
+  }
+
+  const isEmpty = !walked.headline && !walked.body && finalImages.length === 0 && walked.items.length === 0;
+
+  return {
+    type,
+    headline: walked.headline,
+    body: walked.body,
+    images: finalImages,
+    items: walked.items,
+    debugKeys: isEmpty && content && typeof content === "object" ? Object.keys(content as Record<string, unknown>) : undefined
+  };
 }
 
 async function getCachedAplusContent(sellerId: string, asin: string): Promise<AplusContentCacheRow | null> {
