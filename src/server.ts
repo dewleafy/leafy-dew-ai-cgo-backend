@@ -32,6 +32,7 @@ import { startBackgroundAmazonSyncScheduler } from "./modules/background-sync/ba
 import { listingReadinessRoutes } from "./modules/listing-readiness/listing-readiness.routes";
 import { liveExecutionRouter } from "./modules/live-execution/live-execution.routes";
 import { notificationOutboxRouter } from "./modules/notification-outbox/notification-outbox.routes";
+import { ppcExecutionRoutes } from "./modules/ppc-execution/ppc-execution.routes";
 import { productEconomicsRouter } from "./modules/product-economics/product-economics.routes";
 import { listAmazonSpListingsController } from "./modules/amazon-sp/amazon-sp.controller";
 import { productMediaRouter } from "./modules/product-media/product-media.routes";
@@ -216,6 +217,7 @@ app.use("/api/aplus-content", aplusContentRouter);
 app.use("/api/listing-readiness", listingReadinessRoutes);
 app.use("/api/live-execution", liveExecutionRouter);
 app.use("/api/notification-outbox", notificationOutboxRouter);
+app.use("/api/ppc-execution", ppcExecutionRoutes);
 app.use("/api/product-economics", productEconomicsRouter);
 app.use("/api/product-media", productMediaRouter);
 app.use("/api/product-passport", productPassportRoutes);
