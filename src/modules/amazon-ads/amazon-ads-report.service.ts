@@ -823,6 +823,60 @@ export async function downloadAndSaveCampaignReport(job: AmazonAdsReportJob): Pr
   return insertRows.length;
 }
 
+type SearchTermInsertRow = ReturnType<typeof toSearchTermMetricInsertRow>;
+
+// Amazon's search term report can list more than one row for the exact same
+// campaign + ad group + search term + date (for example when two different
+// keywords, or a keyword and an auto-targeting rule, both matched the same
+// customer search term). Our table's unique key is only
+// (profile_id, report_date, campaign_id, ad_group_id, search_term), so two
+// such rows collide on that key. Postgres's ON CONFLICT DO UPDATE cannot
+// update the same target row twice within one upsert command, and rejects
+// the whole batch with "ON CONFLICT DO UPDATE command cannot affect row a
+// second time" when that happens. To keep every row's data instead of
+// dropping the batch, merge same-key rows together (summing their metrics)
+// before upserting.
+function mergeDuplicateSearchTermInsertRows(rows: SearchTermInsertRow[]): SearchTermInsertRow[] {
+  const merged = new Map<string, SearchTermInsertRow>();
+
+  for (const row of rows) {
+    const key = `${row.profile_id}::${row.report_date}::${row.campaign_id}::${row.ad_group_id}::${row.search_term}`;
+    const existing = merged.get(key);
+
+    if (!existing) {
+      merged.set(key, row);
+      continue;
+    }
+
+    const impressions = existing.impressions + row.impressions;
+    const clicks = existing.clicks + row.clicks;
+    const cost = existing.cost + row.cost;
+    const sales = existing.sales + row.sales;
+    const orders = existing.orders + row.orders;
+
+    merged.set(key, {
+      ...existing,
+      impressions,
+      clicks,
+      cost,
+      sales,
+      orders,
+      acos: safeDivide(cost, sales, 100),
+      roas: safeDivide(sales, cost),
+      cpc: safeDivide(cost, clicks),
+      ctr: safeDivide(clicks, impressions, 100),
+      conversion_rate: safeDivide(orders, clicks, 100),
+      // Keep the most recent row's raw Amazon payload for reference; the
+      // summed metrics above are what matters for reporting.
+      raw_data: row.raw_data,
+      last_synced_at: row.last_synced_at,
+      updated_at: row.updated_at
+    });
+  }
+
+  return Array.from(merged.values());
+}
+
 export async function downloadAndSaveSearchTermReport(job: AmazonAdsReportJob): Promise<number> {
   if (job.report_type !== "spSearchTerm") {
     throw new Error("This report job is not a Sponsored Products search term report.");
@@ -854,7 +908,9 @@ export async function downloadAndSaveSearchTermReport(job: AmazonAdsReportJob): 
     return 0;
   }
 
-  const { error } = await supabase.from("amazon_ads_search_term_daily_metrics").upsert(insertRows, {
+  const mergedRows = mergeDuplicateSearchTermInsertRows(insertRows);
+
+  const { error } = await supabase.from("amazon_ads_search_term_daily_metrics").upsert(mergedRows, {
     onConflict: "profile_id,report_date,campaign_id,ad_group_id,search_term"
   });
 
@@ -863,7 +919,7 @@ export async function downloadAndSaveSearchTermReport(job: AmazonAdsReportJob): 
     throw new Error("Could not save Amazon Ads search term daily metrics.");
   }
 
-  return insertRows.length;
+  return mergedRows.length;
 }
 
 export async function markAmazonAdsReportJobSynced(jobId: string): Promise<void> {
