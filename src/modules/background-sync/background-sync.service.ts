@@ -121,6 +121,29 @@ function getSearchTermTargetDate(): string {
   return new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 }
 
+// Amazon's report download link only stays valid for a limited time after a
+// report completes. If a completed job's link has already gone stale (for
+// example a job that finished before this automated sync existed, or one a
+// previous tick could not get to in time), mark it failed instead of
+// retrying it — and failing the same way — on every future tick forever.
+async function markSearchTermReportJobFailed(jobId: string, reason: string): Promise<void> {
+  const { error } = await supabase
+    .from("amazon_ads_report_jobs")
+    .update({
+      status: "FAILED",
+      failure_reason: reason,
+      completed_at: new Date().toISOString()
+    })
+    .eq("id", jobId);
+
+  if (error) {
+    logger.warn("Could not mark stale Amazon Ads search term report job as failed.", {
+      jobId,
+      message: error.message
+    });
+  }
+}
+
 async function runSearchTermSync(sellerId: string): Promise<string> {
   try {
     const connection = await findConnectedAmazonAdsAccount(sellerId);
@@ -162,9 +185,20 @@ async function runSearchTermSync(sellerId: string): Promise<string> {
         }
 
         if (currentJob.status.toUpperCase() === "COMPLETED" && currentJob.report_url) {
-          const savedCount = await downloadAndSaveSearchTermReport(currentJob);
-          await markAmazonAdsReportJobSynced(currentJob.id);
-          results.push(`saved ${savedCount} row(s) for ${currentJob.start_date}`);
+          try {
+            const savedCount = await downloadAndSaveSearchTermReport(currentJob);
+            await markAmazonAdsReportJobSynced(currentJob.id);
+            results.push(`saved ${savedCount} row(s) for ${currentJob.start_date}`);
+          } catch (downloadError) {
+            // Most likely cause: the report finished a while ago and Amazon's
+            // download link has since expired. Stop retrying this job and let
+            // the next tick request a fresh report instead.
+            const message = downloadError instanceof Error ? downloadError.message : "Unknown error";
+            await markSearchTermReportJobFailed(currentJob.id, message);
+            results.push(
+              `could not download the report for ${currentJob.start_date} (link likely expired) — will request a fresh one next run`
+            );
+          }
         } else {
           results.push(`still ${currentJob.status} for ${currentJob.start_date}`);
         }
