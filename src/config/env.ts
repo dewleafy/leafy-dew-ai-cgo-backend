@@ -33,7 +33,12 @@ const envSchema = z.object({
   SP_API_AWS_ACCESS_KEY_ID: z.string().optional(),
   SP_API_AWS_SECRET_ACCESS_KEY: z.string().optional(),
   SP_API_AWS_SESSION_TOKEN: z.string().optional(),
-  CRON_SECRET: z.string().optional()
+  CRON_SECRET: z.string().optional(),
+  // AI Gateway: only used when a seller explicitly enables AI calls in settings (default OFF).
+  // Provider: OpenAI (Chat Completions API). If OpenAI ever rejects OPENAI_MODEL with
+  // "model not found," check the exact current model id at platform.openai.com and update this.
+  OPENAI_API_KEY: z.string().optional(),
+  OPENAI_MODEL: z.string().min(1).default("gpt-5.6-luna")
 });
 
 const parsedEnv = envSchema.safeParse(process.env);
