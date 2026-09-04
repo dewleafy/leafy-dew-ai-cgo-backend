@@ -2,6 +2,7 @@ import { supabase } from "../../db/supabase";
 import { ensureActionLedgerAction } from "../action-ledger/action-ledger.service";
 import { ActionLedgerActionType } from "../action-ledger/action-ledger.types";
 import { safeRecordActivityLog } from "../activity-logs/activity-logs.service";
+import { generateAiResponse } from "../ai-gateway/ai-gateway.service";
 import { AmazonSpListingRow } from "../amazon-sp/amazon-sp.types";
 import { recordLearningEventSafe } from "../learning-loop/learning-loop.service";
 import { ProductPassportRow } from "../product-passports/product-passports.types";
@@ -11,6 +12,14 @@ import {
   ListingOptimizationDraftRow,
   SafeListingOptimizationDraft
 } from "./listing-drafts.types";
+
+// Safety valve: caps how many real AI provider calls one generateListingDrafts() run will attempt,
+// independent of the AI Gateway's own daily/monthly budget guardrails (which still apply per call).
+const MAX_AI_CALLS_PER_GENERATION_RUN = 40;
+
+type AiDraftState = { calls: number; limit: number };
+
+type AiDraftType = Extract<ListingDraftType, "TITLE" | "BULLETS" | "DESCRIPTION">;
 
 type ProductContext = {
   sellerId: string;
@@ -88,7 +97,100 @@ function proposedTitle(product: ProductContext): string | null {
   return [name, features.join(" "), category].filter(Boolean).join(" | ").slice(0, 190);
 }
 
-function buildCandidates(product: ProductContext): DraftCandidate[] {
+function buildProductFactsBlock(product: ProductContext): string {
+  const facts: string[] = [];
+  const name = cleanText(product.productName) ?? cleanText(product.title);
+  if (name) facts.push(`Product name: ${name}`);
+
+  const category = cleanText(product.passport?.category) ?? cleanText(product.passport?.product_type) ?? cleanText(product.listing?.product_type);
+  if (category) facts.push(`Category: ${category}`);
+
+  const features = arrayText(product.passport?.key_features);
+  if (features.length) facts.push(`Known key features: ${features.join("; ")}`);
+
+  const packageContents = cleanText(product.passport?.package_contents);
+  if (packageContents) facts.push(`Package contents: ${packageContents}`);
+
+  const targetCustomer = cleanText(product.passport?.target_customer);
+  if (targetCustomer) facts.push(`Target customer: ${targetCustomer}`);
+
+  const useCase = cleanText(product.passport?.use_case);
+  if (useCase) facts.push(`Use case: ${useCase}`);
+
+  const brandPositioning = cleanText(product.passport?.brand_positioning);
+  if (brandPositioning) facts.push(`Brand positioning: ${brandPositioning}`);
+
+  const seoKeywords = arrayText(product.passport?.seo_keywords);
+  if (seoKeywords.length) facts.push(`Approved SEO keywords to weave in naturally where relevant: ${seoKeywords.join(", ")}`);
+
+  return facts.join("\n");
+}
+
+const AI_DRAFT_INSTRUCTIONS: Record<AiDraftType, string> = {
+  TITLE:
+    'Write ONE Amazon product listing title using only the facts given below. Do not invent specs, certifications, or claims that are not stated. Keep it under 190 characters, no ALL CAPS, no promotional superlatives ("best", "#1", "guaranteed"), no emojis, no HTML. Reply with ONLY the title text and nothing else.',
+  BULLETS:
+    'Write exactly 5 concise, benefit-led Amazon bullet points using only the facts given below. Do not invent specs, certifications, or claims that are not stated. Each bullet under 200 characters, plain text, no numbering, no bullet characters, no HTML, no emojis. Reply with each bullet on its own line and nothing else.',
+  DESCRIPTION:
+    'Write an Amazon product description (150 to 250 words) using only the facts given below. Do not invent specs, certifications, or claims that are not stated. Plain text, no HTML, no emojis, no promotional superlatives ("best", "#1", "guaranteed"). Reply with ONLY the description text and nothing else.'
+};
+
+const AI_DRAFT_MAX_OUTPUT_TOKENS: Record<AiDraftType, number> = {
+  TITLE: 150,
+  BULLETS: 300,
+  DESCRIPTION: 500
+};
+
+async function draftValueWithAi(input: {
+  product: ProductContext;
+  draftType: AiDraftType;
+  fallback: string | null;
+  aiState: AiDraftState;
+}): Promise<{ value: string | null; aiCall: boolean; aiBlockedReason: string | null }> {
+  if (input.aiState.calls >= input.aiState.limit) {
+    return { value: input.fallback, aiCall: false, aiBlockedReason: "AI_RUN_CALL_LIMIT_REACHED" };
+  }
+
+  const facts = buildProductFactsBlock(input.product);
+  if (!facts) {
+    return { value: input.fallback, aiCall: false, aiBlockedReason: "INSUFFICIENT_PRODUCT_DATA" };
+  }
+
+  const prompt = `${AI_DRAFT_INSTRUCTIONS[input.draftType]}\n\nProduct facts:\n${facts}`;
+
+  try {
+    const result = await generateAiResponse({
+      sellerId: input.product.sellerId,
+      moduleName: "LISTING_DRAFTS",
+      purpose: `listing_draft_${input.draftType.toLowerCase()}`,
+      prompt,
+      maxOutputTokens: AI_DRAFT_MAX_OUTPUT_TOKENS[input.draftType],
+      requestId: sourceIdForProduct(input.product, input.draftType),
+      // generateListingDrafts() only runs from a founder-triggered POST /generate click (no background
+      // cron calls it), and the AI Gateway's security guardrail requires a founder/admin actor for any
+      // AI_GENERATE call — "system" would be silently blocked here, so this must say "founder".
+      actor: "founder",
+      metadata: { sku: input.product.sku, asin: input.product.asin, draftType: input.draftType }
+    });
+
+    // Only count this against the per-run cap when a real provider call was actually attempted
+    // (a success, or a failure that reached the provider) — a local block (disabled/budget/etc.)
+    // never touched Anthropic and costs nothing, so it shouldn't eat into the run's call budget.
+    if (result.ok || result.blockedReason === "AI_PROVIDER_CALL_FAILED") {
+      input.aiState.calls += 1;
+    }
+
+    if (result.ok && result.output) {
+      return { value: result.output.trim(), aiCall: true, aiBlockedReason: null };
+    }
+
+    return { value: input.fallback, aiCall: false, aiBlockedReason: result.blockedReason ?? "AI_CALL_DID_NOT_RETURN_OUTPUT" };
+  } catch {
+    return { value: input.fallback, aiCall: false, aiBlockedReason: "AI_CALL_ERROR" };
+  }
+}
+
+async function buildCandidates(product: ProductContext, aiState: AiDraftState): Promise<DraftCandidate[]> {
   const candidates: DraftCandidate[] = [];
   const title = cleanText(product.title);
   const features = arrayText(product.passport?.key_features);
@@ -101,26 +203,29 @@ function buildCandidates(product: ProductContext): DraftCandidate[] {
   ].filter(Boolean);
 
   if (!title || title.length < 40 || title.length > 200) {
+    const ai = await draftValueWithAi({ product, draftType: "TITLE", fallback: proposedTitle(product), aiState });
     candidates.push({
       draftType: "TITLE",
       currentValue: title,
-      proposedValue: proposedTitle(product),
+      proposedValue: ai.value,
       reason: !title ? "Listing title is missing." : title.length < 40 ? "Listing title is short and may miss search context." : "Listing title is too long for safe marketplace review.",
-      confidenceLabel: "MEDIUM",
+      confidenceLabel: ai.aiCall ? "HIGH" : "MEDIUM",
       riskLevel: "MEDIUM",
-      metadata: { currentLength: title?.length ?? 0 }
+      metadata: { currentLength: title?.length ?? 0, aiCall: ai.aiCall, aiBlockedReason: ai.aiBlockedReason }
     });
   }
 
   if (!features.length || features.length < 3) {
+    const fallback = features.length ? features.join("\n") : "Draft benefit-led bullets from Product Passport key features.";
+    const ai = await draftValueWithAi({ product, draftType: "BULLETS", fallback, aiState });
     candidates.push({
       draftType: "BULLETS",
       currentValue: features.join("\n") || null,
-      proposedValue: features.length ? features.join("\n") : "Draft benefit-led bullets from Product Passport key features.",
+      proposedValue: ai.value,
       reason: "Product Passport has fewer than three key feature bullets.",
-      confidenceLabel: "MEDIUM",
+      confidenceLabel: ai.aiCall ? "HIGH" : "MEDIUM",
       riskLevel: "MEDIUM",
-      metadata: { featureCount: features.length }
+      metadata: { featureCount: features.length, aiCall: ai.aiCall, aiBlockedReason: ai.aiBlockedReason }
     });
   }
 
@@ -132,19 +237,21 @@ function buildCandidates(product: ProductContext): DraftCandidate[] {
       reason: "Backend keyword inputs are missing or too thin.",
       confidenceLabel: "MEDIUM",
       riskLevel: "LOW",
-      metadata: { seoKeywordCount: seoKeywords.length }
+      metadata: { seoKeywordCount: seoKeywords.length, aiCall: false }
     });
   }
 
   if (descriptionInputs.length < 2) {
+    const fallback = "Draft description from package contents, target customer, use case, and brand positioning after founder review.";
+    const ai = await draftValueWithAi({ product, draftType: "DESCRIPTION", fallback, aiState });
     candidates.push({
       draftType: "DESCRIPTION",
       currentValue: descriptionInputs.join("\n") || null,
-      proposedValue: "Draft description from package contents, target customer, use case, and brand positioning after founder review.",
+      proposedValue: ai.value,
       reason: "Description readiness fields are incomplete in Product Passport.",
-      confidenceLabel: "MEDIUM",
+      confidenceLabel: ai.aiCall ? "HIGH" : "MEDIUM",
       riskLevel: "MEDIUM",
-      metadata: { descriptionInputCount: descriptionInputs.length }
+      metadata: { descriptionInputCount: descriptionInputs.length, aiCall: ai.aiCall, aiBlockedReason: ai.aiBlockedReason }
     });
   }
 
@@ -252,11 +359,11 @@ async function createDraft(product: ProductContext, candidate: DraftCandidate): 
       confidence_label: candidate.confidenceLabel,
       risk_level: candidate.riskLevel,
       metadata: {
-        ...candidate.metadata,
         shadowMode: true,
         externalExecution: false,
         listingUpdate: false,
-        aiCall: false
+        aiCall: false,
+        ...candidate.metadata
       }
     })
     .select("*")
@@ -380,9 +487,10 @@ export async function generateListingDrafts(sellerIdInput: string): Promise<List
   const rows: SafeListingOptimizationDraft[] = [];
   let skippedCount = 0;
   let actionsCreated = 0;
+  const aiState: AiDraftState = { calls: 0, limit: MAX_AI_CALLS_PER_GENERATION_RUN };
 
   for (const product of products) {
-    const candidates = buildCandidates(product);
+    const candidates = await buildCandidates(product, aiState);
     if (!candidates.length) {
       skippedCount += 1;
       continue;
@@ -417,7 +525,7 @@ export async function generateListingDrafts(sellerIdInput: string): Promise<List
     title: "Listing draft generation completed",
     message: "Listing draft generation completed in shadow mode. No listing update executed.",
     sourceModule: "listing-drafts",
-    metadata: { scannedCount: products.length, draftsCreated: rows.length, actionsCreated, skippedCount }
+    metadata: { scannedCount: products.length, draftsCreated: rows.length, actionsCreated, skippedCount, aiCallsUsed: aiState.calls, aiCallLimit: aiState.limit }
   });
 
   return {
