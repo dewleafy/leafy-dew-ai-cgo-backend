@@ -6,7 +6,8 @@ import {
   getAiCostSummary,
   getAiGatewayStatus,
   listAiCostLedger,
-  recordBlockedAiAttempt
+  recordBlockedAiAttempt,
+  updateAiGatewaySettings
 } from "./ai-gateway.service";
 
 const aiEstimateSchema = z.object({
@@ -30,6 +31,17 @@ const generateSchema = aiEstimateSchema.extend({
   requestId: z.string().nullable().optional(),
   maxOutputTokens: z.number().finite().optional(),
   actor: z.string().nullable().optional()
+});
+
+const updateSettingsSchema = z.object({
+  sellerId: z.string().trim().min(1).optional(),
+  aiCallsEnabled: z.boolean().optional(),
+  dailyBudget: z.number().finite().nonnegative().optional(),
+  monthlyBudget: z.number().finite().nonnegative().optional(),
+  allowedModules: z.array(z.string()).optional(),
+  blockedModules: z.array(z.string()).optional(),
+  defaultProvider: z.string().nullable().optional(),
+  defaultModel: z.string().nullable().optional()
 });
 
 function sellerIdFromQuery(req: Request): string {
@@ -111,5 +123,21 @@ export async function generateAiResponseRoute(req: Request, res: Response): Prom
     res.json(await generateAiResponse(parsed.data));
   } catch {
     sendAiGatewayError(res, "Could not process AI generate request.");
+  }
+}
+
+export async function updateAiGatewaySettingsRoute(req: Request, res: Response): Promise<void> {
+  const parsed = updateSettingsSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    res.status(400).json({ ok: false, message: "Please check AI Gateway settings input.", issues: parsed.error.issues });
+    return;
+  }
+
+  const { sellerId, ...patch } = parsed.data;
+  try {
+    const settings = await updateAiGatewaySettings(sellerId ?? sellerIdFromQuery(req), patch);
+    res.json({ ok: true, settings, message: "AI Gateway settings updated." });
+  } catch {
+    sendAiGatewayError(res, "Could not update AI Gateway settings.");
   }
 }
