@@ -1,3 +1,5 @@
+import axios from "axios";
+import { env } from "../../config/env";
 import { supabase } from "../../db/supabase";
 import { safeRecordActivityLog } from "../activity-logs/activity-logs.service";
 import { checkSecurityGuardrail } from "../security-guardrails/security-guardrails.service";
@@ -11,8 +13,14 @@ import {
   SafeAiGatewaySettings
 } from "./ai-gateway.types";
 
-const INPUT_COST_PER_1K = 0.0005;
-const OUTPUT_COST_PER_1K = 0.0015;
+// OpenAI pricing for the configured OPENAI_MODEL (per official pricing page, confirm at
+// platform.openai.com/docs/pricing if a live call ever fails with "model not found" or the
+// account's actual per-token rate differs — pricing/model IDs can change):
+// $0.20 / MTok input, $1.20 / MTok output => $0.0002 / 1K input, $0.0012 / 1K output.
+const INPUT_COST_PER_1K = 0.0002;
+const OUTPUT_COST_PER_1K = 0.0012;
+const OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions";
+const DEFAULT_MAX_OUTPUT_TOKENS = 1024;
 
 function cleanText(value: unknown): string | null {
   const trimmed = typeof value === "string" ? value.trim() : value == null ? "" : String(value).trim();
@@ -130,6 +138,57 @@ export async function getAiGatewayStatus(sellerIdInput: string): Promise<{
   };
 }
 
+export async function updateAiGatewaySettings(
+  sellerIdInput: string,
+  patch: {
+    aiCallsEnabled?: boolean;
+    dailyBudget?: number;
+    monthlyBudget?: number;
+    allowedModules?: unknown[];
+    blockedModules?: unknown[];
+    defaultProvider?: string | null;
+    defaultModel?: string | null;
+  }
+): Promise<SafeAiGatewaySettings> {
+  const sellerId = cleanText(sellerIdInput) ?? "default";
+  await ensureAiGatewaySettings(sellerId);
+
+  const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
+  if (patch.aiCallsEnabled !== undefined) updates.ai_calls_enabled = Boolean(patch.aiCallsEnabled);
+  if (patch.dailyBudget !== undefined) updates.daily_budget = Math.max(toNumber(patch.dailyBudget), 0);
+  if (patch.monthlyBudget !== undefined) updates.monthly_budget = Math.max(toNumber(patch.monthlyBudget), 0);
+  if (patch.allowedModules !== undefined) updates.allowed_modules = toJsonArray(patch.allowedModules);
+  if (patch.blockedModules !== undefined) updates.blocked_modules = toJsonArray(patch.blockedModules);
+  if (patch.defaultProvider !== undefined) updates.default_provider = cleanText(patch.defaultProvider);
+  if (patch.defaultModel !== undefined) updates.default_model = cleanText(patch.defaultModel);
+
+  const { data, error } = await supabase
+    .from("ai_gateway_settings")
+    .update(updates)
+    .eq("seller_id", sellerId)
+    .select("*")
+    .single<AiGatewaySettingsRow>();
+
+  if (error || !data) throw new Error(error?.message ?? "Could not update AI Gateway settings.");
+  const row = toSafeSettings(data);
+
+  await safeRecordActivityLog({
+    sellerId: row.sellerId,
+    eventType: "AI_GATEWAY_SETTINGS_UPDATED",
+    eventCategory: "AI_GATEWAY",
+    severity: "INFO",
+    actor: "founder",
+    title: "AI Gateway settings updated",
+    message: row.aiCallsEnabled
+      ? "AI calls are now enabled for this seller, subject to daily/monthly budgets and allowed modules."
+      : "AI calls are disabled for this seller.",
+    sourceModule: "ai-gateway",
+    metadata: { aiCallsEnabled: row.aiCallsEnabled, dailyBudget: row.dailyBudget, monthlyBudget: row.monthlyBudget }
+  });
+
+  return row;
+}
+
 export function estimateAiUsage(input: AiEstimateInput): {
   ok: true;
   sellerId: string;
@@ -230,19 +289,58 @@ export async function recordBlockedAiAttempt(input: AiBlockedInput): Promise<Saf
   return row;
 }
 
+async function callOpenAiChatCompletion(input: {
+  prompt: string;
+  maxOutputTokens: number;
+  model: string;
+}): Promise<{ text: string; inputTokens: number; outputTokens: number }> {
+  const response = await axios.post(
+    OPENAI_CHAT_COMPLETIONS_URL,
+    {
+      model: input.model,
+      messages: [{ role: "user", content: input.prompt }],
+      // "max_completion_tokens" is accepted everywhere "max_tokens" is and is required on
+      // reasoning-capable models, so it's used defensively here regardless of which model is configured.
+      max_completion_tokens: input.maxOutputTokens
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${env.OPENAI_API_KEY ?? ""}`,
+        "content-type": "application/json"
+      },
+      timeout: 60000
+    }
+  );
+
+  const data = response.data as {
+    choices?: Array<{ message?: { content?: string | null } }>;
+    usage?: { prompt_tokens?: number; completion_tokens?: number };
+  };
+
+  const text = cleanText(data.choices?.[0]?.message?.content) ?? "";
+
+  return {
+    text,
+    inputTokens: toNumber(data.usage?.prompt_tokens),
+    outputTokens: toNumber(data.usage?.completion_tokens)
+  };
+}
+
 export async function generateAiResponse(input: AiGenerateInput): Promise<{
   ok: boolean;
   blockedReason: string | null;
   entry: SafeAiCostLedgerEntry;
-  output: null;
+  output: string | null;
   message: string;
 }> {
   const sellerId = cleanText(input.sellerId) ?? "default";
   const settings = await ensureAiGatewaySettings(sellerId);
+  const prompt = cleanText(input.prompt);
+  const maxOutputTokens = Math.min(Math.max(Math.floor(input.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS), 1), 4096);
   const estimate = estimateAiUsage({
     ...input,
     sellerId,
-    outputTokens: input.outputTokens ?? input.maxOutputTokens
+    outputTokens: input.outputTokens ?? maxOutputTokens
   });
   const moduleName = estimate.moduleName;
   const allowedModules = toJsonArray(settings.allowedModules).map(String);
@@ -266,6 +364,8 @@ export async function generateAiResponse(input: AiGenerateInput): Promise<{
     blockedReason = "AI_MODULE_NOT_ALLOWED_BY_SETTINGS";
   } else if (blockedModules.includes(moduleName)) {
     blockedReason = "AI_MODULE_BLOCKED_BY_SETTINGS";
+  } else if (!prompt) {
+    blockedReason = "AI_PROMPT_REQUIRED";
   }
 
   if (!blockedReason) {
@@ -285,29 +385,112 @@ export async function generateAiResponse(input: AiGenerateInput): Promise<{
     }
   }
 
-  if (!blockedReason && !process.env.OPENAI_API_KEY) {
+  if (!blockedReason && !env.OPENAI_API_KEY) {
     blockedReason = "AI_PROVIDER_NOT_CONFIGURED";
   }
 
-  const entry = await recordBlockedAiAttempt({
-    ...input,
-    sellerId,
-    blockedReason: blockedReason ?? "AI_PROVIDER_NOT_CONFIGURED",
-    metadata: {
-      ...(input.metadata ?? {}),
-      generateEndpoint: true,
-      estimatedCost: estimate.estimatedCost,
-      providerConfigured: Boolean(process.env.OPENAI_API_KEY)
-    }
-  });
+  if (blockedReason) {
+    const entry = await recordBlockedAiAttempt({
+      ...input,
+      sellerId,
+      blockedReason,
+      metadata: {
+        ...(input.metadata ?? {}),
+        generateEndpoint: true,
+        estimatedCost: estimate.estimatedCost,
+        providerConfigured: Boolean(env.OPENAI_API_KEY)
+      }
+    });
 
-  return {
-    ok: false,
-    blockedReason: blockedReason ?? "AI_PROVIDER_NOT_CONFIGURED",
-    entry,
-    output: null,
-    message: "AI generation blocked safely. No provider call executed."
-  };
+    return {
+      ok: false,
+      blockedReason,
+      entry,
+      output: null,
+      message: "AI generation blocked safely. No provider call executed."
+    };
+  }
+
+  // Reached only when every guardrail above passed, which requires `prompt` to be non-empty.
+  const promptText = prompt ?? "";
+  const model = cleanText(input.modelName) ?? cleanText(settings.defaultModel) ?? env.OPENAI_MODEL;
+  const provider = cleanText(input.provider) ?? cleanText(settings.defaultProvider) ?? "openai";
+
+  try {
+    const result = await callOpenAiChatCompletion({ prompt: promptText, maxOutputTokens, model });
+    const actualCost = estimateCost(result.inputTokens, result.outputTokens);
+
+    const { data, error } = await supabase
+      .from("ai_cost_ledger")
+      .insert({
+        seller_id: sellerId,
+        request_id: cleanText(input.requestId),
+        module_name: moduleName,
+        purpose: estimate.purpose,
+        provider,
+        model_name: model,
+        input_tokens: result.inputTokens,
+        output_tokens: result.outputTokens,
+        estimated_cost: estimate.estimatedCost,
+        actual_cost: actualCost,
+        status: "COMPLETED",
+        blocked_reason: null,
+        metadata: {
+          ...(input.metadata ?? {}),
+          generateEndpoint: true,
+          aiCallsEnabled: true,
+          externalAiCall: true,
+          outputPreview: result.text.slice(0, 500)
+        }
+      })
+      .select("*")
+      .single<AiCostLedgerRow>();
+
+    if (error || !data) throw new Error(error?.message ?? "Could not record AI call result.");
+    const entry = toSafeLedger(data);
+
+    await safeRecordActivityLog({
+      sellerId,
+      eventType: "AI_GATEWAY_CALL_COMPLETED",
+      eventCategory: "AI_GATEWAY",
+      severity: "INFO",
+      actor: "system",
+      title: "AI call completed",
+      message: "AI generation call completed successfully.",
+      sourceModule: "ai-gateway",
+      metadata: { requestId: entry.requestId, moduleName: entry.moduleName, actualCost: entry.actualCost }
+    });
+
+    return {
+      ok: true,
+      blockedReason: null,
+      entry,
+      output: result.text || null,
+      message: "AI generation completed."
+    };
+  } catch (callError) {
+    const failureReason = "AI_PROVIDER_CALL_FAILED";
+    const entry = await recordBlockedAiAttempt({
+      ...input,
+      sellerId,
+      blockedReason: failureReason,
+      metadata: {
+        ...(input.metadata ?? {}),
+        generateEndpoint: true,
+        estimatedCost: estimate.estimatedCost,
+        providerConfigured: true,
+        providerError: callError instanceof Error ? callError.message : "Unknown provider error"
+      }
+    });
+
+    return {
+      ok: false,
+      blockedReason: failureReason,
+      entry,
+      output: null,
+      message: "AI generation failed when calling the provider. The attempt was recorded; no listing content was produced."
+    };
+  }
 }
 
 export async function listAiCostLedger(input: { sellerId: string; limit: number }): Promise<SafeAiCostLedgerEntry[]> {
