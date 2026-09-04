@@ -102,6 +102,7 @@ function cleanText(value: unknown): string | null {
 }
 
 export function isValidImageUrl(value: unknown): value is string {
+  if (typeof value !== "string") return false;
   const text = cleanText(value);
   return Boolean(text && (text.startsWith("https://") || text.startsWith("http://") || text.startsWith("/")));
 }
