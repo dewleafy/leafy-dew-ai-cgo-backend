@@ -253,13 +253,13 @@ async function loadCostCompletionContext(sellerIdInput: string, limit = 1000): P
       .select("*")
       .eq("seller_id", sellerId)
       .neq("status", "ARCHIVED")
-      .order("updated_at", { ascending: false })
+      .order("created_at", { ascending: false })
       .limit(limit),
     supabase
       .from("amazon_product_economics")
       .select("*")
       .eq("seller_id", sellerId)
-      .order("updated_at", { ascending: false })
+      .order("created_at", { ascending: false })
       .limit(limit)
   ]);
 
