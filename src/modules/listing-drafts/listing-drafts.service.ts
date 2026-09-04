@@ -190,7 +190,11 @@ async function draftValueWithAi(input: {
   }
 }
 
-async function buildCandidates(product: ProductContext, aiState: AiDraftState): Promise<DraftCandidate[]> {
+async function buildCandidates(
+  product: ProductContext,
+  aiState: AiDraftState,
+  skipTypes: ReadonlySet<ListingDraftType>
+): Promise<DraftCandidate[]> {
   const candidates: DraftCandidate[] = [];
   const title = cleanText(product.title);
   const features = arrayText(product.passport?.key_features);
@@ -202,7 +206,11 @@ async function buildCandidates(product: ProductContext, aiState: AiDraftState): 
     cleanText(product.passport?.brand_positioning)
   ].filter(Boolean);
 
-  if (!title || title.length < 40 || title.length > 200) {
+  // skipTypes are draft types that already have a pending DRAFTED duplicate for this product,
+  // checked up front by the caller — skipping here means never spending a real AI call on a
+  // draft that would just be discarded as a duplicate afterward.
+
+  if (!skipTypes.has("TITLE") && (!title || title.length < 40 || title.length > 200)) {
     const ai = await draftValueWithAi({ product, draftType: "TITLE", fallback: proposedTitle(product), aiState });
     candidates.push({
       draftType: "TITLE",
@@ -215,7 +223,7 @@ async function buildCandidates(product: ProductContext, aiState: AiDraftState): 
     });
   }
 
-  if (!features.length || features.length < 3) {
+  if (!skipTypes.has("BULLETS") && (!features.length || features.length < 3)) {
     const fallback = features.length ? features.join("\n") : "Draft benefit-led bullets from Product Passport key features.";
     const ai = await draftValueWithAi({ product, draftType: "BULLETS", fallback, aiState });
     candidates.push({
@@ -229,7 +237,7 @@ async function buildCandidates(product: ProductContext, aiState: AiDraftState): 
     });
   }
 
-  if (seoKeywords.length < 5) {
+  if (!skipTypes.has("BACKEND_KEYWORDS") && seoKeywords.length < 5) {
     candidates.push({
       draftType: "BACKEND_KEYWORDS",
       currentValue: seoKeywords.join(", ") || null,
@@ -241,7 +249,7 @@ async function buildCandidates(product: ProductContext, aiState: AiDraftState): 
     });
   }
 
-  if (descriptionInputs.length < 2) {
+  if (!skipTypes.has("DESCRIPTION") && descriptionInputs.length < 2) {
     const fallback = "Draft description from package contents, target customer, use case, and brand positioning after founder review.";
     const ai = await draftValueWithAi({ product, draftType: "DESCRIPTION", fallback, aiState });
     candidates.push({
@@ -489,14 +497,31 @@ export async function generateListingDrafts(sellerIdInput: string): Promise<List
   let actionsCreated = 0;
   const aiState: AiDraftState = { calls: 0, limit: MAX_AI_CALLS_PER_GENERATION_RUN };
 
+  const draftTypesToCheck: ListingDraftType[] = ["TITLE", "BULLETS", "BACKEND_KEYWORDS", "DESCRIPTION"];
+
   for (const product of products) {
-    const candidates = await buildCandidates(product, aiState);
+    // Check for existing pending duplicates BEFORE generating candidates, so we never spend a
+    // real AI call drafting content that will just be thrown away as a duplicate below.
+    const skipTypes = new Set<ListingDraftType>();
+    for (const draftType of draftTypesToCheck) {
+      const alreadyPending = await draftDuplicateExists({
+        sellerId,
+        sku: product.sku,
+        asin: product.asin,
+        draftType
+      });
+      if (alreadyPending) skipTypes.add(draftType);
+    }
+
+    const candidates = await buildCandidates(product, aiState, skipTypes);
     if (!candidates.length) {
-      skippedCount += 1;
+      skippedCount += skipTypes.size > 0 ? skipTypes.size : 1;
       continue;
     }
 
     for (const candidate of candidates) {
+      // Defense-in-depth: re-check immediately before insert in case a duplicate was created by
+      // another process between the up-front check above and now.
       const duplicate = await draftDuplicateExists({
         sellerId,
         sku: product.sku,
