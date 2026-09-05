@@ -72,8 +72,32 @@ export async function amazonSpPost<T>(input: {
   });
 }
 
+// Added for real Amazon write-back (Listings Items API partial updates, e.g.
+// title/bullets/description). Every prior use of this client was read-only
+// (GET) or POST (used for Reports API report creation, never a real listing
+// write) — this is the first PATCH support in this client, and the first
+// method here whose whole purpose is to change something on Amazon's side.
+export async function amazonSpPatch<T>(input: {
+  path: string;
+  query?: Record<string, AmazonSpQueryValue>;
+  body?: Record<string, unknown>;
+  accessToken: string;
+  region: AmazonSpRegion;
+  stage?: string;
+}): Promise<T> {
+  return amazonSpRequest<T>({
+    method: "PATCH",
+    path: input.path,
+    query: input.query,
+    body: input.body,
+    accessToken: input.accessToken,
+    region: input.region,
+    stage: input.stage
+  });
+}
+
 async function amazonSpRequest<T>(input: {
-  method: "GET" | "POST";
+  method: "GET" | "POST" | "PATCH";
   path: string;
   query?: Record<string, AmazonSpQueryValue>;
   body?: Record<string, unknown>;
@@ -115,7 +139,9 @@ async function amazonSpRequest<T>(input: {
     try {
       const response = input.method === "GET"
         ? await axios.get<T>(url.toString(), { headers })
-        : await axios.post<T>(url.toString(), input.body ?? {}, { headers });
+        : input.method === "PATCH"
+          ? await axios.patch<T>(url.toString(), input.body ?? {}, { headers })
+          : await axios.post<T>(url.toString(), input.body ?? {}, { headers });
       return response.data;
     } catch (error) {
       const status = axios.isAxiosError(error) ? error.response?.status : undefined;
