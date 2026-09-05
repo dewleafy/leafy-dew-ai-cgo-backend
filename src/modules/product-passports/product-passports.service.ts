@@ -572,3 +572,51 @@ export async function archiveProductPassport(id: string): Promise<SafeProductPas
 
   return toSafeProductPassport(data, await findListingForPassport(data), await findProductMediaForPassport(data));
 }
+
+export type ProductImageLookup = {
+  bySku: Map<string, string>;
+  byAsin: Map<string, string>;
+};
+
+// Shared "what does this product look like" lookup used by other modules (Action Ledger,
+// Listing Drafts, real-sales summaries) so their list/card responses can carry a real product
+// photo URL instead of the founder seeing a generic icon while reviewing. Deliberately reuses
+// listProductPassports() rather than re-deriving image logic, so this always matches whatever
+// image the founder actually sees on the Product Passport / Products page.
+export async function getProductImageLookup(sellerIdInput: string): Promise<ProductImageLookup> {
+  const sellerId = cleanText(sellerIdInput) ?? "default";
+  const bySku = new Map<string, string>();
+  const byAsin = new Map<string, string>();
+
+  let passports: SafeProductPassportRow[] = [];
+  try {
+    passports = await listProductPassports({ sellerId });
+  } catch (error) {
+    logProductPassportError("Could not build product image lookup.", {
+      message: error instanceof Error ? error.message : "Unknown error"
+    });
+    return { bySku, byAsin };
+  }
+
+  for (const passport of passports) {
+    const imageUrl = cleanText(passport.imageUrl);
+    if (!imageUrl) continue;
+
+    const skuKey = normalizeSkuKey(passport.sku);
+    const asinKey = normalizeAsin(passport.asin);
+    if (skuKey && !bySku.has(skuKey)) bySku.set(skuKey, imageUrl);
+    if (asinKey && !byAsin.has(asinKey)) byAsin.set(asinKey, imageUrl);
+  }
+
+  return { bySku, byAsin };
+}
+
+export function lookupProductImage(
+  lookup: ProductImageLookup,
+  sku?: string | null,
+  asin?: string | null
+): string | null {
+  const skuKey = normalizeSkuKey(sku);
+  const asinKey = normalizeAsin(asin);
+  return (skuKey ? lookup.bySku.get(skuKey) : undefined) ?? (asinKey ? lookup.byAsin.get(asinKey) : undefined) ?? null;
+}
