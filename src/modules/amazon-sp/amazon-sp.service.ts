@@ -21,6 +21,7 @@ import {
   normalizeProductImage,
   normalizeProductMedia
 } from "../product-media/product-media-normalizer";
+import { getProductImageLookup, lookupProductImage } from "../product-passports/product-passports.service";
 import {
   AmazonSpConnectionRow,
   AmazonSpListingRow,
@@ -2955,6 +2956,10 @@ export async function getAmazonSpSalesSummary(sellerIdInput: string, daysInput: 
     bySku.set(key, current);
   }
 
+  // Bulk lookup (one call, not one per SKU) so the Sales & Ads "Top Products by Real Sales" card
+  // can show a real product photo instead of a generic icon.
+  const imageLookup = await getProductImageLookup(sellerId);
+
   return {
     days,
     rawSales: orderTotals.rawSales,
@@ -2986,6 +2991,7 @@ export async function getAmazonSpSalesSummary(sellerIdInput: string, daysInput: 
         sku: row.sku,
         asin: row.asin,
         title: row.title,
+        imageUrl: lookupProductImage(imageLookup, row.sku, row.asin),
         units: row.confirmedUnits,
         sales: row.confirmedSales,
         orders: row.confirmedOrders.size,
