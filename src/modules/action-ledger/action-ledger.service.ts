@@ -1,6 +1,7 @@
 import { env } from "../../config/env";
 import { supabase } from "../../db/supabase";
 import { logger } from "../../utils/logger";
+import { getProductImageLookup, lookupProductImage } from "../product-passports/product-passports.service";
 import {
   ActionLedgerActionType,
   ActionLedgerBatchUpdateResult,
@@ -223,6 +224,10 @@ export function toSafeActionLedgerRow(row: ActionLedgerRow): SafeActionLedgerRow
     entityId: row.entity_id,
     sku: row.sku,
     asin: row.asin,
+    // Filled in by attachProductImages() for list endpoints that display these rows as
+    // cards (Approval Center, AI Actions). Left null here since this pure row mapper has
+    // no product-image data of its own to look up.
+    imageUrl: null,
     title: row.title,
     summary: row.summary,
     recommendedAction: row.recommended_action,
@@ -250,6 +255,19 @@ export function toSafeActionLedgerRow(row: ActionLedgerRow): SafeActionLedgerRow
 
 export function mapActionLedgerRow(row: ActionLedgerRow): SafeActionLedgerRow {
   return toSafeActionLedgerRow(row);
+}
+
+// Attaches a real product photo URL to each row (by SKU, falling back to ASIN) so Approval
+// Center and AI Actions cards can show what the product actually looks like instead of a
+// generic icon. Built as a single bulk lookup per list call rather than one query per row.
+async function attachProductImages(rows: SafeActionLedgerRow[], sellerId: string): Promise<SafeActionLedgerRow[]> {
+  if (!rows.length) return rows;
+
+  const lookup = await getProductImageLookup(sellerId);
+  return rows.map((row) => ({
+    ...row,
+    imageUrl: lookupProductImage(lookup, row.sku, row.asin)
+  }));
 }
 
 function defaultStateForInput(input: ActionLedgerInput): ActionLedgerState {
@@ -322,7 +340,8 @@ export async function listActionLedgerRows(input: {
     throw new Error("Could not load action ledger from Supabase.");
   }
 
-  return ((data ?? []) as ActionLedgerRow[]).map(toSafeActionLedgerRow);
+  const rows = ((data ?? []) as ActionLedgerRow[]).map(toSafeActionLedgerRow);
+  return attachProductImages(rows, cleanText(input.sellerId) ?? "default");
 }
 
 export async function getActionLedgerById(id: unknown): Promise<SafeActionLedgerRow | null> {
