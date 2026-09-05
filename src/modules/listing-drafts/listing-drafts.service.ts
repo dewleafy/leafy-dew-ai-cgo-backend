@@ -6,6 +6,7 @@ import { generateAiResponse } from "../ai-gateway/ai-gateway.service";
 import { AmazonSpListingRow } from "../amazon-sp/amazon-sp.types";
 import { recordLearningEventSafe } from "../learning-loop/learning-loop.service";
 import { ProductPassportRow } from "../product-passports/product-passports.types";
+import { getProductImageLookup, lookupProductImage } from "../product-passports/product-passports.service";
 import {
   ListingDraftGenerateResult,
   ListingDraftType,
@@ -67,6 +68,9 @@ function toSafeDraft(row: ListingOptimizationDraftRow): SafeListingOptimizationD
     sku: row.sku,
     asin: row.asin,
     productName: row.product_name,
+    // Filled in by attachProductImages() after the initial DB row mapping (see below) — left null
+    // here since toSafeDraft() only has the raw draft row, not the product image lookup.
+    imageUrl: null,
     draftType: row.draft_type,
     currentValue: row.current_value,
     proposedValue: row.proposed_value,
@@ -81,6 +85,19 @@ function toSafeDraft(row: ListingOptimizationDraftRow): SafeListingOptimizationD
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
+}
+
+// Attaches a real product photo URL to each draft (by SKU, falling back to ASIN) so the Listing
+// Drafts page can show what the product actually looks like instead of a generic icon. Built as a
+// single bulk lookup per list call rather than one query per row.
+async function attachProductImages(rows: SafeListingOptimizationDraft[], sellerId: string): Promise<SafeListingOptimizationDraft[]> {
+  if (!rows.length) return rows;
+
+  const lookup = await getProductImageLookup(sellerId);
+  return rows.map((row) => ({
+    ...row,
+    imageUrl: lookupProductImage(lookup, row.sku, row.asin)
+  }));
 }
 
 function sourceIdForProduct(product: ProductContext, draftType: ListingDraftType): string {
@@ -578,7 +595,8 @@ export async function listListingDrafts(input: {
     .limit(limit);
 
   if (error) throw new Error(error.message);
-  return ((data ?? []) as ListingOptimizationDraftRow[]).map(toSafeDraft);
+  const rows = ((data ?? []) as ListingOptimizationDraftRow[]).map(toSafeDraft);
+  return attachProductImages(rows, sellerId);
 }
 
 async function countDrafts(input: {
