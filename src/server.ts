@@ -25,6 +25,7 @@ import { learningSummaryRoutes } from "./modules/learning-summary/learning-summa
 import { launchChecklistRouter } from "./modules/launch-checklist/launch-checklist.routes";
 import { launchGateRouter } from "./modules/launch-gate/launch-gate.routes";
 import { listingDraftsRouter } from "./modules/listing-drafts/listing-drafts.routes";
+import { listingExecutionRoutes } from "./modules/listing-execution/listing-execution.routes";
 import { listingSchemaRouter } from "./modules/listing-schema/listing-schema.routes";
 import { backgroundSyncRouter } from "./modules/background-sync/background-sync.routes";
 import { aplusContentRouter } from "./modules/aplus-content/aplus-content.routes";
@@ -214,6 +215,7 @@ app.use("/api/listing-drafts", listingDraftsRouter);
 app.use("/api/listing-schema", listingSchemaRouter);
 app.use("/api/background-sync", backgroundSyncRouter);
 app.use("/api/aplus-content", aplusContentRouter);
+app.use("/api/listing-execution", listingExecutionRoutes);
 app.use("/api/listing-readiness", listingReadinessRoutes);
 app.use("/api/live-execution", liveExecutionRouter);
 app.use("/api/notification-outbox", notificationOutboxRouter);
