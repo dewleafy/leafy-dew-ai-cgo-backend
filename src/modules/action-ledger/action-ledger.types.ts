@@ -157,6 +157,11 @@ export type SafeActionLedgerRow = {
   entityId: string | null;
   sku: string | null;
   asin: string | null;
+  // Real product photo URL for this row's SKU/ASIN, looked up from Product Passport image
+  // data at read time (see getProductImageLookup() in product-passports.service.ts) so
+  // Approval Center and AI Actions cards can show a real thumbnail instead of a generic icon.
+  // Null when no image is on file for this product yet.
+  imageUrl: string | null;
   title: string;
   summary: string | null;
   recommendedAction: string | null;
