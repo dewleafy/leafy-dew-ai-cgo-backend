@@ -27,6 +27,9 @@ export type SafeListingOptimizationDraft = {
   sku: string | null;
   asin: string | null;
   productName: string | null;
+  // Real product photo URL for this draft's SKU/ASIN, filled in by listListingDrafts() from
+  // Product Passport image data so the Listing Drafts page can show what the product actually
+  // looks like. Null when no image is on file for this product yet.
   imageUrl: string | null;
   draftType: string;
   currentValue: string | null;
