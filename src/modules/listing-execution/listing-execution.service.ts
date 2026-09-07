@@ -6,7 +6,8 @@ import { transitionActionState } from "../action-ledger/action-workflow.service"
 import { getSafetyControlSettings } from "../safety-control/safety-control.service";
 import { requireConnectedConnection } from "../amazon-sp/amazon-sp.service";
 import { getAmazonSpAccessToken } from "../amazon-sp/amazon-sp-token.service";
-import { amazonSpPatch } from "../amazon-sp/amazon-sp-client.service";
+import { amazonSpGet, amazonSpPatch } from "../amazon-sp/amazon-sp-client.service";
+import { AmazonSpRegion } from "../amazon-sp/amazon-sp.types";
 import { cleanText } from "../amazon-sp/amazon-sp-utils";
 import { env } from "../../config/env";
 import { ListingExecutionDraftType, ListingExecutionError, ListingExecutionResult } from "./listing-execution.types";
@@ -93,15 +94,69 @@ async function recordSafetyAuditEvent(input: {
   }
 }
 
-async function getRealAmazonProductType(sellerId: string, sku: string): Promise<string | null> {
+// The daily listings sync populates amazon_sp_listings from Amazon's GET_MERCHANT_LISTINGS_ALL_DATA
+// report, which (confirmed against Amazon's own report documentation) has no product-type, category,
+// or item-type column at all — so amazon_sp_listings.product_type has never been populated by that
+// sync, for any SKU. The real productType only exists on the live Listings Items API, so when the
+// cached column is empty this fetches it directly from Amazon (read-only GET, the same access scope
+// already used everywhere else in this app — no new permission needed) and caches the result back
+// onto the row so this SKU never needs a second live fetch.
+async function getRealAmazonProductType(input: {
+  sellerId: string;
+  sku: string;
+  amazonSellerId: string;
+  marketplaceId: string;
+  accessToken: string;
+  region: AmazonSpRegion;
+}): Promise<string | null> {
   const { data } = await supabase
     .from("amazon_sp_listings")
     .select("product_type")
-    .eq("seller_id", sellerId)
-    .eq("sku", sku)
+    .eq("seller_id", input.sellerId)
+    .eq("sku", input.sku)
     .maybeSingle<{ product_type: string | null }>();
 
-  return data?.product_type ?? null;
+  if (data?.product_type) {
+    return data.product_type;
+  }
+
+  let fetchedProductType: string | null = null;
+
+  try {
+    const response = await amazonSpGet<{ summaries?: Array<{ productType?: string }> }>({
+      path: `/listings/2021-08-01/items/${encodeURIComponent(input.amazonSellerId)}/${encodeURIComponent(input.sku)}`,
+      query: { marketplaceIds: [input.marketplaceId], includedData: ["summaries"] },
+      accessToken: input.accessToken,
+      region: input.region,
+      stage: "GET_LISTINGS_ITEM_FOR_PRODUCT_TYPE"
+    });
+    fetchedProductType = cleanTextLocal(response?.summaries?.[0]?.productType) || null;
+  } catch (error) {
+    logger.warn("Could not fetch real Amazon product type for listing execution.", {
+      sellerId: input.sellerId,
+      sku: input.sku,
+      message: error instanceof Error ? error.message : "Unknown error"
+    });
+    return null;
+  }
+
+  if (fetchedProductType) {
+    const { error: updateError } = await supabase
+      .from("amazon_sp_listings")
+      .update({ product_type: fetchedProductType })
+      .eq("seller_id", input.sellerId)
+      .eq("sku", input.sku);
+
+    if (updateError) {
+      logger.warn("Fetched a real Amazon product type but could not cache it onto amazon_sp_listings.", {
+        sellerId: input.sellerId,
+        sku: input.sku,
+        message: updateError.message
+      });
+    }
+  }
+
+  return fetchedProductType;
 }
 
 function buildAttributeValue(input: {
@@ -248,12 +303,19 @@ export async function executeListingContentAction(input: {
     throw new ListingExecutionError(503, "This seller's Amazon Seller ID is not confirmed yet, so nothing can be sent to Amazon.");
   }
 
-  const productType = await getRealAmazonProductType(sellerId, sku);
+  const productType = await getRealAmazonProductType({
+    sellerId,
+    sku,
+    amazonSellerId,
+    marketplaceId: connection.marketplace_id,
+    accessToken,
+    region: connection.region
+  });
 
   if (!productType) {
     throw new ListingExecutionError(
       503,
-      "This product's real Amazon product type isn't on file yet (needed for a safe update) — run a listings sync first, then try again."
+      "Could not confirm this product's real Amazon product type (needed for a safe update), even after checking Amazon directly. Try again shortly, or check the Amazon listing is still active."
     );
   }
 
