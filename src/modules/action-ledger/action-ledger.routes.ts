@@ -4,6 +4,7 @@ import {
   approveActionLedgerRow,
   backfillActionLedgerWorkflowRoute,
   batchCompleteActionLedgerRows,
+  batchDeleteActionLedgerRowsRoute,
   batchMonitorActionLedgerRows,
   batchRejectActionLedgerRows,
   completeActionLedgerRow,
@@ -32,6 +33,7 @@ actionLedgerRoutes.post("/batch/reject", asyncHandler(batchRejectActionLedgerRow
 actionLedgerRoutes.post("/batch/monitor", asyncHandler(batchMonitorActionLedgerRows));
 actionLedgerRoutes.post("/batch/complete", asyncHandler(batchCompleteActionLedgerRows));
 actionLedgerRoutes.post("/batch/dismiss-low-priority", asyncHandler(dismissLowPriorityActionLedgerRowsRoute));
+actionLedgerRoutes.post("/batch/delete", asyncHandler(batchDeleteActionLedgerRowsRoute));
 actionLedgerRoutes.post("/workflow/backfill", asyncHandler(backfillActionLedgerWorkflowRoute));
 actionLedgerRoutes.get("/:id/workflow", asyncHandler(getActionLedgerWorkflowRoute));
 actionLedgerRoutes.get("/:id/rollback-preview", asyncHandler(getActionLedgerRollbackPreviewRoute));
