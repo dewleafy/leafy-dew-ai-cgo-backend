@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import { z } from "zod";
 import {
+  batchDeleteActionLedgerRows,
   batchUpdateActionLedgerState,
   createActionLedgerRow,
   dismissLowPriorityActionLedgerRows,
@@ -651,6 +652,47 @@ export async function batchCompleteActionLedgerRows(req: Request, res: Response)
     sendBatchResult(res, result);
   } catch {
     sendDatabaseError(res, "Could not batch complete action ledger rows in Supabase.");
+  }
+}
+
+export async function batchDeleteActionLedgerRowsRoute(req: Request, res: Response): Promise<void> {
+  const parsed = batchIdsSchema.safeParse(req.body ?? {});
+
+  if (!parsed.success) {
+    sendValidationError(res, parsed.error.issues);
+    return;
+  }
+
+  try {
+    const result = await batchDeleteActionLedgerRows({
+      sellerId: parsed.data.sellerId,
+      ids: parsed.data.ids
+    });
+
+    if (result.updatedCount > 0) {
+      await safeRecordActivityLog({
+        sellerId: result.sellerId,
+        eventType: "ACTION_BATCH_DELETED",
+        eventCategory: "ACTION_LEDGER",
+        severity: "WARNING",
+        actor: actorForAction({ actor: parsed.data.actor, fallback: "founder" }),
+        title: "Bulk deleted action ledger rows",
+        message: parsed.data.note
+          ?? `Permanently deleted ${result.updatedCount} action ledger row(s) from the Approval Center.`,
+        sourceModule: "action-ledger",
+        metadata: {
+          batch: true,
+          requestedCount: result.requestedCount,
+          deletedCount: result.updatedCount,
+          skippedCount: result.skippedCount,
+          deletedIds: result.rows.map((row) => row.id)
+        }
+      });
+    }
+
+    sendBatchResult(res, result);
+  } catch {
+    sendDatabaseError(res, "Could not batch delete action ledger rows in Supabase.");
   }
 }
 
