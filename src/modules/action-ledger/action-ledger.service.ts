@@ -631,6 +631,72 @@ export async function batchUpdateActionLedgerState(input: {
   };
 }
 
+// Permanent delete -- unlike every other batch function in this file (which only ever change
+// approval_status/state), this removes rows from Supabase entirely. Restricted to PENDING/MONITOR
+// rows as a server-side safety net: the Approval Center's own selection checkboxes already only
+// allow selecting rows in those two statuses, so this guard means a delete request can never
+// remove Approved/Rejected/Completed history even if it were ever called with a different id
+// list than the UI sends. `action_workflow_events` cascade-deletes with its action_ledger row
+// (see workflow_state_machine.sql), so there is nothing to write there for a row about to be
+// deleted; the controller records one activity-log summary instead, which survives the delete.
+export async function batchDeleteActionLedgerRows(input: {
+  sellerId: string;
+  ids: string[];
+}): Promise<ActionLedgerBatchUpdateResult> {
+  const sellerId = cleanText(input.sellerId) ?? "default";
+  const requestedCount = input.ids.length;
+  const ids = uniqueActionLedgerIds(input.ids);
+
+  if (!ids.length) {
+    logger.info("Action ledger batch delete completed.", {
+      sellerId,
+      requestedCount,
+      updatedCount: 0,
+      skippedCount: requestedCount
+    });
+
+    return {
+      sellerId,
+      requestedCount,
+      updatedCount: 0,
+      skippedCount: requestedCount,
+      rows: []
+    };
+  }
+
+  const { data, error } = await supabase
+    .from("action_ledger")
+    .delete()
+    .eq("seller_id", sellerId)
+    .in("id", ids)
+    .in("approval_status", ["PENDING", "MONITOR"])
+    .select("*");
+
+  if (error) {
+    logActionLedgerError("Could not batch delete action ledger rows.", error);
+    throw new Error("Could not batch delete action ledger rows in Supabase.");
+  }
+
+  const rows = ((data ?? []) as ActionLedgerRow[]).map(toSafeActionLedgerRow);
+  const updatedCount = rows.length;
+  const skippedCount = Math.max(requestedCount - updatedCount, 0);
+
+  logger.info("Action ledger batch delete completed.", {
+    sellerId,
+    requestedCount,
+    updatedCount,
+    skippedCount
+  });
+
+  return {
+    sellerId,
+    requestedCount,
+    updatedCount,
+    skippedCount,
+    rows
+  };
+}
+
 async function listPendingActionLedgerRowsForPrioritySort(sellerId: string): Promise<SafeActionLedgerRow[]> {
   const pageSize = 1000;
   const rows: SafeActionLedgerRow[] = [];
