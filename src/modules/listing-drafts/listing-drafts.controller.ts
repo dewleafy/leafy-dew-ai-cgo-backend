@@ -1,5 +1,7 @@
 import { Request, Response } from "express";
+import { safeRecordActivityLog } from "../activity-logs/activity-logs.service";
 import {
+  batchDeleteListingDrafts,
   createActionForListingDraft,
   generateListingDrafts,
   getListingDraftSummary,
@@ -49,6 +51,58 @@ export async function listListingDraftsRoute(req: Request, res: Response): Promi
 export async function generateListingDraftsRoute(req: Request, res: Response): Promise<void> {
   try {
     res.json(await generateListingDrafts(sellerIdFromQuery(req)));
+  } catch (error) {
+    sendDraftError(res, error);
+  }
+}
+
+export async function batchDeleteListingDraftsRoute(req: Request, res: Response): Promise<void> {
+  const body = (req.body ?? {}) as { sellerId?: unknown; ids?: unknown };
+  const sellerId = typeof body.sellerId === "string" && body.sellerId.trim() ? body.sellerId.trim() : "default";
+  const rawIds = Array.isArray(body.ids) ? body.ids : [];
+  const ids = [...new Set(rawIds.filter((id): id is string => typeof id === "string" && id.trim().length > 0))];
+
+  if (!ids.length) {
+    res.status(400).json({ ok: false, message: "ids must be a non-empty array of listing draft ids." });
+    return;
+  }
+
+  if (ids.length > 200) {
+    res.status(400).json({ ok: false, message: "Batch delete is limited to 200 ids per request." });
+    return;
+  }
+
+  try {
+    const result = await batchDeleteListingDrafts({ sellerId, ids });
+
+    if (result.deletedCount > 0) {
+      await safeRecordActivityLog({
+        sellerId: result.sellerId,
+        eventType: "LISTING_DRAFT_BATCH_DELETED",
+        eventCategory: "LISTING_DRAFT_SYSTEM",
+        severity: "WARNING",
+        actor: "founder",
+        title: "Bulk deleted listing drafts",
+        message: `Permanently deleted ${result.deletedCount} listing draft record(s) from the Listing Drafts page.`,
+        sourceModule: "listing-drafts",
+        metadata: {
+          batch: true,
+          requestedCount: result.requestedCount,
+          deletedCount: result.deletedCount,
+          skippedCount: result.skippedCount,
+          deletedIds: result.rows.map((row) => row.id)
+        }
+      });
+    }
+
+    res.json({
+      ok: true,
+      sellerId: result.sellerId,
+      requestedCount: result.requestedCount,
+      updatedCount: result.deletedCount,
+      skippedCount: result.skippedCount,
+      rows: result.rows
+    });
   } catch (error) {
     sendDraftError(res, error);
   }
