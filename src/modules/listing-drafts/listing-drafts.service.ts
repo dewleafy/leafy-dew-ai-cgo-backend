@@ -599,6 +599,46 @@ export async function listListingDrafts(input: {
   return attachProductImages(rows, sellerId);
 }
 
+// Permanent delete of selected listing_optimization_drafts rows. Unlike the Action Ledger's
+// equivalent (batchDeleteActionLedgerRows), this is not restricted to any particular status --
+// the founder explicitly wants a full reset available here (including already-approved/sent
+// draft records), and this table has no downstream cascade to worry about: action_ledger.payload
+// already carries its own snapshot of draftId/currentValue/proposedValue, so deleting a draft row
+// never erases what an already-approved or already-executed action actually did.
+export async function batchDeleteListingDrafts(input: {
+  sellerId: string;
+  ids: string[];
+}): Promise<{
+  sellerId: string;
+  requestedCount: number;
+  deletedCount: number;
+  skippedCount: number;
+  rows: SafeListingOptimizationDraft[];
+}> {
+  const sellerId = cleanText(input.sellerId) ?? "default";
+  const requestedCount = input.ids.length;
+  const ids = [...new Set(input.ids.map((id) => cleanText(id)).filter((id): id is string => Boolean(id)))];
+
+  if (!ids.length) {
+    return { sellerId, requestedCount, deletedCount: 0, skippedCount: requestedCount, rows: [] };
+  }
+
+  const { data, error } = await supabase
+    .from("listing_optimization_drafts")
+    .delete()
+    .eq("seller_id", sellerId)
+    .in("id", ids)
+    .select("*");
+
+  if (error) throw new Error(error.message);
+
+  const rows = ((data ?? []) as ListingOptimizationDraftRow[]).map(toSafeDraft);
+  const deletedCount = rows.length;
+  const skippedCount = Math.max(requestedCount - deletedCount, 0);
+
+  return { sellerId, requestedCount, deletedCount, skippedCount, rows };
+}
+
 async function countDrafts(input: {
   sellerId: string;
   status?: string;
