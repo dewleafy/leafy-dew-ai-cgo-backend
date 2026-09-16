@@ -3,7 +3,13 @@ import { logger } from "../../utils/logger";
 import { getActionLedgerById } from "../action-ledger/action-ledger.service";
 import { transitionActionState } from "../action-ledger/action-workflow.service";
 import { safeRecordActivityLog } from "../activity-logs/activity-logs.service";
-import { PassportDraftExecutionError, PassportDraftExecutionResult, PassportDraftFieldType } from "./passport-draft-execution.types";
+import {
+  PassportDraftBatchExecutionResult,
+  PassportDraftBatchItemResult,
+  PassportDraftExecutionError,
+  PassportDraftExecutionResult,
+  PassportDraftFieldType
+} from "./passport-draft-execution.types";
 
 const ACTION_ID_REGEX = /^[0-9a-f-]{8,64}$/i;
 
@@ -174,5 +180,56 @@ export async function executePassportDraftAction(input: {
     message: `Saved to the Product Passport: ${targetLabel}.`,
     savedValue,
     row: transition.row
+  };
+}
+
+// Runs executePassportDraftAction() for each id in turn (not in parallel — each one does a real
+// Supabase write plus a workflow-state transition, and running them one at a time keeps this
+// simple and safe rather than racing writes against the same table). One id's failure (already
+// approved, wrong type, missing passport row, etc.) is recorded and skipped — it never stops the
+// rest of the batch, since a founder selecting 50 cards should get 49 real saves even if 1 is stale.
+export async function batchExecutePassportDraftActions(input: {
+  sellerId: string;
+  actionIds: string[];
+  actor?: string | null;
+}): Promise<PassportDraftBatchExecutionResult> {
+  const sellerId = cleanTextLocal(input.sellerId) || "default";
+  const actor = cleanTextLocal(input.actor) || "founder";
+  const results: PassportDraftBatchItemResult[] = [];
+
+  for (const rawActionId of input.actionIds) {
+    const actionId = cleanTextLocal(rawActionId);
+
+    try {
+      const result = await executePassportDraftAction({ sellerId, actionId, actor });
+      results.push({
+        actionId: result.actionId,
+        ok: true,
+        sku: result.sku,
+        asin: result.asin,
+        draftType: result.draftType,
+        message: result.message
+      });
+    } catch (error) {
+      const message =
+        error instanceof PassportDraftExecutionError
+          ? error.message
+          : error instanceof Error
+            ? error.message
+            : "Could not save this draft to the Product Passport.";
+      results.push({ actionId, ok: false, message });
+    }
+  }
+
+  const savedCount = results.filter((r) => r.ok).length;
+
+  return {
+    ok: true,
+    sellerId,
+    requestedCount: input.actionIds.length,
+    savedCount,
+    updatedCount: savedCount,
+    skippedCount: results.length - savedCount,
+    results
   };
 }
