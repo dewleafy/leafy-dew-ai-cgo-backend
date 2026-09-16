@@ -991,6 +991,23 @@ async function findProductPassportForListing(
   return Array.isArray(asinRows) ? asinRows[0] as Record<string, unknown> | undefined : undefined;
 }
 
+// Real fix for a long-documented bug: this sync used to hardcode brand: "Leafy Dew" on every
+// product it created, mislabeling every Ziro kart product too (this seller sells two brands
+// under one Amazon account). Detects the real brand from the SKU/product name instead — the
+// same detection Brand Readiness uses — so newly-synced products get the correct brand, and
+// existing mislabeled rows self-heal the next time this sync updates them (belt-and-suspenders
+// alongside the one-time SQL backfill for rows that don't get an update any time soon).
+const KNOWN_SECONDARY_BRANDS: Array<{ match: RegExp; brandName: string }> = [{ match: /ziro\s*kart/i, brandName: "Ziro kart" }];
+const DEFAULT_BRAND_NAME = "Leafy Dew";
+
+function resolveBrandForListing(sku: string | null | undefined, productName: string | null | undefined): string {
+  const haystack = `${sku ?? ""} ${productName ?? ""}`;
+  for (const candidate of KNOWN_SECONDARY_BRANDS) {
+    if (candidate.match.test(haystack)) return candidate.brandName;
+  }
+  return DEFAULT_BRAND_NAME;
+}
+
 async function upsertProductPassportsFromListings(sellerId: string, listings: ListingSyncItem[]): Promise<{ inserted: number; updated: number }> {
   let inserted = 0;
   let updated = 0;
@@ -998,6 +1015,7 @@ async function upsertProductPassportsFromListings(sellerId: string, listings: Li
   for (const listing of listings) {
     const existing = await findProductPassportForListing(sellerId, listing);
     const status = listingLooksActive(listing.listingStatus) ? "ACTIVE" : "NEEDS_REVIEW";
+    const resolvedBrand = resolveBrandForListing(listing.sku, listing.productName);
 
     if (existing) {
       const updateRow: Record<string, unknown> = { updated_at: new Date().toISOString() };
@@ -1014,6 +1032,12 @@ async function upsertProductPassportsFromListings(sellerId: string, listings: Li
       }
       if (listing.price !== null && listing.price !== undefined) updateRow.selling_price = listing.price;
       if (existing.status === "DRAFT" || existing.status !== status) updateRow.status = status;
+      // Self-heal a mislabeled brand from the old hardcoded-"Leafy Dew" bug, or fill it in if
+      // it was ever left blank. Never overwrites a brand a founder may have manually corrected
+      // to something outside the known set (only corrects towards a brand we can detect).
+      if (existing.brand !== resolvedBrand && (!existing.brand || KNOWN_SECONDARY_BRANDS.some((b) => b.brandName === resolvedBrand))) {
+        updateRow.brand = resolvedBrand;
+      }
 
       if (Object.keys(updateRow).length > 1) {
         const { error } = await supabase.from("product_passports").update(updateRow).eq("id", existing.id);
@@ -1028,7 +1052,7 @@ async function upsertProductPassportsFromListings(sellerId: string, listings: Li
       sku: listing.sku,
       asin: listing.asin,
       product_name: listing.productName ?? listing.sku,
-      brand: "Leafy Dew",
+      brand: resolvedBrand,
       category: listing.productType,
       product_type: listing.productType,
       selling_price: listing.price,
