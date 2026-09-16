@@ -20,7 +20,7 @@ const MAX_AI_CALLS_PER_GENERATION_RUN = 40;
 
 type AiDraftState = { calls: number; limit: number };
 
-type AiDraftType = Extract<ListingDraftType, "TITLE" | "BULLETS" | "DESCRIPTION">;
+type AiDraftType = Extract<ListingDraftType, "TITLE" | "BULLETS" | "DESCRIPTION" | "BRAND_POSITIONING" | "CUSTOMER_OBJECTIONS">;
 
 type ProductContext = {
   sellerId: string;
@@ -119,6 +119,9 @@ function buildProductFactsBlock(product: ProductContext): string {
   const name = cleanText(product.productName) ?? cleanText(product.title);
   if (name) facts.push(`Product name: ${name}`);
 
+  const brand = cleanText(product.passport?.brand);
+  if (brand) facts.push(`Brand: ${brand}`);
+
   const category = cleanText(product.passport?.category) ?? cleanText(product.passport?.product_type) ?? cleanText(product.listing?.product_type);
   if (category) facts.push(`Category: ${category}`);
 
@@ -149,13 +152,19 @@ const AI_DRAFT_INSTRUCTIONS: Record<AiDraftType, string> = {
   BULLETS:
     'Write exactly 5 concise, benefit-led Amazon bullet points using only the facts given below. Do not invent specs, certifications, or claims that are not stated. Each bullet under 200 characters, plain text, no numbering, no bullet characters, no HTML, no emojis. Reply with each bullet on its own line and nothing else.',
   DESCRIPTION:
-    'Write an Amazon product description (150 to 250 words) using only the facts given below. Do not invent specs, certifications, or claims that are not stated. Plain text, no HTML, no emojis, no promotional superlatives ("best", "#1", "guaranteed"). Reply with ONLY the description text and nothing else.'
+    'Write an Amazon product description (150 to 250 words) using only the facts given below. Do not invent specs, certifications, or claims that are not stated. Plain text, no HTML, no emojis, no promotional superlatives ("best", "#1", "guaranteed"). Reply with ONLY the description text and nothing else.',
+  BRAND_POSITIONING:
+    'Write a short internal brand positioning note (2 to 4 sentences) for this product, using only the facts given below. This is an internal strategy note, not customer-facing copy — it explains how this product fits and supports the brand named below (its style, price tier, and the kind of customer it serves). Do not invent specs, certifications, awards, or claims that are not stated. Do not claim this is the "best" or "#1" anything. Plain text, no HTML, no emojis. Reply with ONLY the note and nothing else.',
+  CUSTOMER_OBJECTIONS:
+    'List 3 to 5 realistic reasons a shopper might hesitate before buying this specific product, using only the facts given below (for example: price relative to what is known, uncertainty about size/fit, durability doubts, or unclear use case) — this is an internal strategy note to help improve the listing later, not customer-facing copy. For each one, write one line as "Objection: <the hesitation> — Address by: <a brief, honest way the listing or brand could address it using only known facts>". Do not invent facts, specs, or certifications to resolve an objection with something not stated. Reply with ONLY the numbered-free list, one objection per line, and nothing else.'
 };
 
 const AI_DRAFT_MAX_OUTPUT_TOKENS: Record<AiDraftType, number> = {
   TITLE: 150,
   BULLETS: 300,
-  DESCRIPTION: 500
+  DESCRIPTION: 500,
+  BRAND_POSITIONING: 220,
+  CUSTOMER_OBJECTIONS: 350
 };
 
 async function draftValueWithAi(input: {
@@ -278,6 +287,42 @@ async function buildCandidates(
       riskLevel: "MEDIUM",
       metadata: { descriptionInputCount: descriptionInputs.length, aiCall: ai.aiCall, aiBlockedReason: ai.aiBlockedReason }
     });
+  }
+
+  // These two never go to Amazon — approving one just saves the AI-authored text into the
+  // Product Passport (see passport-draft-execution module). They exist specifically because
+  // "missing brand positioning" and "missing customer objections" are two of the top gaps the
+  // Brand Readiness score surfaces on both brands.
+  const brandPositioning = cleanText(product.passport?.brand_positioning);
+  if (!skipTypes.has("BRAND_POSITIONING") && !brandPositioning) {
+    const ai = await draftValueWithAi({ product, draftType: "BRAND_POSITIONING", fallback: null, aiState });
+    if (ai.value) {
+      candidates.push({
+        draftType: "BRAND_POSITIONING",
+        currentValue: brandPositioning,
+        proposedValue: ai.value,
+        reason: "Brand positioning is missing from this product's Product Passport.",
+        confidenceLabel: ai.aiCall ? "HIGH" : "LOW",
+        riskLevel: "LOW",
+        metadata: { aiCall: ai.aiCall, aiBlockedReason: ai.aiBlockedReason }
+      });
+    }
+  }
+
+  const customerObjections = arrayText(product.passport?.customer_objections);
+  if (!skipTypes.has("CUSTOMER_OBJECTIONS") && customerObjections.length < 2) {
+    const ai = await draftValueWithAi({ product, draftType: "CUSTOMER_OBJECTIONS", fallback: null, aiState });
+    if (ai.value) {
+      candidates.push({
+        draftType: "CUSTOMER_OBJECTIONS",
+        currentValue: customerObjections.length ? customerObjections.join("\n") : null,
+        proposedValue: ai.value,
+        reason: "Product Passport has fewer than two known customer objections on file.",
+        confidenceLabel: ai.aiCall ? "HIGH" : "LOW",
+        riskLevel: "LOW",
+        metadata: { existingObjectionCount: customerObjections.length, aiCall: ai.aiCall, aiBlockedReason: ai.aiBlockedReason }
+      });
+    }
   }
 
   return candidates;
@@ -403,6 +448,8 @@ function actionTypeForDraft(draftType: string): ActionLedgerActionType {
   if (draftType === "BULLETS") return "LISTING_BULLETS_DRAFT_REVIEW";
   if (draftType === "BACKEND_KEYWORDS") return "LISTING_BACKEND_KEYWORDS_DRAFT_REVIEW";
   if (draftType === "DESCRIPTION") return "LISTING_DESCRIPTION_DRAFT_REVIEW";
+  if (draftType === "BRAND_POSITIONING") return "PASSPORT_BRAND_POSITIONING_DRAFT_REVIEW";
+  if (draftType === "CUSTOMER_OBJECTIONS") return "PASSPORT_CUSTOMER_OBJECTIONS_DRAFT_REVIEW";
   return "LISTING_READINESS_REVIEW";
 }
 
@@ -514,7 +561,7 @@ export async function generateListingDrafts(sellerIdInput: string): Promise<List
   let actionsCreated = 0;
   const aiState: AiDraftState = { calls: 0, limit: MAX_AI_CALLS_PER_GENERATION_RUN };
 
-  const draftTypesToCheck: ListingDraftType[] = ["TITLE", "BULLETS", "BACKEND_KEYWORDS", "DESCRIPTION"];
+  const draftTypesToCheck: ListingDraftType[] = ["TITLE", "BULLETS", "BACKEND_KEYWORDS", "DESCRIPTION", "BRAND_POSITIONING", "CUSTOMER_OBJECTIONS"];
 
   for (const product of products) {
     // Check for existing pending duplicates BEFORE generating candidates, so we never spend a
