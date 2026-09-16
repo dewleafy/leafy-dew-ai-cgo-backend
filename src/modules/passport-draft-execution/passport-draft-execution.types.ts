@@ -25,3 +25,22 @@ export class PassportDraftExecutionError extends Error {
     this.name = "PassportDraftExecutionError";
   }
 }
+
+// One outcome per requested id in a batch "Approve & Save to Passport" run — never throws for an
+// individual failure, so one bad/ineligible id never stops the rest of the batch from saving.
+export type PassportDraftBatchItemResult =
+  | { actionId: string; ok: true; sku: string | null; asin: string | null; draftType: PassportDraftFieldType; message: string }
+  | { actionId: string; ok: false; message: string };
+
+export type PassportDraftBatchExecutionResult = {
+  ok: true;
+  sellerId: string;
+  requestedCount: number;
+  savedCount: number;
+  // Same number as savedCount, included under the app's shared batch-result field name
+  // (updatedCount/skippedCount) so the Approval Center's one generic batch-result reader
+  // works for this endpoint too, without needing its own special case.
+  updatedCount: number;
+  skippedCount: number;
+  results: PassportDraftBatchItemResult[];
+};
