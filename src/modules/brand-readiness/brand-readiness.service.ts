@@ -3,10 +3,46 @@ import { supabase } from "../../db/supabase";
 import { logger } from "../../utils/logger";
 import { ProductPassportRow } from "../product-passports/product-passports.types";
 import {
+  BrandReadinessBrandResult,
   BrandReadinessNextBestAction,
+  BrandReadinessResponse,
   BrandReadinessSection,
   BrandReadinessStatus
 } from "./brand-readiness.types";
+
+// Known limitation: the `brand` column on product_passports is unreliable today (a
+// separate, already-documented sync bug hardcodes "Leafy Dew" on every synced row,
+// including Ziro kart products). Rather than trust that column, we detect the real
+// brand from the SKU/product name, which reliably carries a "Ziro kart" / "Zirokart"
+// marker for that brand's listings. Anything that doesn't match falls back to the
+// seller's primary brand name, "Leafy Dew".
+const KNOWN_SECONDARY_BRANDS: Array<{ match: RegExp; brandName: string }> = [
+  { match: /ziro\s*kart/i, brandName: "Ziro kart" }
+];
+const DEFAULT_BRAND_NAME = "Leafy Dew";
+
+function resolveBrandName(product: ProductPassportRow): string {
+  const haystack = `${product.sku ?? ""} ${product.product_name ?? ""}`;
+
+  for (const candidate of KNOWN_SECONDARY_BRANDS) {
+    if (candidate.match.test(haystack)) {
+      return candidate.brandName;
+    }
+  }
+
+  return DEFAULT_BRAND_NAME;
+}
+
+function groupProductsByBrand(products: ProductPassportRow[]): Map<string, ProductPassportRow[]> {
+  const groups = new Map<string, ProductPassportRow[]>();
+
+  for (const product of products) {
+    const brandName = resolveBrandName(product);
+    groups.set(brandName, [...(groups.get(brandName) ?? []), product]);
+  }
+
+  return groups;
+}
 
 function sanitizeErrorMessage(message: string): string {
   const secretValues = [
@@ -382,8 +418,7 @@ async function loadProductPassports(sellerId: string): Promise<ProductPassportRo
   return (data ?? []) as ProductPassportRow[];
 }
 
-export async function getBrandReadiness(sellerId: string) {
-  const products = await loadProductPassports(sellerId);
+function buildBrandReadinessResult(brandName: string, products: ProductPassportRow[]): BrandReadinessBrandResult {
   const productCount = products.length;
   const activeProductCount = products.filter((product) => product.status === "ACTIVE").length;
   const draftProductCount = products.filter((product) => product.status === "DRAFT").length;
@@ -403,10 +438,7 @@ export async function getBrandReadiness(sellerId: string) {
   const warnings = Object.values(sections).flatMap((section) => section.warnings);
 
   return {
-    ok: true,
-    sellerId,
-    mode: "BRAND_READINESS_V1",
-    brandName: products.find((product) => isPresent(product.brand))?.brand ?? "Leafy Dew",
+    brandName,
     overallScore,
     readinessStatus: getReadinessStatus(overallScore),
     sections,
@@ -434,5 +466,29 @@ export async function getBrandReadiness(sellerId: string) {
       overallScore
     }),
     warnings
+  };
+}
+
+export async function getBrandReadiness(sellerId: string): Promise<BrandReadinessResponse> {
+  const products = await loadProductPassports(sellerId);
+  const groups = groupProductsByBrand(products);
+
+  // Always include the primary brand, even with zero products, so the UI has a stable
+  // row to render instead of the whole brand silently disappearing.
+  if (!groups.has(DEFAULT_BRAND_NAME)) {
+    groups.set(DEFAULT_BRAND_NAME, []);
+  }
+
+  const brands = Array.from(groups.entries())
+    .map(([brandName, brandProducts]) => buildBrandReadinessResult(brandName, brandProducts))
+    .sort((a, b) => (a.brandName === DEFAULT_BRAND_NAME ? -1 : b.brandName === DEFAULT_BRAND_NAME ? 1 : a.brandName.localeCompare(b.brandName)));
+
+  return {
+    ok: true,
+    sellerId,
+    mode: "BRAND_READINESS_V1",
+    brands,
+    brandDetectionNote:
+      "Brand is detected from each product's SKU/name (not the product_passports.brand column, which is known to be mislabeled for some products)."
   };
 }
