@@ -10,12 +10,12 @@ import {
   BrandReadinessStatus
 } from "./brand-readiness.types";
 
-// Known limitation: the `brand` column on product_passports is unreliable today (a
-// separate, already-documented sync bug hardcodes "Leafy Dew" on every synced row,
-// including Ziro kart products). Rather than trust that column, we detect the real
-// brand from the SKU/product name, which reliably carries a "Ziro kart" / "Zirokart"
-// marker for that brand's listings. Anything that doesn't match falls back to the
-// seller's primary brand name, "Leafy Dew".
+// The sync's old hardcoded brand: "Leafy Dew" bug is now fixed at the source (see
+// amazon-sp.service.ts's own resolveBrandForListing, plus the one-time SQL backfill for
+// rows created before the fix) — but this scorer still detects brand from the SKU/product
+// name itself rather than trusting the stored `brand` column, so this score stays correct
+// even for any row the backfill or a stale sync hasn't touched yet. Kept in sync with the
+// same detection logic used at the sync source.
 const KNOWN_SECONDARY_BRANDS: Array<{ match: RegExp; brandName: string }> = [
   { match: /ziro\s*kart/i, brandName: "Ziro kart" }
 ];
@@ -489,6 +489,6 @@ export async function getBrandReadiness(sellerId: string): Promise<BrandReadines
     mode: "BRAND_READINESS_V1",
     brands,
     brandDetectionNote:
-      "Brand is detected from each product's SKU/name (not the product_passports.brand column, which is known to be mislabeled for some products)."
+      "Brand is detected from each product's SKU/name. The product_passports.brand column has also been fixed at the sync source and should now agree with this for every product going forward."
   };
 }
