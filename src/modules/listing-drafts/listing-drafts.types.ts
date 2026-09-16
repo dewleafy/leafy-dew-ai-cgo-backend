@@ -1,4 +1,10 @@
-export type ListingDraftType = "TITLE" | "BULLETS" | "BACKEND_KEYWORDS" | "DESCRIPTION";
+export type ListingDraftType =
+  | "TITLE"
+  | "BULLETS"
+  | "BACKEND_KEYWORDS"
+  | "DESCRIPTION"
+  | "BRAND_POSITIONING"
+  | "CUSTOMER_OBJECTIONS";
 
 export type ListingOptimizationDraftRow = {
   id: string;
