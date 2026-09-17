@@ -2,7 +2,12 @@ import { supabase } from "../../db/supabase";
 import { requireConnectedConnection } from "../amazon-sp/amazon-sp.service";
 import { amazonSpGet } from "../amazon-sp/amazon-sp-client.service";
 import { getAmazonSpAccessToken } from "../amazon-sp/amazon-sp-token.service";
+import { resolveBrandName } from "../brand-readiness/brand-readiness.service";
 import {
+  AplusCoverageBrandSummary,
+  AplusCoverageProduct,
+  AplusCoverageReport,
+  AplusCoverageScanResult,
   AplusContentCacheRow,
   AplusContentReport,
   AplusContentStatus,
@@ -11,6 +16,14 @@ import {
 } from "./aplus-content.types";
 
 const CACHE_MAX_AGE_DAYS = 7;
+
+// How many not-yet-checked ASINs one coverage-scan call fetches live from Amazon. Each
+// ASIN costs two real SP-API calls (publish records + content document), and the client
+// already retries 429/5xx with backoff (amazon-sp-client.service.ts), so this cap just
+// keeps a single request's runtime reasonable — call the scan endpoint repeatedly (same
+// fire-and-poll pattern as /api/listing-drafts/generate) until remainingUncheckedCount
+// reaches 0.
+const MAX_APLUS_LOOKUPS_PER_SCAN_RUN = 20;
 
 // Amazon's A+ Content API represents plain "headline" style text as a TextComponent
 // ({ value: string }) but represents "body" style text as a richer ParagraphComponent
@@ -367,4 +380,142 @@ export async function getAplusContentPreview(input: { sellerId: string; asin: st
       warning: error instanceof Error ? error.message : "Could not reach Amazon's A+ Content API."
     };
   }
+}
+
+type AplusCoverageProductInput = { sku: string | null; asin: string | null; product_name: string };
+
+async function loadActiveProductsForAplusCoverage(sellerId: string): Promise<AplusCoverageProductInput[]> {
+  const { data, error } = await supabase
+    .from("product_passports")
+    .select("sku, asin, product_name")
+    .eq("seller_id", sellerId)
+    .neq("status", "ARCHIVED")
+    .order("created_at", { ascending: false })
+    .limit(1000);
+
+  if (error) {
+    throw new Error("Could not load products for A+ Content coverage.");
+  }
+
+  return (data ?? []) as AplusCoverageProductInput[];
+}
+
+type AplusCacheStatusEntry = { status: AplusContentStatus; moduleCount: number; fetchedAt: string };
+
+// Whether Amazon's own per-ASIN cache (getCachedAplusContent above) would still trust
+// this row is a SEPARATE question from whether the coverage scan has "checked" this ASIN
+// yet. A NOT_FOUND row is never trusted by getCachedAplusContent (by design — see the
+// comment on getCachedAplusContent), so a single-product page visit will always re-fetch
+// it live. That's fine for that use case, but it must NOT make the coverage scan treat a
+// genuinely-checked "no content" product as still unchecked forever — otherwise the scan
+// could never finish. So for coverage purposes, any existing cache row (any status) counts
+// as "checked", regardless of Amazon-cache freshness rules.
+async function loadAplusCacheStatusMap(sellerId: string, asins: string[]): Promise<Map<string, AplusCacheStatusEntry>> {
+  const map = new Map<string, AplusCacheStatusEntry>();
+  if (asins.length === 0) return map;
+
+  const { data, error } = await supabase
+    .from("amazon_aplus_content_cache")
+    .select("asin, status, content_module_list, fetched_at")
+    .eq("seller_id", sellerId)
+    .in("asin", asins);
+
+  if (error) {
+    throw new Error("Could not load A+ Content cache for coverage.");
+  }
+
+  for (const row of data ?? []) {
+    map.set(row.asin as string, {
+      status: row.status as AplusContentStatus,
+      moduleCount: Array.isArray(row.content_module_list) ? row.content_module_list.length : 0,
+      fetchedAt: row.fetched_at as string
+    });
+  }
+
+  return map;
+}
+
+export async function getAplusContentCoverage(sellerId: string): Promise<AplusCoverageReport> {
+  const products = await loadActiveProductsForAplusCoverage(sellerId);
+  const asins = products.map((product) => product.asin).filter((value): value is string => Boolean(value));
+  const cacheMap = await loadAplusCacheStatusMap(sellerId, asins);
+
+  const brandGroups = new Map<string, AplusCoverageProduct[]>();
+
+  for (const product of products) {
+    const brand = resolveBrandName({ sku: product.sku, product_name: product.product_name });
+    const cacheEntry = product.asin ? cacheMap.get(product.asin) : undefined;
+
+    const entry: AplusCoverageProduct = {
+      sku: product.sku,
+      asin: product.asin,
+      productName: product.product_name,
+      brand,
+      status: !product.asin
+        ? "NO_ASIN"
+        : !cacheEntry
+          ? "NOT_CHECKED_YET"
+          : cacheEntry.status !== "NOT_FOUND" && cacheEntry.moduleCount > 0
+            ? "HAS_CONTENT"
+            : "NO_CONTENT",
+      moduleCount: cacheEntry?.moduleCount ?? 0,
+      lastCheckedAt: cacheEntry?.fetchedAt ?? null
+    };
+
+    brandGroups.set(brand, [...(brandGroups.get(brand) ?? []), entry]);
+  }
+
+  const brands: AplusCoverageBrandSummary[] = [];
+  const missingProducts: AplusCoverageProduct[] = [];
+  let uncheckedCount = 0;
+
+  for (const [brandName, items] of brandGroups) {
+    let hasContentCount = 0;
+    let noContentCount = 0;
+    let notCheckedCount = 0;
+
+    for (const item of items) {
+      if (item.status === "HAS_CONTENT") {
+        hasContentCount += 1;
+      } else if (item.status === "NO_CONTENT") {
+        noContentCount += 1;
+        missingProducts.push(item);
+      } else if (item.status === "NOT_CHECKED_YET") {
+        notCheckedCount += 1;
+        uncheckedCount += 1;
+      }
+    }
+
+    brands.push({ brandName, productCount: items.length, hasContentCount, noContentCount, notCheckedCount });
+  }
+
+  return { ok: true, brands, missingProducts, uncheckedCount };
+}
+
+export async function scanAplusContentCoverage(sellerId: string): Promise<AplusCoverageScanResult> {
+  const products = await loadActiveProductsForAplusCoverage(sellerId);
+  const asins = products.map((product) => product.asin).filter((value): value is string => Boolean(value));
+  const cacheMap = await loadAplusCacheStatusMap(sellerId, asins);
+  const uncheckedAsins = asins.filter((asin) => !cacheMap.has(asin));
+  const toScan = uncheckedAsins.slice(0, MAX_APLUS_LOOKUPS_PER_SCAN_RUN);
+
+  let hasContentCount = 0;
+  let noContentCount = 0;
+
+  for (const asin of toScan) {
+    const report = await getAplusContentPreview({ sellerId, asin });
+    if (report.status !== "NOT_FOUND" && report.moduleCount > 0) {
+      hasContentCount += 1;
+    } else {
+      noContentCount += 1;
+    }
+  }
+
+  return {
+    ok: true,
+    scannedCount: toScan.length,
+    hasContentCount,
+    noContentCount,
+    remainingUncheckedCount: uncheckedAsins.length - toScan.length
+  };
 }
