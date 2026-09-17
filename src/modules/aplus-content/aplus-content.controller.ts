@@ -1,5 +1,5 @@
 import { Request, Response } from "express";
-import { getAplusContentPreview } from "./aplus-content.service";
+import { getAplusContentCoverage, getAplusContentPreview, scanAplusContentCoverage } from "./aplus-content.service";
 
 function sellerIdFromQuery(req: Request): string {
   return typeof req.query.sellerId === "string" && req.query.sellerId.trim() ? req.query.sellerId.trim() : "default";
@@ -22,6 +22,30 @@ export async function getAplusContentPreviewRoute(req: Request, res: Response): 
     res.status(503).json({
       ok: false,
       message: error instanceof Error ? error.message : "Could not load A+ Content. Run amazon_aplus_content_cache.sql in Supabase and check the Amazon SP-API connection."
+    });
+  }
+}
+
+export async function getAplusContentCoverageRoute(req: Request, res: Response): Promise<void> {
+  try {
+    const report = await getAplusContentCoverage(sellerIdFromQuery(req));
+    res.json(report);
+  } catch (error) {
+    res.status(503).json({
+      ok: false,
+      message: error instanceof Error ? error.message : "Could not load A+ Content coverage."
+    });
+  }
+}
+
+export async function scanAplusContentCoverageRoute(req: Request, res: Response): Promise<void> {
+  try {
+    const result = await scanAplusContentCoverage(sellerIdFromQuery(req));
+    res.json(result);
+  } catch (error) {
+    res.status(503).json({
+      ok: false,
+      message: error instanceof Error ? error.message : "Could not run the A+ Content coverage scan."
     });
   }
 }
