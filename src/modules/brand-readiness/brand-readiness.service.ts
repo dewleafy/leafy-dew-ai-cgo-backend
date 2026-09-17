@@ -21,7 +21,11 @@ const KNOWN_SECONDARY_BRANDS: Array<{ match: RegExp; brandName: string }> = [
 ];
 const DEFAULT_BRAND_NAME = "Leafy Dew";
 
-function resolveBrandName(product: ProductPassportRow): string {
+// Exported so other modules (e.g. aplus-content's coverage scan) can group products by
+// the same brand definition instead of re-implementing their own detection regex, which
+// is exactly the kind of drift that caused the old hardcoded-brand bug this comment block
+// already warns about above.
+export function resolveBrandName(product: { sku?: string | null; product_name?: string | null }): string {
   const haystack = `${product.sku ?? ""} ${product.product_name ?? ""}`;
 
   for (const candidate of KNOWN_SECONDARY_BRANDS) {
