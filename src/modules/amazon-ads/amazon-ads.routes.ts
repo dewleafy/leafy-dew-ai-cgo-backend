@@ -14,6 +14,7 @@ import {
   getAmazonAdsSearchTermDailyMetrics,
   getAmazonAdsSearchTermSummary,
   getAmazonAdsStatus,
+  getAmazonAdsStoresProbe,
   handleAmazonAdsCallback,
   postAmazonAdsBackfillCampaignReports,
   postAmazonAdsBackfillSearchTermReports,
@@ -44,6 +45,7 @@ amazonAdsRouter.get("/search-term-daily-metrics", asyncHandler(getAmazonAdsSearc
 amazonAdsRouter.get("/search-term-summary", asyncHandler(getAmazonAdsSearchTermSummary));
 amazonAdsRouter.get("/ppc-recommendations", asyncHandler(getAmazonAdsPpcRecommendations));
 amazonAdsRouter.get("/dashboard-summary", asyncHandler(getAmazonAdsDashboardSummary));
+amazonAdsRouter.get("/stores-probe", asyncHandler(getAmazonAdsStoresProbe));
 amazonAdsRouter.get("/report-job/:jobId", asyncHandler(getAmazonAdsReportJob));
 amazonAdsRouter.post("/request-campaign-report", asyncHandler(postAmazonAdsRequestCampaignReport));
 amazonAdsRouter.post("/request-search-term-report", asyncHandler(postAmazonAdsRequestSearchTermReport));
