@@ -1086,9 +1086,19 @@ export async function getCostCompletionQueue(sellerIdInput: string): Promise<Cos
       nextActionLabel = "Ready for profit-safe PPC";
     }
 
+    // Prefer the matched Product Passport's own sku/asin (its canonical identity) over the raw
+    // Amazon listing's, when a passport was found. Amazon sellers sometimes relabel a product's
+    // SKU over time; when that happens, the OLD sku can keep sitting in amazon_sp_listings
+    // (Amazon's listings report still returns it, so our sync keeps refreshing that stale row)
+    // even though the real, current Product Passport for that same ASIN now uses a new sku.
+    // Without this, this queue row gets keyed by the stale sku, so the frontend (which dedupes
+    // products by sku/asin) sees it as a second, phantom product distinct from the real
+    // passport-backed one — silently inflating "Total Products" / "Active Listings" counts by
+    // one for every product whose SKU was ever changed on Amazon. Aligning the identity here
+    // makes this row collapse into the same key as the real passport everywhere it's merged.
     return {
-      sku: cleanText(input.sku),
-      asin: cleanText(input.asin),
+      sku: cleanText(passport?.sku ?? input.sku),
+      asin: cleanText(passport?.asin ?? input.asin),
       productName: cleanText(input.productName) ?? existingEconomics?.productName ?? passport?.product_name ?? null,
       subcategory,
       subCategory: subcategory,
