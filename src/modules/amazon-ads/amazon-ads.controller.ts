@@ -4,6 +4,7 @@ import crypto from "crypto";
 import { env } from "../../config/env";
 import { supabase } from "../../db/supabase";
 import { logger } from "../../utils/logger";
+import { probeBrandStoresApiAccess } from "./amazon-ads-stores-probe.service";
 import {
   buildAmazonAdsConnectUrl,
   exchangeAmazonAdsAuthorizationCode,
@@ -1641,4 +1642,24 @@ export async function getAmazonAdsDbHealth(_req: Request, res: Response): Promis
     ok,
     tables
   });
+}
+
+export async function getAmazonAdsStoresProbe(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+
+  try {
+    const result = await probeBrandStoresApiAccess(sellerId);
+    res.json(result);
+  } catch (error) {
+    logger.warn("Amazon Ads Brand Stores probe failed.", {
+      sellerId,
+      message: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+
+    res.status(503).json({
+      ok: false,
+      message: "Could not run the Brand Stores API access check.",
+      details: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+  }
 }
