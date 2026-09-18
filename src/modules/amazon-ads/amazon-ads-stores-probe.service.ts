@@ -9,11 +9,15 @@ import { AmazonAdsConnection, AmazonAdsRegion, AmazonAdsStoredProfile } from "./
 // "advertising::campaign_management" OAuth scope this app already has) also cover the
 // newer Brand Stores API, or does that require separate Amazon enrollment?
 //
-// There is no safe way to answer this from documentation (Amazon's Ads API docs site is a
-// client-rendered SPA that automated fetching cannot read), so this makes one real, harmless
-// GET request to Amazon's Stores API using the founder's real, already-connected credentials
-// and reports back what Amazon's own server says. A GET to a listing endpoint cannot change
-// anything in the founder's account.
+// Amazon's Ads API docs site is a client-rendered SPA that automated fetching cannot read,
+// so path names here come from a real, published open-source Amazon Ads API client
+// (python-amazon-ad-api), not guesswork:
+//   GET /brands              -> list Brand entities (brandId, brandEntityId, brandRegistryName)
+//                                tied to the connected profile. This is the real prerequisite
+//                                call, separate from listing stores themselves.
+//   GET /v2/stores           -> "List store information for all registered stores under an
+//                                advertiser" (no brandEntityId needed for this call).
+// Both are harmless GETs that cannot change anything in the founder's account.
 
 const AMAZON_ADS_API_ENDPOINTS: Record<AmazonAdsRegion, string> = {
   NA: "https://advertising-api.amazon.com",
@@ -21,16 +25,24 @@ const AMAZON_ADS_API_ENDPOINTS: Record<AmazonAdsRegion, string> = {
   FE: "https://advertising-api-fe.amazon.com"
 };
 
-// Amazon's Stores API has changed paths as it moved out of beta; try the current
-// documented-in-the-wild path first, then a legacy fallback, so one wrong guess doesn't
-// produce a misleading "no access" verdict.
-const CANDIDATE_PATHS = ["/stores/v1/brands", "/v2/stores"];
+type AmazonBrand = {
+  brandId?: string;
+  brandEntityId?: string;
+  brandRegistryName?: string;
+};
 
 export type AmazonAdsStoresProbeResult = {
   ok: true;
   connected: boolean;
   message: string;
-  verdict: "ACCESS_CONFIRMED" | "ACCESS_DENIED" | "NOT_FOUND" | "NO_CONNECTION" | "UNKNOWN";
+  verdict:
+    | "ACCESS_CONFIRMED"
+    | "BRAND_LINKED_NO_STORE"
+    | "PROFILE_NOT_BRAND_LINKED"
+    | "ACCESS_DENIED"
+    | "NO_CONNECTION"
+    | "UNKNOWN";
+  brands: AmazonBrand[];
   details: Array<{
     path: string;
     httpStatus: number | null;
@@ -81,6 +93,7 @@ export async function probeBrandStoresApiAccess(sellerId: string): Promise<Amazo
       connected: false,
       verdict: "NO_CONNECTION",
       message: context.message,
+      brands: [],
       details: []
     };
   }
@@ -88,67 +101,96 @@ export async function probeBrandStoresApiAccess(sellerId: string): Promise<Amazo
   const accessToken = await getAmazonAdsAccessToken(context.connection.id);
   const host = AMAZON_ADS_API_ENDPOINTS[context.connection.region];
   const details: AmazonAdsStoresProbeResult["details"] = [];
+  const baseHeaders = {
+    Authorization: `Bearer ${accessToken}`,
+    "Amazon-Advertising-API-ClientId": process.env.AMAZON_ADS_CLIENT_ID ?? "",
+    "Amazon-Advertising-API-Scope": context.profile.profile_id
+  };
 
-  let bestVerdict: AmazonAdsStoresProbeResult["verdict"] = "UNKNOWN";
-
-  for (const path of CANDIDATE_PATHS) {
+  async function callPath(path: string): Promise<{ status: number | null; data: unknown }> {
     try {
       const response = await axios.get(`${host}${path}`, {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Amazon-Advertising-API-ClientId": process.env.AMAZON_ADS_CLIENT_ID ?? "",
-          "Amazon-Advertising-API-Scope": context.profile.profile_id
-        },
+        headers: baseHeaders,
         validateStatus: () => true,
         timeout: 15000
       });
-
-      const status = response.status;
-      let note = `HTTP ${status}`;
-
-      if (status === 200) {
-        note = "Amazon returned a successful response — existing Ads API access already covers this.";
-        bestVerdict = "ACCESS_CONFIRMED";
-      } else if (status === 401) {
-        note = "Amazon rejected the access token itself (401) — likely an unrelated auth problem, not a scope issue.";
-        if (bestVerdict === "UNKNOWN") bestVerdict = "UNKNOWN";
-      } else if (status === 403) {
-        note = "Amazon returned Forbidden (403) — the existing Ads API access/scope does not cover Brand Stores; separate enrollment is required.";
-        if (bestVerdict === "UNKNOWN") bestVerdict = "ACCESS_DENIED";
-      } else if (status === 404) {
-        note = "Amazon returned Not Found (404) for this path — either the wrong endpoint path or no store exists yet.";
-        if (bestVerdict === "UNKNOWN") bestVerdict = "NOT_FOUND";
-      } else if (status === 400) {
-        note = "Amazon returned Bad Request (400) — the endpoint exists and accepted the credentials, but needs different parameters.";
-        bestVerdict = "ACCESS_CONFIRMED";
-      }
-
-      details.push({ path, httpStatus: status, note });
+      return { status: response.status, data: response.data };
     } catch (error) {
       const message = axios.isAxiosError(error)
         ? error.message
         : error instanceof Error
           ? error.message
           : "Unknown network error.";
-      details.push({ path, httpStatus: null, note: `Request failed: ${message}` });
       logger.warn("Brand Stores API probe request failed.", { sellerId, path, message });
+      return { status: null, data: { error: message } };
     }
   }
 
-  const verdictMessage =
-    bestVerdict === "ACCESS_CONFIRMED"
-      ? "Good news — your existing Amazon Ads connection already has access to the Brand Stores API. No separate enrollment needed."
-      : bestVerdict === "ACCESS_DENIED"
-        ? "Your existing Amazon Ads connection does NOT have access to the Brand Stores API yet. Amazon requires separate enrollment (their own Ads API onboarding process) before this app could read or manage your Brand Store."
-        : bestVerdict === "NOT_FOUND"
-          ? "Amazon accepted the credentials but returned Not Found for the Brand Stores endpoints tried. This usually means the exact API path has changed again, not that access is blocked — treat this as inconclusive."
-          : "Could not get a conclusive answer from Amazon. See the details below.";
+  // Step 1: does the connected Ads profile see any registered Brand entities at all?
+  const brandsResult = await callPath("/brands");
+  const brands: AmazonBrand[] = Array.isArray(brandsResult.data) ? (brandsResult.data as AmazonBrand[]) : [];
+
+  details.push({
+    path: "/brands",
+    httpStatus: brandsResult.status,
+    note:
+      brandsResult.status === 200
+        ? `Found ${brands.length} brand${brands.length === 1 ? "" : "s"} linked to this Ads profile.`
+        : brandsResult.status === 403
+          ? "Amazon returned Forbidden (403) — this Ads connection cannot see Brand data at all."
+          : brandsResult.status === 404
+            ? "Amazon returned Not Found (404) for /brands — unexpected for a working Ads connection."
+            : `HTTP ${brandsResult.status ?? "request failed"}`
+  });
+
+  // Step 2: list stores under the advertiser (does not require a brandEntityId itself).
+  const storesResult = await callPath("/v2/stores");
+  const storesList = Array.isArray(storesResult.data)
+    ? storesResult.data
+    : storesResult.data && typeof storesResult.data === "object" && Array.isArray((storesResult.data as { stores?: unknown[] }).stores)
+      ? (storesResult.data as { stores: unknown[] }).stores
+      : null;
+
+  details.push({
+    path: "/v2/stores",
+    httpStatus: storesResult.status,
+    note:
+      storesResult.status === 200
+        ? `Amazon returned a successful response${storesList ? ` with ${storesList.length} store${storesList.length === 1 ? "" : "s"}` : ""}.`
+        : storesResult.status === 403
+          ? "Amazon returned Forbidden (403) — Brand Stores access needs separate enrollment."
+          : storesResult.status === 404
+            ? "Amazon returned Not Found (404) — either no store is registered for this advertiser, or this profile isn't the one the Brand Store was published under."
+            : `HTTP ${storesResult.status ?? "request failed"}`
+  });
+
+  let verdict: AmazonAdsStoresProbeResult["verdict"] = "UNKNOWN";
+  let message: string;
+
+  if (brandsResult.status === 403 || storesResult.status === 403) {
+    verdict = "ACCESS_DENIED";
+    message =
+      "Amazon returned Forbidden (403). This Ads connection does not have Brand Stores access yet — it needs separate Amazon enrollment beyond the existing Ads API connection.";
+  } else if (brandsResult.status === 200 && brands.length === 0) {
+    verdict = "PROFILE_NOT_BRAND_LINKED";
+    message =
+      "The connected Amazon Ads profile does not see any registered Brand entities. Your brands may be registered under Brand Registry, but this specific Ads profile/account (the one this app is connected to) isn't linked to them — likely a different Amazon Ads account or profile owns that link. Check which Ads account you connected this app with against which account manages your Brand Store in Seller Central / Amazon Ads console.";
+  } else if (brandsResult.status === 200 && brands.length > 0 && storesResult.status === 200) {
+    verdict = "ACCESS_CONFIRMED";
+    message = `Good news — this Ads connection sees ${brands.length} registered brand${brands.length === 1 ? "" : "s"} (${brands.map((b) => b.brandRegistryName).filter(Boolean).join(", ") || "unnamed"}) and Amazon returned real store data. Brand Store access already works through this connection.`;
+  } else if (brandsResult.status === 200 && brands.length > 0 && storesResult.status === 404) {
+    verdict = "BRAND_LINKED_NO_STORE";
+    message = `This Ads connection does see ${brands.length} registered brand${brands.length === 1 ? "" : "s"} (${brands.map((b) => b.brandRegistryName).filter(Boolean).join(", ") || "unnamed"}), so Brand Registry access is confirmed working. But Amazon returned Not Found when listing actual stores — most likely no Brand Store page has been published/registered for these brands under this specific Ads profile yet (Brand Registry and a published Store are two separate steps in Amazon's system). Worth checking directly in the Amazon Ads console under Brand Store / Stores whether a store has actually been created and published for each brand.`;
+  } else {
+    message = "Could not get a conclusive answer from Amazon. See the details below.";
+  }
 
   return {
     ok: true,
     connected: true,
-    verdict: bestVerdict,
-    message: verdictMessage,
+    verdict,
+    message,
+    brands,
     details
   };
 }
