@@ -1020,7 +1020,17 @@ async function upsertProductPassportsFromListings(sellerId: string, listings: Li
     if (existing) {
       const updateRow: Record<string, unknown> = { updated_at: new Date().toISOString() };
       if (!existing.sku && listing.sku) updateRow.sku = listing.sku;
-      if (!existing.asin && listing.asin) updateRow.asin = listing.asin;
+      // ASIN: always refresh from Amazon's current listings report, the same way
+      // product_name/product_type/price/status/brand already do below. This used to only
+      // backfill the ASIN when the stored value was empty, which let a Product Passport's
+      // ASIN go stale forever once set. findProductPassportForListing() matches this row by
+      // SKU, and Amazon does sometimes attach a new ASIN to an existing SKU over time (a
+      // relist or catalog merge) — so this SKU's own passport row should track whichever
+      // ASIN Amazon currently reports as live for it, not whichever ASIN happened to be
+      // captured the first time this SKU was synced. (First surfaced on SKU DV-R5TL-79KT:
+      // the passport stayed stuck on ASIN B0HFWSFSL1 while Amazon's own listing had already
+      // moved on to B0HJJJ5DN3, and every daily sync kept silently failing to notice.)
+      if (listing.asin && existing.asin !== listing.asin) updateRow.asin = listing.asin;
       // Always refresh these from Amazon's current listings report — this runs
       // automatically in the background now, so a founder never clicks a button to
       // "confirm" it's really time to trust Amazon's data. Only skip overwriting a
