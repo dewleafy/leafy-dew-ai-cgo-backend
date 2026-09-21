@@ -546,6 +546,83 @@ export async function updateProductPassport(input: {
   return toSafeProductPassport(data, await findListingForPassport(data), await findProductMediaForPassport(data));
 }
 
+// The founder confirmed (2026-09-21) that none of their real products need a safety
+// certification, compliance marking, or regulatory audit -- these are ordinary household
+// decor/planter items, not a regulated category. Rather than leave compliance_notes blank
+// forever (which keeps dragging the Brand Readiness Trust Readiness score down for a gap that
+// genuinely doesn't apply), this lets the founder apply one honest, founder-confirmed statement
+// to every eligible product in a single click -- this is deliberately NOT AI-authored text: it
+// is exactly what the founder told Claude directly, so the extraction-only/UNKNOWN-sentinel
+// safety design used for AI-drafted compliance notes elsewhere in this module doesn't apply here.
+const DEFAULT_COMPLIANCE_NOTES_TEXT =
+  "Standard household decor and planter item for everyday home, gifting, and event use. Does not fall under a regulated product category, so no safety certification, compliance marking, or regulatory audit applies.";
+
+export async function bulkApplyStandardComplianceNotes(input: {
+  sellerId: string;
+  text?: string | null;
+}): Promise<{
+  eligibleCount: number;
+  updatedCount: number;
+  failedCount: number;
+  failedIds: string[];
+  textApplied: string;
+}> {
+  const sellerId = cleanText(input.sellerId) ?? "default";
+  const text = cleanText(input.text ?? null) ?? DEFAULT_COMPLIANCE_NOTES_TEXT;
+
+  const { data, error } = await supabase
+    .from("product_passports")
+    .select("id, compliance_notes, status")
+    .eq("seller_id", sellerId);
+
+  if (error) {
+    logProductPassportError("Could not load product passports for bulk compliance notes update.", error);
+    throw new Error("Could not load product passports from Supabase.");
+  }
+
+  const rows = (data ?? []) as Array<{ id: string; compliance_notes: string | null; status: string | null }>;
+  // Only touches products that don't already have compliance notes on file (never overwrites an
+  // existing value, AI-drafted or founder-entered) and skips archived products.
+  const eligible = rows.filter((row) => (!row.compliance_notes || !row.compliance_notes.trim()) && row.status !== "ARCHIVED");
+
+  let updatedCount = 0;
+  const failedIds: string[] = [];
+
+  // Sequential batches (not one giant Promise.all across 150+ rows) so this stays predictable and
+  // easy to reason about -- this is a single founder-triggered click, not a background job.
+  const BATCH_SIZE = 15;
+  for (let i = 0; i < eligible.length; i += BATCH_SIZE) {
+    const batch = eligible.slice(i, i + BATCH_SIZE);
+    const results = await Promise.all(
+      batch.map(async (row) => {
+        const { error: updateError } = await supabase
+          .from("product_passports")
+          .update({ compliance_notes: text, updated_at: new Date().toISOString() })
+          .eq("id", row.id);
+
+        if (updateError) {
+          logProductPassportError(`Could not apply standard compliance notes to product passport ${row.id}.`, updateError);
+        }
+
+        return { id: row.id, ok: !updateError };
+      })
+    );
+
+    for (const result of results) {
+      if (result.ok) updatedCount += 1;
+      else failedIds.push(result.id);
+    }
+  }
+
+  return {
+    eligibleCount: eligible.length,
+    updatedCount,
+    failedCount: failedIds.length,
+    failedIds,
+    textApplied: text
+  };
+}
+
 export async function archiveProductPassport(id: string): Promise<SafeProductPassportRow | null> {
   const existing = await getProductPassportById(id);
 
