@@ -20,7 +20,19 @@ const MAX_AI_CALLS_PER_GENERATION_RUN = 40;
 
 type AiDraftState = { calls: number; limit: number };
 
-type AiDraftType = Extract<ListingDraftType, "TITLE" | "BULLETS" | "DESCRIPTION" | "BRAND_POSITIONING" | "CUSTOMER_OBJECTIONS">;
+type AiDraftType = Extract<
+  ListingDraftType,
+  "TITLE" | "BULLETS" | "DESCRIPTION" | "BRAND_POSITIONING" | "CUSTOMER_OBJECTIONS" | "PACKAGE_CONTENTS" | "COMPLIANCE_NOTES"
+>;
+
+// PACKAGE_CONTENTS and COMPLIANCE_NOTES are extraction-only: the AI is instructed to reply with
+// exactly this sentinel when the given facts don't explicitly state an answer, rather than guess.
+// Unlike BRAND_POSITIONING/CUSTOMER_OBJECTIONS (internal strategy notes, lower stakes if imprecise),
+// these two describe real, factual things about the physical product — inventing a package item or
+// a compliance/safety claim that isn't true is a materially different kind of mistake, so this pair
+// gets a stricter contract: extract only what's already stated, or say so plainly.
+const AI_DRAFT_UNKNOWN_SENTINEL = "UNKNOWN";
+const EXTRACTION_ONLY_DRAFT_TYPES: ReadonlySet<AiDraftType> = new Set(["PACKAGE_CONTENTS", "COMPLIANCE_NOTES"]);
 
 type ProductContext = {
   sellerId: string;
@@ -156,7 +168,19 @@ const AI_DRAFT_INSTRUCTIONS: Record<AiDraftType, string> = {
   BRAND_POSITIONING:
     'Write a short internal brand positioning note (2 to 4 sentences) for this product, using only the facts given below. This is an internal strategy note, not customer-facing copy — it explains how this product fits and supports the brand named below (its style, price tier, and the kind of customer it serves). Do not invent specs, certifications, awards, or claims that are not stated. Do not claim this is the "best" or "#1" anything. Plain text, no HTML, no emojis. Reply with ONLY the note and nothing else.',
   CUSTOMER_OBJECTIONS:
-    'List 3 to 5 realistic reasons a shopper might hesitate before buying this specific product, using only the facts given below (for example: price relative to what is known, uncertainty about size/fit, durability doubts, or unclear use case) — this is an internal strategy note to help improve the listing later, not customer-facing copy. For each one, write one line as "Objection: <the hesitation> — Address by: <a brief, honest way the listing or brand could address it using only known facts>". Do not invent facts, specs, or certifications to resolve an objection with something not stated. Reply with ONLY the numbered-free list, one objection per line, and nothing else.'
+    'List 3 to 5 realistic reasons a shopper might hesitate before buying this specific product, using only the facts given below (for example: price relative to what is known, uncertainty about size/fit, durability doubts, or unclear use case) — this is an internal strategy note to help improve the listing later, not customer-facing copy. For each one, write one line as "Objection: <the hesitation> — Address by: <a brief, honest way the listing or brand could address it using only known facts>". Do not invent facts, specs, or certifications to resolve an objection with something not stated. Reply with ONLY the numbered-free list, one objection per line, and nothing else.',
+  // Extraction-only, not generation: state what the box contains ONLY if the facts below (most
+  // reliably the "Known key features" line, which is this seller's own real, Amazon-synced bullet
+  // point text) already say so explicitly. This is a Product Passport field, not customer-facing —
+  // but it feeds an internal readiness score, so a wrong answer is still worth avoiding.
+  PACKAGE_CONTENTS:
+    `State exactly what is included in the product's package/box, using ONLY the facts given below — most reliably the "Known key features" line, which is this seller's own real, already-published Amazon listing text. List each included item as a short phrase, one per line. Do NOT invent, assume, or add any item, accessory, or quantity that is not explicitly and unambiguously stated in the facts below. If the facts below do not clearly and explicitly state what is included in the package, reply with exactly this one word and nothing else: ${AI_DRAFT_UNKNOWN_SENTINEL}. Otherwise reply with ONLY the package contents list and nothing else.`,
+  // Extraction-only, deliberately the strictest prompt in this file: compliance/safety/regulatory
+  // claims are the one category where a fabricated answer (an invented certification, standard, or
+  // age recommendation) is worse than no answer at all, even though this only ever saves to the
+  // Product Passport and never touches the live Amazon listing.
+  COMPLIANCE_NOTES:
+    `State any safety, regulatory, certification, or age-recommendation information for this product, using ONLY what is explicitly and unambiguously stated in the facts given below — most reliably the "Known key features" line, which is this seller's own real, already-published Amazon listing text. Do NOT invent, assume, imply, or add any certification, standard, safety claim, or age recommendation that is not directly and explicitly stated in the facts below — this includes never inventing things like "BIS certified", "CE marked", "food-grade", "non-toxic", or "ASTM compliant" unless those exact words or a clear, unambiguous equivalent already appear in the facts. If the facts below do not explicitly state any compliance, safety, or regulatory information, reply with exactly this one word and nothing else: ${AI_DRAFT_UNKNOWN_SENTINEL}. Otherwise reply with ONLY the compliance notes and nothing else.`
 };
 
 const AI_DRAFT_MAX_OUTPUT_TOKENS: Record<AiDraftType, number> = {
@@ -164,7 +188,9 @@ const AI_DRAFT_MAX_OUTPUT_TOKENS: Record<AiDraftType, number> = {
   BULLETS: 300,
   DESCRIPTION: 500,
   BRAND_POSITIONING: 220,
-  CUSTOMER_OBJECTIONS: 350
+  CUSTOMER_OBJECTIONS: 350,
+  PACKAGE_CONTENTS: 150,
+  COMPLIANCE_NOTES: 150
 };
 
 async function draftValueWithAi(input: {
@@ -207,7 +233,14 @@ async function draftValueWithAi(input: {
     }
 
     if (result.ok && result.output) {
-      return { value: result.output.trim(), aiCall: true, aiBlockedReason: null };
+      const trimmed = result.output.trim();
+      // Extraction-only types (PACKAGE_CONTENTS/COMPLIANCE_NOTES) are instructed to reply with the
+      // UNKNOWN sentinel rather than guess when the facts don't explicitly support an answer —
+      // treat that exactly like "no usable output", not as a real value to save or show a founder.
+      if (EXTRACTION_ONLY_DRAFT_TYPES.has(input.draftType) && trimmed.toUpperCase() === AI_DRAFT_UNKNOWN_SENTINEL) {
+        return { value: input.fallback, aiCall: true, aiBlockedReason: "AI_COULD_NOT_EXTRACT_FROM_KNOWN_FACTS" };
+      }
+      return { value: trimmed, aiCall: true, aiBlockedReason: null };
     }
 
     return { value: input.fallback, aiCall: false, aiBlockedReason: result.blockedReason ?? "AI_CALL_DID_NOT_RETURN_OUTPUT" };
@@ -321,6 +354,46 @@ async function buildCandidates(
         confidenceLabel: ai.aiCall ? "HIGH" : "LOW",
         riskLevel: "LOW",
         metadata: { existingObjectionCount: customerObjections.length, aiCall: ai.aiCall, aiBlockedReason: ai.aiBlockedReason }
+      });
+    }
+  }
+
+  // Also passport-only, also never go to Amazon — but unlike the two above, these describe real
+  // facts about the physical product rather than internal marketing strategy, so the AI is run in
+  // extraction-only mode (see the PACKAGE_CONTENTS/COMPLIANCE_NOTES prompts above): it may only
+  // restate what's already explicitly stated in this product's own known facts, never invent new
+  // specifics, and returns nothing (not a candidate) when it can't find a grounded answer.
+  const packageContents = cleanText(product.passport?.package_contents);
+  if (!skipTypes.has("PACKAGE_CONTENTS") && !packageContents) {
+    const ai = await draftValueWithAi({ product, draftType: "PACKAGE_CONTENTS", fallback: null, aiState });
+    if (ai.value) {
+      candidates.push({
+        draftType: "PACKAGE_CONTENTS",
+        currentValue: packageContents,
+        proposedValue: ai.value,
+        reason: "Package contents is missing from this product's Product Passport. Extracted only from this product's own known Amazon listing text — verify before approving.",
+        confidenceLabel: ai.aiCall ? "HIGH" : "LOW",
+        riskLevel: "LOW",
+        metadata: { aiCall: ai.aiCall, aiBlockedReason: ai.aiBlockedReason, extractionOnly: true }
+      });
+    }
+  }
+
+  const complianceNotes = cleanText(product.passport?.compliance_notes);
+  if (!skipTypes.has("COMPLIANCE_NOTES") && !complianceNotes) {
+    const ai = await draftValueWithAi({ product, draftType: "COMPLIANCE_NOTES", fallback: null, aiState });
+    if (ai.value) {
+      candidates.push({
+        draftType: "COMPLIANCE_NOTES",
+        currentValue: complianceNotes,
+        proposedValue: ai.value,
+        reason: "Compliance notes is missing from this product's Product Passport. Extracted only from this product's own known Amazon listing text, never invented — verify before approving.",
+        confidenceLabel: ai.aiCall ? "HIGH" : "LOW",
+        // Deliberately flagged MEDIUM (not LOW like the other passport-only fields) so this stands
+        // out for a closer look in the Approval Center — safety/regulatory claims are the one
+        // category here where an approval mistake matters more than a marketing-copy mistake would.
+        riskLevel: "MEDIUM",
+        metadata: { aiCall: ai.aiCall, aiBlockedReason: ai.aiBlockedReason, extractionOnly: true }
       });
     }
   }
@@ -450,6 +523,8 @@ function actionTypeForDraft(draftType: string): ActionLedgerActionType {
   if (draftType === "DESCRIPTION") return "LISTING_DESCRIPTION_DRAFT_REVIEW";
   if (draftType === "BRAND_POSITIONING") return "PASSPORT_BRAND_POSITIONING_DRAFT_REVIEW";
   if (draftType === "CUSTOMER_OBJECTIONS") return "PASSPORT_CUSTOMER_OBJECTIONS_DRAFT_REVIEW";
+  if (draftType === "PACKAGE_CONTENTS") return "PASSPORT_PACKAGE_CONTENTS_DRAFT_REVIEW";
+  if (draftType === "COMPLIANCE_NOTES") return "PASSPORT_COMPLIANCE_NOTES_DRAFT_REVIEW";
   return "LISTING_READINESS_REVIEW";
 }
 
@@ -561,7 +636,16 @@ export async function generateListingDrafts(sellerIdInput: string): Promise<List
   let actionsCreated = 0;
   const aiState: AiDraftState = { calls: 0, limit: MAX_AI_CALLS_PER_GENERATION_RUN };
 
-  const draftTypesToCheck: ListingDraftType[] = ["TITLE", "BULLETS", "BACKEND_KEYWORDS", "DESCRIPTION", "BRAND_POSITIONING", "CUSTOMER_OBJECTIONS"];
+  const draftTypesToCheck: ListingDraftType[] = [
+    "TITLE",
+    "BULLETS",
+    "BACKEND_KEYWORDS",
+    "DESCRIPTION",
+    "BRAND_POSITIONING",
+    "CUSTOMER_OBJECTIONS",
+    "PACKAGE_CONTENTS",
+    "COMPLIANCE_NOTES"
+  ];
 
   for (const product of products) {
     // Check for existing pending duplicates BEFORE generating candidates, so we never spend a
