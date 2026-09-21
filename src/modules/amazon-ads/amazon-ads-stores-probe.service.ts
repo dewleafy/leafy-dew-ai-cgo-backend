@@ -7,17 +7,34 @@ import { AmazonAdsConnection, AmazonAdsRegion, AmazonAdsStoredProfile } from "./
 
 // Read-only diagnostic: does the founder's EXISTING Amazon Ads API access (the
 // "advertising::campaign_management" OAuth scope this app already has) also cover the
-// newer Brand Stores API, or does that require separate Amazon enrollment?
+// Brand Stores API, and can this connection actually pull real Store data back?
 //
-// Amazon's Ads API docs site is a client-rendered SPA that automated fetching cannot read,
-// so path names here come from a real, published open-source Amazon Ads API client
-// (python-amazon-ad-api), not guesswork:
-//   GET /brands              -> list Brand entities (brandId, brandEntityId, brandRegistryName)
-//                                tied to the connected profile. This is the real prerequisite
-//                                call, separate from listing stores themselves.
-//   GET /v2/stores           -> "List store information for all registered stores under an
-//                                advertiser" (no brandEntityId needed for this call).
-// Both are harmless GETs that cannot change anything in the founder's account.
+// History: the original version of this probe called `GET /v2/stores`, which consistently
+// returned 404 even though Brand Registry linkage (/brands) and Sponsored Brands
+// (/sb/v4/campaigns/list) both worked. Amazon's own Ads API support team confirmed by email
+// (2026-09-22, case referencing brandEntityIds ENTITY1MRD6TIID97OP / ENTITY3KKYH518R0DHF):
+// `GET /v2/stores` was permanently deprecated and shut off on 2026-06-01 -- it wasn't an
+// access/enrollment gap, the endpoint itself no longer exists for anyone. The real, current
+// replacement is `POST /brand/stores/v1/storePages/list`.
+//
+// The wrinkle Amazon support flagged: storePages/list needs the STORE's own entity ID
+// (identifierType: ENTITY_ID), which is not always the same as the brandEntityId returned by
+// GET /brands. This account is a SELLER profile (not vendor), so per Amazon support's own
+// instructions, a seller-profile Store has its own separate sub-entity ID that must be looked
+// up first via `POST /brand/stores/v1/stores/list`. Amazon support's documented request shape
+// for both endpoints is `{ "identifier": "<ENTITY_ID value>", "identifierType": "ENTITY_ID" }`.
+//
+// What "identifier" to pass into that first lookup call is the one detail Amazon's email
+// didn't fully pin down for a multi-brand seller account (they said "your profile's advertiser
+// entityId", which is a value this app has never had a confirmed source for). Rather than
+// guess at a single value and risk another silent wrong-endpoint dead end, this probe tries
+// every real, already-known ENTITY_ID-shaped candidate empirically (each brand's own
+// brandEntityId from /brands, since those are confirmed real ENTITY_ID values for this
+// account) and records Amazon's actual raw response for each -- so whichever one works (or the
+// real error Amazon returns for each) becomes concrete evidence, not another guess.
+//
+// All calls here are read-only list/lookup calls and cannot change anything in the founder's
+// account.
 
 const AMAZON_ADS_API_ENDPOINTS: Record<AmazonAdsRegion, string> = {
   NA: "https://advertising-api.amazon.com",
@@ -31,25 +48,39 @@ type AmazonBrand = {
   brandRegistryName?: string;
 };
 
+type ProbeCallDetail = {
+  path: string;
+  method: "GET" | "POST";
+  requestBody?: Record<string, unknown>;
+  httpStatus: number | null;
+  note: string;
+};
+
+type DiscoveredStore = {
+  fromCandidateLabel: string;
+  fromCandidateIdentifier: string;
+  storeEntityId: string;
+  raw: Record<string, unknown>;
+};
+
 export type AmazonAdsStoresProbeResult = {
   ok: true;
   connected: boolean;
   message: string;
   verdict:
     | "ACCESS_CONFIRMED"
+    | "STORE_ID_FOUND_PAGES_BLOCKED"
+    | "STORES_LIST_NEEDS_FOLLOWUP"
     | "SPONSORED_BRANDS_NOT_ENABLED"
-    | "STORES_SPECIFIC_BLOCK"
     | "BRAND_LINKED_NO_STORE"
     | "PROFILE_NOT_BRAND_LINKED"
     | "ACCESS_DENIED"
     | "NO_CONNECTION"
     | "UNKNOWN";
   brands: AmazonBrand[];
-  details: Array<{
-    path: string;
-    httpStatus: number | null;
-    note: string;
-  }>;
+  discoveredStores: DiscoveredStore[];
+  storePages: Array<{ storeEntityId: string; httpStatus: number | null; pageCount: number | null; raw: unknown }>;
+  details: ProbeCallDetail[];
 };
 
 async function loadAmazonAdsProbeContext(sellerId: string): Promise<
@@ -86,6 +117,29 @@ async function loadAmazonAdsProbeContext(sellerId: string): Promise<
   return { ok: true, connection, profile };
 }
 
+function extractEntityIdCandidates(source: unknown, seen: Set<string>): string[] {
+  const found: string[] = [];
+
+  function walk(value: unknown): void {
+    if (!value) return;
+    if (typeof value === "string" && /^ENTITY[A-Z0-9]{6,}$/i.test(value) && !seen.has(value)) {
+      seen.add(value);
+      found.push(value);
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach(walk);
+      return;
+    }
+    if (typeof value === "object") {
+      Object.values(value as Record<string, unknown>).forEach(walk);
+    }
+  }
+
+  walk(source);
+  return found;
+}
+
 export async function probeBrandStoresApiAccess(sellerId: string): Promise<AmazonAdsStoresProbeResult> {
   const context = await loadAmazonAdsProbeContext(sellerId);
 
@@ -96,20 +150,22 @@ export async function probeBrandStoresApiAccess(sellerId: string): Promise<Amazo
       verdict: "NO_CONNECTION",
       message: context.message,
       brands: [],
+      discoveredStores: [],
+      storePages: [],
       details: []
     };
   }
 
   const accessToken = await getAmazonAdsAccessToken(context.connection.id);
   const host = AMAZON_ADS_API_ENDPOINTS[context.connection.region];
-  const details: AmazonAdsStoresProbeResult["details"] = [];
+  const details: ProbeCallDetail[] = [];
   const baseHeaders = {
     Authorization: `Bearer ${accessToken}`,
     "Amazon-Advertising-API-ClientId": process.env.AMAZON_ADS_CLIENT_ID ?? "",
     "Amazon-Advertising-API-Scope": context.profile.profile_id
   };
 
-  async function callPath(path: string): Promise<{ status: number | null; data: unknown }> {
+  async function callGet(path: string): Promise<{ status: number | null; data: unknown }> {
     try {
       const response = await axios.get(`${host}${path}`, {
         headers: baseHeaders,
@@ -118,126 +174,193 @@ export async function probeBrandStoresApiAccess(sellerId: string): Promise<Amazo
       });
       return { status: response.status, data: response.data };
     } catch (error) {
-      const message = axios.isAxiosError(error)
-        ? error.message
-        : error instanceof Error
-          ? error.message
-          : "Unknown network error.";
-      logger.warn("Brand Stores API probe request failed.", { sellerId, path, message });
+      const message = axios.isAxiosError(error) ? error.message : error instanceof Error ? error.message : "Unknown network error.";
+      logger.warn("Brand Stores API probe GET failed.", { sellerId, path, message });
       return { status: null, data: { error: message } };
     }
   }
 
-  // Sponsored Brands campaigns list (POST is Amazon's pattern for this "list/search" call,
-  // not a mutation — an empty body just means "return everything"). This tells us whether the
-  // Sponsored Brands product itself is enabled for this profile at all, since Amazon's own
-  // Stores API lives under the Sponsored Brands product family alongside campaigns.
-  async function callSponsoredBrandsCampaignsList(): Promise<{ status: number | null; data: unknown }> {
+  async function callPost(path: string, body: Record<string, unknown>, acceptHeader?: string): Promise<{ status: number | null; data: unknown }> {
     try {
-      const response = await axios.post(
-        `${host}/sb/v4/campaigns/list`,
-        {},
-        {
-          headers: { ...baseHeaders, Accept: "application/vnd.sbcampaignresource.v4+json" },
-          validateStatus: () => true,
-          timeout: 15000
-        }
-      );
+      const response = await axios.post(`${host}${path}`, body, {
+        headers: acceptHeader ? { ...baseHeaders, Accept: acceptHeader } : baseHeaders,
+        validateStatus: () => true,
+        timeout: 15000
+      });
       return { status: response.status, data: response.data };
     } catch (error) {
-      const message = axios.isAxiosError(error)
-        ? error.message
-        : error instanceof Error
-          ? error.message
-          : "Unknown network error.";
-      logger.warn("Sponsored Brands campaigns probe request failed.", { sellerId, message });
+      const message = axios.isAxiosError(error) ? error.message : error instanceof Error ? error.message : "Unknown network error.";
+      logger.warn("Brand Stores API probe POST failed.", { sellerId, path, message });
       return { status: null, data: { error: message } };
     }
   }
 
   // Step 1: does the connected Ads profile see any registered Brand entities at all?
-  const brandsResult = await callPath("/brands");
+  const brandsResult = await callGet("/brands");
   const brands: AmazonBrand[] = Array.isArray(brandsResult.data) ? (brandsResult.data as AmazonBrand[]) : [];
 
   details.push({
     path: "/brands",
+    method: "GET",
     httpStatus: brandsResult.status,
     note:
       brandsResult.status === 200
         ? `Found ${brands.length} brand${brands.length === 1 ? "" : "s"} linked to this Ads profile.`
         : brandsResult.status === 403
-          ? "Amazon returned Forbidden (403) — this Ads connection cannot see Brand data at all."
+          ? "Amazon returned Forbidden (403) -- this Ads connection cannot see Brand data at all."
           : brandsResult.status === 404
-            ? "Amazon returned Not Found (404) for /brands — unexpected for a working Ads connection."
+            ? "Amazon returned Not Found (404) for /brands -- unexpected for a working Ads connection."
             : `HTTP ${brandsResult.status ?? "request failed"}`
   });
 
-  // Step 2: list stores under the advertiser (does not require a brandEntityId itself).
-  const storesResult = await callPath("/v2/stores");
-  const storesList = Array.isArray(storesResult.data)
-    ? storesResult.data
-    : storesResult.data && typeof storesResult.data === "object" && Array.isArray((storesResult.data as { stores?: unknown[] }).stores)
-      ? (storesResult.data as { stores: unknown[] }).stores
-      : null;
+  if (brandsResult.status === 403) {
+    return {
+      ok: true,
+      connected: true,
+      verdict: "ACCESS_DENIED",
+      message: "Amazon returned Forbidden (403) on /brands. This Ads connection does not have Brand-linked access yet.",
+      brands: [],
+      discoveredStores: [],
+      storePages: [],
+      details
+    };
+  }
 
-  details.push({
-    path: "/v2/stores",
-    httpStatus: storesResult.status,
-    note:
-      storesResult.status === 200
-        ? `Amazon returned a successful response${storesList ? ` with ${storesList.length} store${storesList.length === 1 ? "" : "s"}` : ""}.`
-        : storesResult.status === 403
-          ? "Amazon returned Forbidden (403) — Brand Stores access needs separate enrollment."
-          : storesResult.status === 404
-            ? "Amazon returned Not Found (404) — either no store is registered for this advertiser, or this profile isn't the one the Brand Store was published under."
-            : `HTTP ${storesResult.status ?? "request failed"}`
-  });
+  if (brandsResult.status === 200 && brands.length === 0) {
+    return {
+      ok: true,
+      connected: true,
+      verdict: "PROFILE_NOT_BRAND_LINKED",
+      message:
+        "The connected Amazon Ads profile does not see any registered Brand entities. Your brands may be registered under Brand Registry, but this specific Ads profile/account isn't linked to them.",
+      brands: [],
+      discoveredStores: [],
+      storePages: [],
+      details
+    };
+  }
 
-  let verdict: AmazonAdsStoresProbeResult["verdict"] = "UNKNOWN";
-  let message: string;
+  // Step 2 (per Amazon Ads API support, case 2026-09-22): GET /v2/stores was permanently
+  // deprecated and shut off 2026-06-01 -- it is no longer called here at all. The real path is
+  // POST /brand/stores/v1/stores/list, which needs an ENTITY_ID identifier to look up each
+  // Store's own entity id (a seller-profile Store's id is a separate sub-entity, not
+  // necessarily the same as the brandEntityId from /brands). Every already-known, confirmed-
+  // real ENTITY_ID on this account -- each brand's own brandEntityId -- is tried as a candidate
+  // identifier, and Amazon's real raw response for each is recorded.
+  const candidates = brands
+    .filter((brand) => typeof brand.brandEntityId === "string" && brand.brandEntityId.trim())
+    .map((brand) => ({
+      label: brand.brandRegistryName ?? brand.brandEntityId ?? "unknown brand",
+      identifier: brand.brandEntityId as string
+    }));
 
-  // Only bother checking Sponsored Brands enablement if the simple explanations (no brand
-  // link, outright 403) don't already answer it — this call costs a real API round trip.
-  let sbCampaignsResult: { status: number | null; data: unknown } | null = null;
+  const seenEntityIds = new Set<string>();
+  const discoveredStores: DiscoveredStore[] = [];
 
-  if (brandsResult.status === 403 || storesResult.status === 403) {
-    verdict = "ACCESS_DENIED";
-    message =
-      "Amazon returned Forbidden (403). This Ads connection does not have Brand Stores access yet — it needs separate Amazon enrollment beyond the existing Ads API connection.";
-  } else if (brandsResult.status === 200 && brands.length === 0) {
-    verdict = "PROFILE_NOT_BRAND_LINKED";
-    message =
-      "The connected Amazon Ads profile does not see any registered Brand entities. Your brands may be registered under Brand Registry, but this specific Ads profile/account (the one this app is connected to) isn't linked to them — likely a different Amazon Ads account or profile owns that link. Check which Ads account you connected this app with against which account manages your Brand Store in Seller Central / Amazon Ads console.";
-  } else if (brandsResult.status === 200 && brands.length > 0 && storesResult.status === 200) {
-    verdict = "ACCESS_CONFIRMED";
-    message = `Good news — this Ads connection sees ${brands.length} registered brand${brands.length === 1 ? "" : "s"} (${brands.map((b) => b.brandRegistryName).filter(Boolean).join(", ") || "unnamed"}) and Amazon returned real store data. Brand Store access already works through this connection.`;
-  } else if (brandsResult.status === 200 && brands.length > 0 && storesResult.status === 404) {
-    // Brand Registry is confirmed linked, but the "list all stores" call still says Not Found.
-    // If the founder has confirmed the Store pages are actually live, this 404 is not about
-    // whether a Store exists — check whether Sponsored Brands (the product family this
-    // endpoint lives under) is enabled at all for this profile, which narrows it further.
-    sbCampaignsResult = await callSponsoredBrandsCampaignsList();
-
-    details.push({
-      path: "/sb/v4/campaigns/list",
-      httpStatus: sbCampaignsResult.status,
-      note:
-        sbCampaignsResult.status === 200
-          ? "Sponsored Brands campaigns are reachable through this profile — Sponsored Brands itself is enabled."
-          : sbCampaignsResult.status === 403 || sbCampaignsResult.status === 404
-            ? `Amazon returned ${sbCampaignsResult.status} for Sponsored Brands campaigns too — Sponsored Brands does not appear enabled for this profile.`
-            : `HTTP ${sbCampaignsResult.status ?? "request failed"}`
+  for (const candidate of candidates) {
+    const result = await callPost("/brand/stores/v1/stores/list", {
+      identifier: candidate.identifier,
+      identifierType: "ENTITY_ID"
     });
 
-    if (sbCampaignsResult.status === 200) {
-      verdict = "STORES_SPECIFIC_BLOCK";
-      message = `This Ads connection sees ${brands.length} registered brand${brands.length === 1 ? "" : "s"} (${brands.map((b) => b.brandRegistryName).filter(Boolean).join(", ") || "unnamed"}), and Sponsored Brands campaigns work fine through this same profile — so the product family isn't disabled. Yet the Stores "list all" endpoint still returns Not Found. Since you've confirmed both Store pages are actually live on Amazon, this points to the Stores API listing endpoint itself being restricted or requiring a separate access grant beyond standard Sponsored Brands access — this is the kind of thing that needs an Amazon Ads API support case (via the Advertising API developer console) referencing brandEntityIds ${brands.map((b) => b.brandEntityId).filter(Boolean).join(", ")}, since no public documentation covers this gap.`;
-    } else {
-      verdict = "SPONSORED_BRANDS_NOT_ENABLED";
-      message = `This Ads connection sees ${brands.length} registered brand${brands.length === 1 ? "" : "s"} (${brands.map((b) => b.brandRegistryName).filter(Boolean).join(", ") || "unnamed"}) — Brand Registry linkage works. But Sponsored Brands campaigns ALSO return Not Found/Forbidden through this same profile, not just Stores. This strongly suggests the Sponsored Brands advertising product itself has never been activated for this Ads account (this app has so far only ever used Sponsored Products), and the Stores API lives under that same product family. Even though your Store pages are live on Amazon (published through Brand Registry / Store Builder, which is separate from the Ads product), the Ads API can't see them until Sponsored Brands is enabled for this advertiser account. Check Seller Central / Amazon Ads console for a "Sponsored Brands" or "enable this campaign type" prompt on this account.`;
+    details.push({
+      path: "/brand/stores/v1/stores/list",
+      method: "POST",
+      requestBody: { identifier: candidate.identifier, identifierType: "ENTITY_ID" },
+      httpStatus: result.status,
+      note:
+        result.status === 200
+          ? `Lookup using ${candidate.label}'s brandEntityId (${candidate.identifier}) succeeded.`
+          : `Lookup using ${candidate.label}'s brandEntityId (${candidate.identifier}) returned HTTP ${result.status ?? "request failed"}: ${JSON.stringify(result.data).slice(0, 300)}`
+    });
+
+    if (result.status === 200) {
+      const foundIds = extractEntityIdCandidates(result.data, seenEntityIds);
+      for (const storeEntityId of foundIds) {
+        discoveredStores.push({
+          fromCandidateLabel: candidate.label,
+          fromCandidateIdentifier: candidate.identifier,
+          storeEntityId,
+          raw: (result.data as Record<string, unknown>) ?? {}
+        });
+      }
     }
+  }
+
+  // Step 3: for every distinct store entity id actually discovered, fetch its real store pages.
+  const storePages: AmazonAdsStoresProbeResult["storePages"] = [];
+  for (const store of discoveredStores) {
+    const result = await callPost("/brand/stores/v1/storePages/list", {
+      identifier: store.storeEntityId,
+      identifierType: "ENTITY_ID"
+    });
+
+    const pageCount = Array.isArray(result.data)
+      ? result.data.length
+      : result.data && typeof result.data === "object" && Array.isArray((result.data as { storePages?: unknown[] }).storePages)
+        ? (result.data as { storePages: unknown[] }).storePages.length
+        : null;
+
+    details.push({
+      path: "/brand/stores/v1/storePages/list",
+      method: "POST",
+      requestBody: { identifier: store.storeEntityId, identifierType: "ENTITY_ID" },
+      httpStatus: result.status,
+      note:
+        result.status === 200
+          ? `Store pages fetched for entity ${store.storeEntityId} (from ${store.fromCandidateLabel}) -- ${pageCount ?? "unknown"} page(s).`
+          : `Store pages lookup for entity ${store.storeEntityId} returned HTTP ${result.status ?? "request failed"}: ${JSON.stringify(result.data).slice(0, 300)}`
+    });
+
+    storePages.push({ storeEntityId: store.storeEntityId, httpStatus: result.status, pageCount, raw: result.data });
+  }
+
+  // Fallback: if brandEntityId candidates found no store ids at all, also try each brand's
+  // brandEntityId directly against storePages/list -- some accounts may not have a separate
+  // store sub-entity and the brandEntityId itself is already the right identifier.
+  if (discoveredStores.length === 0) {
+    for (const candidate of candidates) {
+      const result = await callPost("/brand/stores/v1/storePages/list", {
+        identifier: candidate.identifier,
+        identifierType: "ENTITY_ID"
+      });
+
+      const pageCount = Array.isArray(result.data)
+        ? result.data.length
+        : result.data && typeof result.data === "object" && Array.isArray((result.data as { storePages?: unknown[] }).storePages)
+          ? (result.data as { storePages: unknown[] }).storePages.length
+          : null;
+
+      details.push({
+        path: "/brand/stores/v1/storePages/list",
+        method: "POST",
+        requestBody: { identifier: candidate.identifier, identifierType: "ENTITY_ID" },
+        httpStatus: result.status,
+        note:
+          result.status === 200
+            ? `Direct storePages lookup using ${candidate.label}'s brandEntityId succeeded -- ${pageCount ?? "unknown"} page(s).`
+            : `Direct storePages lookup using ${candidate.label}'s brandEntityId returned HTTP ${result.status ?? "request failed"}: ${JSON.stringify(result.data).slice(0, 300)}`
+      });
+
+      storePages.push({ storeEntityId: candidate.identifier, httpStatus: result.status, pageCount, raw: result.data });
+    }
+  }
+
+  const successfulPages = storePages.filter((p) => p.httpStatus === 200);
+  const brandNames = brands.map((b) => b.brandRegistryName).filter(Boolean).join(", ") || "unnamed";
+
+  let verdict: AmazonAdsStoresProbeResult["verdict"];
+  let message: string;
+
+  if (successfulPages.length > 0) {
+    verdict = "ACCESS_CONFIRMED";
+    message = `Real Brand Store page data was retrieved for ${successfulPages.length} store${successfulPages.length === 1 ? "" : "s"} across ${brandNames}. The Amazon-support-confirmed replacement endpoint (POST /brand/stores/v1/storePages/list) works through this connection.`;
+  } else if (discoveredStores.length > 0) {
+    verdict = "STORE_ID_FOUND_PAGES_BLOCKED";
+    message = `Found ${discoveredStores.length} store entity id(s) via /brand/stores/v1/stores/list, but the follow-up storePages/list call did not return 200 for any of them. See "details" below for Amazon's exact error on each -- worth forwarding back to the same Amazon Ads API support case for a precise follow-up.`;
   } else {
-    message = "Could not get a conclusive answer from Amazon. See the details below.";
+    verdict = "STORES_LIST_NEEDS_FOLLOWUP";
+    message = `Could not discover a working store entity id for ${brandNames} using either /brand/stores/v1/stores/list or a direct storePages/list attempt with each brand's brandEntityId. See "details" below for Amazon's exact raw response on each attempt -- this is the concrete evidence to send back to the Amazon Ads API support case, since the "advertiser entityId" Amazon's reply referenced wasn't something this app had a confirmed source for.`;
   }
 
   return {
@@ -246,6 +369,8 @@ export async function probeBrandStoresApiAccess(sellerId: string): Promise<Amazo
     verdict,
     message,
     brands,
+    discoveredStores,
+    storePages,
     details
   };
 }
