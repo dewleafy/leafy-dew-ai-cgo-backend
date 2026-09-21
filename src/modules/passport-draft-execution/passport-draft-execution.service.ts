@@ -13,12 +13,19 @@ import {
 
 const ACTION_ID_REGEX = /^[0-9a-f-]{8,64}$/i;
 
-const ELIGIBLE_ACTION_TYPES = ["PASSPORT_BRAND_POSITIONING_DRAFT_REVIEW", "PASSPORT_CUSTOMER_OBJECTIONS_DRAFT_REVIEW"] as const;
+const ELIGIBLE_ACTION_TYPES = [
+  "PASSPORT_BRAND_POSITIONING_DRAFT_REVIEW",
+  "PASSPORT_CUSTOMER_OBJECTIONS_DRAFT_REVIEW",
+  "PASSPORT_PACKAGE_CONTENTS_DRAFT_REVIEW",
+  "PASSPORT_COMPLIANCE_NOTES_DRAFT_REVIEW"
+] as const;
 
 // Maps this app's internal passport-draft type onto the real product_passports column it fills in.
 const PASSPORT_COLUMN_BY_DRAFT_TYPE: Record<PassportDraftFieldType, string> = {
   BRAND_POSITIONING: "brand_positioning",
-  CUSTOMER_OBJECTIONS: "customer_objections"
+  CUSTOMER_OBJECTIONS: "customer_objections",
+  PACKAGE_CONTENTS: "package_contents",
+  COMPLIANCE_NOTES: "compliance_notes"
 };
 
 function cleanTextLocal(value: unknown): string {
@@ -87,7 +94,7 @@ export async function executePassportDraftAction(input: {
   if (!isEligible) {
     throw new PassportDraftExecutionError(
       400,
-      "This action is not a brand positioning or customer objections draft, so it cannot be saved to the Product Passport here. Use the regular Approve button instead."
+      "This action is not a brand positioning, customer objections, package contents, or compliance notes draft, so it cannot be saved to the Product Passport here. Use the regular Approve button instead."
     );
   }
 
