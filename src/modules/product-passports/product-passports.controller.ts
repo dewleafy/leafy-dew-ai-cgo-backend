@@ -2,6 +2,7 @@ import { Request, Response } from "express";
 import { z } from "zod";
 import {
   archiveProductPassport,
+  bulkApplyStandardComplianceNotes,
   createProductPassport,
   getProductPassportById,
   isProductPassportStatus,
@@ -217,6 +218,22 @@ export async function postProductPassport(req: Request, res: Response): Promise<
       message: error instanceof Error ? error.message : "Could not create product passport.",
       safeHint: "Check product_passports table and unique seller SKU/ASIN values."
     });
+  }
+}
+
+// Founder-triggered, one-click bulk write -- deliberately separate from the AI drafting/Approval
+// Center pipeline (see EXTRACTION_ONLY_DRAFT_TYPES in listing-drafts.service.ts). This never
+// invents anything: it saves back the exact statement the founder confirmed in chat, and only
+// touches products that don't already have a compliance_notes value.
+export async function postProductPassportBulkComplianceNotesRoute(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+  const rawText = typeof (req.body as { text?: unknown } | undefined)?.text === "string" ? (req.body as { text: string }).text : undefined;
+
+  try {
+    const result = await bulkApplyStandardComplianceNotes({ sellerId, text: rawText });
+    res.json({ ok: true, sellerId, ...result });
+  } catch (error) {
+    sendDatabaseError(res, error instanceof Error ? error.message : "Could not apply compliance notes in bulk.");
   }
 }
 
