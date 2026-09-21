@@ -1,242 +1,218 @@
-import { supabase } from "../../db/supabase";
-import { logger } from "../../utils/logger";
-import { getActionLedgerById } from "../action-ledger/action-ledger.service";
-import { transitionActionState } from "../action-ledger/action-workflow.service";
-import { safeRecordActivityLog } from "../activity-logs/activity-logs.service";
-import {
-  PassportDraftBatchExecutionResult,
-  PassportDraftBatchItemResult,
-  PassportDraftExecutionError,
-  PassportDraftExecutionResult,
-  PassportDraftFieldType
-} from "./passport-draft-execution.types";
+export type ActionLedgerSource =
+  | "CEO_REPORT"
+  | "PPC_RECOMMENDATION"
+  | "PPC_RECOMMENDATIONS"
+  | "PRODUCT_ECONOMICS"
+  | "LISTING_AI"
+  | "A_PLUS_AI"
+  | "IMAGE_AI"
+  | "BRAND_STORE_AI"
+  | "SOCIAL_AI"
+  | "ENGINE_ROUTER"
+  | "LISTING_DRAFT_SYSTEM"
+  | "CREATIVE_RECOMMENDATION_SYSTEM"
+  | "SYSTEM";
 
-const ACTION_ID_REGEX = /^[0-9a-f-]{8,64}$/i;
+export type ActionLedgerActionType =
+  | "PPC_ACTION"
+  | "ADD_EXACT_KEYWORD_AFTER_APPROVAL"
+  | "ADD_PRODUCT_TARGET_AFTER_APPROVAL"
+  | "PAUSE_WASTEFUL_TARGET_AFTER_APPROVAL"
+  | "REDUCE_BID_AFTER_APPROVAL"
+  | "INCREASE_BID_AFTER_APPROVAL"
+  | "NEGATE_SEARCH_TERM_AFTER_APPROVAL"
+  | "PPC_BUDGET_GUARDRAIL_REVIEW"
+  | "CHECK_LISTING_BEFORE_NEGATIVE"
+  | "PAUSE_OR_REDUCE_SPEND_AFTER_APPROVAL"
+  | "PPC_GUARDRAIL_REVIEW"
+  | "PROFIT_BAND_APPROVAL"
+  | "COST_DATA_REQUIRED"
+  | "PROFIT_RISK_REVIEW"
+  | "ACCOUNT_HEALTH_REVIEW"
+  | "LISTING_READINESS_REVIEW"
+  | "LISTING_SEO_REVIEW"
+  | "LISTING_CONVERSION_REVIEW"
+  | "PRICING_REVIEW"
+  | "INVENTORY_RISK_REVIEW"
+  | "LISTING_TITLE_DRAFT_REVIEW"
+  | "LISTING_BULLETS_DRAFT_REVIEW"
+  | "LISTING_BACKEND_KEYWORDS_DRAFT_REVIEW"
+  | "LISTING_DESCRIPTION_DRAFT_REVIEW"
+  | "PASSPORT_BRAND_POSITIONING_DRAFT_REVIEW"
+  | "PASSPORT_CUSTOMER_OBJECTIONS_DRAFT_REVIEW"
+  | "PASSPORT_PACKAGE_CONTENTS_DRAFT_REVIEW"
+  | "PASSPORT_COMPLIANCE_NOTES_DRAFT_REVIEW"
+  | "IMAGE_CREATIVE_REVIEW"
+  | "A_PLUS_CONTENT_REVIEW"
+  | "LISTING_UPDATE"
+  | "IMAGE_UPDATE"
+  | "A_PLUS_UPDATE"
+  | "BRAND_STORE_UPDATE"
+  | "SOCIAL_POST"
+  | "COST_DATA_UPDATE"
+  | "SYNC_JOB"
+  | "OTHER";
 
-const ELIGIBLE_ACTION_TYPES = [
-  "PASSPORT_BRAND_POSITIONING_DRAFT_REVIEW",
-  "PASSPORT_CUSTOMER_OBJECTIONS_DRAFT_REVIEW",
-  "PASSPORT_PACKAGE_CONTENTS_DRAFT_REVIEW",
-  "PASSPORT_COMPLIANCE_NOTES_DRAFT_REVIEW"
-] as const;
+export type ActionLedgerEntityType =
+  | "SKU"
+  | "ASIN"
+  | "KEYWORD"
+  | "CAMPAIGN"
+  | "AD_GROUP"
+  | "SEARCH_TERM"
+  | "BRAND_STORE"
+  | "SOCIAL_CHANNEL"
+  | "ACCOUNT";
 
-// Maps this app's internal passport-draft type onto the real product_passports column it fills in.
-const PASSPORT_COLUMN_BY_DRAFT_TYPE: Record<PassportDraftFieldType, string> = {
-  BRAND_POSITIONING: "brand_positioning",
-  CUSTOMER_OBJECTIONS: "customer_objections",
-  PACKAGE_CONTENTS: "package_contents",
-  COMPLIANCE_NOTES: "compliance_notes"
+export type ActionLedgerRiskLevel = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
+export type ActionLedgerConfidenceLabel = "LOW" | "MEDIUM" | "HIGH";
+export type ActionLedgerApprovalTier = "TIER_1" | "TIER_2" | "TIER_3" | "FOUNDER_OVERRIDE";
+
+export type ActionLedgerState =
+  | "DRAFTED"
+  | "DATA_CHECKED"
+  | "VALIDATED"
+  | "WAITING_FOR_APPROVAL"
+  | "APPROVED"
+  | "REJECTED"
+  | "MONITOR"
+  | "MONITORING"
+  | "SUBMITTED"
+  | "PROCESSING"
+  | "LIVE_VERIFIED"
+  | "COMPLETED"
+  | "FAILED"
+  | "AUTO_REPAIRING"
+  | "NEEDS_FOUNDER_INPUT"
+  | "ROLLBACK_SUGGESTED"
+  | "ROLLED_BACK"
+  | "CLOSED";
+
+export type ActionLedgerApprovalStatus = "PENDING" | "APPROVED" | "REJECTED" | "MONITOR" | "COMPLETED" | "EXPIRED";
+
+export type ActionLedgerRow = {
+  id: string;
+  seller_id: string;
+  source: ActionLedgerSource | string;
+  source_id: string | null;
+  action_type: ActionLedgerActionType | string;
+  entity_type: ActionLedgerEntityType | string | null;
+  entity_id: string | null;
+  sku: string | null;
+  asin: string | null;
+  title: string;
+  summary: string | null;
+  recommended_action: string | null;
+  expected_profit_impact: number | string | null;
+  expected_sales_impact: number | string | null;
+  expected_brand_impact: number | string | null;
+  risk_level: ActionLedgerRiskLevel | string;
+  confidence_label: ActionLedgerConfidenceLabel | string;
+  approval_tier: ActionLedgerApprovalTier | string;
+  requires_approval: boolean;
+  state: ActionLedgerState | string;
+  approval_status: ActionLedgerApprovalStatus | string;
+  payload: Record<string, unknown> | null;
+  evidence: Record<string, unknown> | null;
+  guardrails: Record<string, unknown> | null;
+  rollback_snapshot: Record<string, unknown> | null;
+  approval_note: string | null;
+  approved_by: string | null;
+  approved_at: string | null;
+  rejected_at: string | null;
+  created_at: string | null;
+  updated_at: string | null;
 };
 
-function cleanTextLocal(value: unknown): string {
-  return typeof value === "string" ? value.trim() : value == null ? "" : String(value).trim();
-}
+export type ActionLedgerInput = {
+  sellerId?: string;
+  source: ActionLedgerSource;
+  sourceId?: string | null;
+  actionType: ActionLedgerActionType;
+  entityType?: ActionLedgerEntityType | null;
+  entityId?: string | null;
+  sku?: string | null;
+  asin?: string | null;
+  title: string;
+  summary?: string | null;
+  recommendedAction?: string | null;
+  expectedProfitImpact?: number | null;
+  expectedSalesImpact?: number | null;
+  expectedBrandImpact?: number | null;
+  riskLevel?: ActionLedgerRiskLevel;
+  confidenceLabel?: ActionLedgerConfidenceLabel;
+  approvalTier?: ActionLedgerApprovalTier;
+  requiresApproval?: boolean;
+  state?: ActionLedgerState;
+  approvalStatus?: ActionLedgerApprovalStatus;
+  payload?: Record<string, unknown>;
+  evidence?: Record<string, unknown>;
+  guardrails?: Record<string, unknown>;
+  rollbackSnapshot?: Record<string, unknown> | null;
+};
 
-// The AI drafts customer objections as one "Objection: ... — Address by: ..." line per
-// objection (see listing-drafts.service.ts's CUSTOMER_OBJECTIONS prompt). Split back into a
-// plain array of strings for the jsonb customer_objections column.
-function parseCustomerObjections(proposedValue: string): string[] {
-  return proposedValue
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
-}
-
-async function findPassportRowId(input: { sellerId: string; sku: string | null; asin: string | null }): Promise<string | null> {
-  if (input.sku) {
-    const { data } = await supabase
-      .from("product_passports")
-      .select("id")
-      .eq("seller_id", input.sellerId)
-      .eq("sku", input.sku)
-      .maybeSingle<{ id: string }>();
-    if (data?.id) return data.id;
-  }
-
-  if (input.asin) {
-    const { data } = await supabase
-      .from("product_passports")
-      .select("id")
-      .eq("seller_id", input.sellerId)
-      .eq("asin", input.asin)
-      .maybeSingle<{ id: string }>();
-    if (data?.id) return data.id;
-  }
-
-  return null;
-}
-
-export async function executePassportDraftAction(input: {
+export type SafeActionLedgerRow = {
+  id: string;
   sellerId: string;
-  actionId: string;
-  actor?: string | null;
-}): Promise<PassportDraftExecutionResult> {
-  const sellerId = cleanTextLocal(input.sellerId) || "default";
-  const actor = cleanTextLocal(input.actor) || "founder";
-  const actionId = cleanTextLocal(input.actionId);
+  source: string;
+  sourceId: string | null;
+  actionType: string;
+  entityType: string | null;
+  entityId: string | null;
+  sku: string | null;
+  asin: string | null;
+  // Real product photo URL for this row's SKU/ASIN, looked up from Product Passport image
+  // data at read time (see getProductImageLookup() in product-passports.service.ts) so
+  // Approval Center and AI Actions cards can show a real thumbnail instead of a generic icon.
+  // Null when no image is on file for this product yet.
+  imageUrl: string | null;
+  title: string;
+  summary: string | null;
+  recommendedAction: string | null;
+  expectedProfitImpact: number | null;
+  expectedSalesImpact: number | null;
+  expectedBrandImpact: number | null;
+  riskLevel: string;
+  confidenceLabel: string;
+  approvalTier: string;
+  requiresApproval: boolean;
+  state: string;
+  approvalStatus: string;
+  payload: Record<string, unknown>;
+  evidence: Record<string, unknown>;
+  guardrails: Record<string, unknown>;
+  rollbackSnapshot: Record<string, unknown> | null;
+  approvalNote: string | null;
+  approvedBy: string | null;
+  approvedAt: string | null;
+  rejectedAt: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+};
 
-  if (!actionId || !ACTION_ID_REGEX.test(actionId)) {
-    throw new PassportDraftExecutionError(400, "Invalid action id.");
-  }
+export type ActionLedgerSummary = {
+  pendingCount: number;
+  approvedCount: number;
+  rejectedCount: number;
+  monitoringCount: number;
+  completedCount: number;
+  highRiskCount: number;
+  founderOverrideCount: number;
+  latestActions: SafeActionLedgerRow[];
+};
 
-  const row = await getActionLedgerById(actionId);
-
-  if (!row) {
-    throw new PassportDraftExecutionError(404, "Action ledger row not found.");
-  }
-
-  if (row.sellerId !== sellerId) {
-    throw new PassportDraftExecutionError(404, "Action ledger row not found for this seller.");
-  }
-
-  const isEligible = row.source === "LISTING_DRAFT_SYSTEM" && (ELIGIBLE_ACTION_TYPES as readonly string[]).includes(row.actionType);
-
-  if (!isEligible) {
-    throw new PassportDraftExecutionError(
-      400,
-      "This action is not a brand positioning, customer objections, package contents, or compliance notes draft, so it cannot be saved to the Product Passport here. Use the regular Approve button instead."
-    );
-  }
-
-  if (row.state !== "WAITING_FOR_APPROVAL") {
-    throw new PassportDraftExecutionError(400, `This action is already ${row.state}. Reopen it first if you need to approve it again.`);
-  }
-
-  const payload = row.payload ?? {};
-  const draftType = cleanTextLocal(payload.draftType) as PassportDraftFieldType;
-  const proposedValue = cleanTextLocal(payload.proposedValue);
-  const sku = cleanTextLocal(row.sku) || null;
-  const asin = cleanTextLocal(row.asin) || null;
-
-  if (!draftType || !PASSPORT_COLUMN_BY_DRAFT_TYPE[draftType]) {
-    throw new PassportDraftExecutionError(400, "This draft's content type cannot be saved to the Product Passport here.");
-  }
-
-  if (!proposedValue) {
-    throw new PassportDraftExecutionError(400, "This draft has no proposed text to save.");
-  }
-
-  const passportId = await findPassportRowId({ sellerId, sku, asin });
-
-  if (!passportId) {
-    throw new PassportDraftExecutionError(404, "Could not find this product's Product Passport row to save the draft into.");
-  }
-
-  const column = PASSPORT_COLUMN_BY_DRAFT_TYPE[draftType];
-  const savedValue: string | string[] = draftType === "CUSTOMER_OBJECTIONS" ? parseCustomerObjections(proposedValue) : proposedValue;
-
-  const { error: updateError } = await supabase
-    .from("product_passports")
-    .update({ [column]: savedValue, updated_at: new Date().toISOString() })
-    .eq("id", passportId);
-
-  if (updateError) {
-    logger.warn("Could not save passport draft into Product Passport.", {
-      sellerId,
-      actionId,
-      draftType,
-      message: updateError.message
-    });
-    throw new PassportDraftExecutionError(502, `Could not save this to the Product Passport: ${updateError.message}`);
-  }
-
-  const targetLabel = `${draftType.toLowerCase().replace(/_/g, " ")}${sku ? ` for SKU ${sku}` : ""}`;
-
-  const transition = await transitionActionState({
-    actionId: row.id,
-    sellerId,
-    toState: "APPROVED",
-    approvalStatus: "APPROVED",
-    eventType: "APPROVED",
-    actor,
-    note: `Approved and saved ${targetLabel} to the Product Passport.`,
-    metadata: { passportDraftExecution: true, column, savedValue }
-  });
-
-  if (!transition) {
-    throw new PassportDraftExecutionError(
-      404,
-      "Action ledger row not found after saving — check the Action Ledger directly, since the Product Passport was already updated."
-    );
-  }
-
-  await safeRecordActivityLog({
-    sellerId,
-    eventType: "PASSPORT_DRAFT_SAVED",
-    eventCategory: "LISTING_DRAFTS",
-    severity: "INFO",
-    actor,
-    title: "Passport draft saved",
-    message: `Saved ${targetLabel} to the Product Passport after founder approval.`,
-    entityType: asin ? "ASIN" : sku ? "SKU" : "ACCOUNT",
-    entityId: asin ?? sku ?? row.id,
-    sku,
-    asin,
-    actionId: row.id,
-    sourceModule: "passport-draft-execution",
-    metadata: { draftType, column }
-  });
-
-  return {
-    ok: true,
-    actionId: row.id,
-    sellerId,
-    draftType,
-    sku,
-    asin,
-    message: `Saved to the Product Passport: ${targetLabel}.`,
-    savedValue,
-    row: transition.row
-  };
-}
-
-// Runs executePassportDraftAction() for each id in turn (not in parallel — each one does a real
-// Supabase write plus a workflow-state transition, and running them one at a time keeps this
-// simple and safe rather than racing writes against the same table). One id's failure (already
-// approved, wrong type, missing passport row, etc.) is recorded and skipped — it never stops the
-// rest of the batch, since a founder selecting 50 cards should get 49 real saves even if 1 is stale.
-export async function batchExecutePassportDraftActions(input: {
+export type ActionLedgerBatchUpdateResult = {
   sellerId: string;
-  actionIds: string[];
-  actor?: string | null;
-}): Promise<PassportDraftBatchExecutionResult> {
-  const sellerId = cleanTextLocal(input.sellerId) || "default";
-  const actor = cleanTextLocal(input.actor) || "founder";
-  const results: PassportDraftBatchItemResult[] = [];
+  requestedCount: number;
+  updatedCount: number;
+  skippedCount: number;
+  rows: SafeActionLedgerRow[];
+  workflowBeforeRows?: ActionLedgerRow[];
+};
 
-  for (const rawActionId of input.actionIds) {
-    const actionId = cleanTextLocal(rawActionId);
-
-    try {
-      const result = await executePassportDraftAction({ sellerId, actionId, actor });
-      results.push({
-        actionId: result.actionId,
-        ok: true,
-        sku: result.sku,
-        asin: result.asin,
-        draftType: result.draftType,
-        message: result.message
-      });
-    } catch (error) {
-      const message =
-        error instanceof PassportDraftExecutionError
-          ? error.message
-          : error instanceof Error
-            ? error.message
-            : "Could not save this draft to the Product Passport.";
-      results.push({ actionId, ok: false, message });
-    }
-  }
-
-  const savedCount = results.filter((r) => r.ok).length;
-
-  return {
-    ok: true,
-    sellerId,
-    requestedCount: input.actionIds.length,
-    savedCount,
-    updatedCount: savedCount,
-    skippedCount: results.length - savedCount,
-    results
-  };
-}
+export type ActionLedgerDailyPriorities = {
+  sellerId: string;
+  limit: number;
+  totalPending: number;
+  rows: SafeActionLedgerRow[];
+};
