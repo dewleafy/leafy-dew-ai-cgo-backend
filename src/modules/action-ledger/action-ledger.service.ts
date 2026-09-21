@@ -62,6 +62,17 @@ export const ACTION_LEDGER_ACTION_TYPES: ActionLedgerActionType[] = [
   "LISTING_DESCRIPTION_DRAFT_REVIEW",
   "PASSPORT_BRAND_POSITIONING_DRAFT_REVIEW",
   "PASSPORT_CUSTOMER_OBJECTIONS_DRAFT_REVIEW",
+  // These two were added to the ActionLedgerActionType union (action-ledger.types.ts) when
+  // PACKAGE_CONTENTS/COMPLIANCE_NOTES drafting was built, but were missed here -- this runtime
+  // array is what toSafeActionLedgerRow()'s safeEnum() check actually validates against when
+  // reading a row back out for the API/frontend, so every package_contents/compliance_notes
+  // action was silently downgraded to "OTHER" on read (the DB value itself was always correct).
+  // That mislabeling hid the "Approve & Save to Passport" button and the batch-save toolbar
+  // button (isPassportDraftExecutableAction() checks actionType against this same allowlist
+  // family) for every one of these drafts. Fixing this list is the whole fix -- no other file,
+  // no data migration: existing rows already have the right value in the database.
+  "PASSPORT_PACKAGE_CONTENTS_DRAFT_REVIEW",
+  "PASSPORT_COMPLIANCE_NOTES_DRAFT_REVIEW",
   "IMAGE_CREATIVE_REVIEW",
   "A_PLUS_CONTENT_REVIEW",
   "LISTING_UPDATE",
