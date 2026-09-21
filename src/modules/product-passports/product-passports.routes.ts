@@ -7,6 +7,7 @@ import {
   getProductPassportReadinessSummaryController,
   getProductPassports,
   postProductPassport,
+  postProductPassportBulkComplianceNotesRoute,
   putProductPassport
 } from "./product-passports.controller";
 import {
@@ -25,6 +26,7 @@ productPassportRoutes.get("/cost-completion", asyncHandler(getProductPassportCos
 productPassportRoutes.post("/cost-completion/bulk-update", asyncHandler(postProductPassportCostCompletionBulkUpdate));
 productPassportRoutes.post("/cost-completion/resolve-actions", asyncHandler(postProductPassportCostCompletionResolveActions));
 productPassportRoutes.get("/cost-completion/summary", asyncHandler(getProductPassportCostCompletionSummaryController));
+productPassportRoutes.post("/compliance-notes/bulk-apply", asyncHandler(postProductPassportBulkComplianceNotesRoute));
 productPassportRoutes.get("/:id/readiness", asyncHandler(getProductPassportReadiness));
 productPassportRoutes.get("/:id", asyncHandler(getProductPassport));
 productPassportRoutes.post("/", asyncHandler(postProductPassport));
