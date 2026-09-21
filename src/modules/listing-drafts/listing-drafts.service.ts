@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import { supabase } from "../../db/supabase";
 import { ensureActionLedgerAction } from "../action-ledger/action-ledger.service";
 import { ActionLedgerActionType } from "../action-ledger/action-ledger.types";
@@ -33,6 +34,16 @@ type AiDraftType = Extract<
 // gets a stricter contract: extract only what's already stated, or say so plainly.
 const AI_DRAFT_UNKNOWN_SENTINEL = "UNKNOWN";
 const EXTRACTION_ONLY_DRAFT_TYPES: ReadonlySet<AiDraftType> = new Set(["PACKAGE_CONTENTS", "COMPLIANCE_NOTES"]);
+
+// Once the AI has genuinely tried an extraction-only product+type and found nothing explicit to
+// extract, that result is recorded as a listing_optimization_drafts row with this status instead of
+// "DRAFTED" -- it never shows up in the Listing Drafts list or the Approval Center (see
+// listListingDrafts()'s filter below), it exists purely so future generate runs can skip re-asking
+// the same already-answered question. Without this, generateListingDrafts() has no memory of a
+// UNKNOWN result: the same dead-end products get re-scanned (and re-billed against the per-run AI
+// call budget) on every single run forever, starving the budget from ever reaching real candidates
+// further down the product list.
+const EXTRACTION_ONLY_NO_DATA_STATUS = "NO_DATA";
 
 type ProductContext = {
   sellerId: string;
@@ -158,6 +169,15 @@ function buildProductFactsBlock(product: ProductContext): string {
   return facts.join("\n");
 }
 
+// A short, stable fingerprint of the exact facts block the AI would see for this product right now.
+// Used only to key NO_DATA markers (see EXTRACTION_ONLY_NO_DATA_STATUS above): if a later Amazon
+// sync changes this product's known facts (e.g. adds real box-contents wording), the hash changes
+// too, so a stale marker stops matching and the product becomes eligible for a fresh AI attempt
+// automatically -- no manual cleanup needed.
+function factsHashFor(product: ProductContext): string {
+  return createHash("sha256").update(buildProductFactsBlock(product)).digest("hex").slice(0, 16);
+}
+
 const AI_DRAFT_INSTRUCTIONS: Record<AiDraftType, string> = {
   TITLE:
     'Write ONE Amazon product listing title using only the facts given below. Do not invent specs, certifications, or claims that are not stated. Keep it under 190 characters, no ALL CAPS, no promotional superlatives ("best", "#1", "guaranteed"), no emojis, no HTML. Reply with ONLY the title text and nothing else.',
@@ -252,7 +272,8 @@ async function draftValueWithAi(input: {
 async function buildCandidates(
   product: ProductContext,
   aiState: AiDraftState,
-  skipTypes: ReadonlySet<ListingDraftType>
+  skipTypes: ReadonlySet<ListingDraftType>,
+  factsHash: string
 ): Promise<DraftCandidate[]> {
   const candidates: DraftCandidate[] = [];
   const title = cleanText(product.title);
@@ -376,6 +397,10 @@ async function buildCandidates(
         riskLevel: "LOW",
         metadata: { aiCall: ai.aiCall, aiBlockedReason: ai.aiBlockedReason, extractionOnly: true }
       });
+    } else if (ai.aiBlockedReason === "AI_COULD_NOT_EXTRACT_FROM_KNOWN_FACTS") {
+      // The AI genuinely ran and found nothing to extract -- record that so future runs stop
+      // re-asking this exact product+facts combination (see EXTRACTION_ONLY_NO_DATA_STATUS above).
+      await createNoDataMarker(product, "PACKAGE_CONTENTS", factsHash);
     }
   }
 
@@ -395,6 +420,8 @@ async function buildCandidates(
         riskLevel: "MEDIUM",
         metadata: { aiCall: ai.aiCall, aiBlockedReason: ai.aiBlockedReason, extractionOnly: true }
       });
+    } else if (ai.aiBlockedReason === "AI_COULD_NOT_EXTRACT_FROM_KNOWN_FACTS") {
+      await createNoDataMarker(product, "COMPLIANCE_NOTES", factsHash);
     }
   }
 
@@ -481,6 +508,65 @@ async function draftDuplicateExists(input: {
   const { count, error } = await query;
   if (error) throw new Error(error.message);
   return (count ?? 0) > 0;
+}
+
+// See EXTRACTION_ONLY_NO_DATA_STATUS above. Returns true only when a NO_DATA marker exists for this
+// exact product+type AND its stored factsHash still matches the facts the product has right now --
+// so a stale marker from before the product's data changed never wrongly blocks a fresh AI attempt.
+async function extractionOnlyNoDataMarkerMatches(input: {
+  sellerId: string;
+  sku: string | null;
+  asin: string | null;
+  draftType: AiDraftType;
+  factsHash: string;
+}): Promise<boolean> {
+  let query = supabase
+    .from("listing_optimization_drafts")
+    .select("metadata")
+    .eq("seller_id", input.sellerId)
+    .eq("draft_type", input.draftType)
+    .eq("status", EXTRACTION_ONLY_NO_DATA_STATUS)
+    .order("created_at", { ascending: false })
+    .limit(1);
+
+  query = input.sku ? query.eq("sku", input.sku) : query.is("sku", null);
+  query = input.asin ? query.eq("asin", input.asin) : query.is("asin", null);
+
+  const { data, error } = await query;
+  if (error) throw new Error(error.message);
+
+  const row = (data ?? [])[0] as { metadata: Record<string, unknown> | null } | undefined;
+  if (!row) return false;
+
+  const storedHash = typeof row.metadata?.factsHash === "string" ? row.metadata.factsHash : null;
+  return storedHash === input.factsHash;
+}
+
+// Bookkeeping-only insert -- never shown to the founder (listListingDrafts() filters status =
+// NO_DATA out) and never gets an action-ledger action. Best-effort: if this insert fails for any
+// reason, the product simply gets re-tried on the next run (the old, slower behavior), never a hard
+// failure of the real generate run it's called from.
+async function createNoDataMarker(product: ProductContext, draftType: AiDraftType, factsHash: string): Promise<void> {
+  try {
+    await supabase.from("listing_optimization_drafts").insert({
+      seller_id: product.sellerId,
+      sku: product.sku,
+      asin: product.asin,
+      product_name: product.productName,
+      draft_type: draftType,
+      current_value: null,
+      proposed_value: null,
+      reason: "AI checked this product's known facts and found no explicit answer to extract yet -- not a data quality problem, just nothing stated in the listing text so far.",
+      source: "LISTING_DRAFT_SYSTEM",
+      source_id: sourceIdForProduct(product, draftType),
+      status: EXTRACTION_ONLY_NO_DATA_STATUS,
+      confidence_label: "LOW",
+      risk_level: "LOW",
+      metadata: { noDataMarker: true, extractionOnly: true, factsHash }
+    });
+  } catch {
+    // Intentionally swallowed -- see comment above.
+  }
 }
 
 async function createDraft(product: ProductContext, candidate: DraftCandidate): Promise<SafeListingOptimizationDraft> {
@@ -661,7 +747,24 @@ export async function generateListingDrafts(sellerIdInput: string): Promise<List
       if (alreadyPending) skipTypes.add(draftType);
     }
 
-    const candidates = await buildCandidates(product, aiState, skipTypes);
+    // Extraction-only types get one more check: a still-matching NO_DATA marker means the AI
+    // already tried this exact product with these exact facts and found nothing to extract, so
+    // skip it too -- this is what lets the run's limited AI-call budget reach products that
+    // haven't been tried yet instead of re-asking the same dead-end question every round.
+    const factsHash = factsHashFor(product);
+    for (const draftType of EXTRACTION_ONLY_DRAFT_TYPES) {
+      if (skipTypes.has(draftType)) continue;
+      const noDataMatches = await extractionOnlyNoDataMarkerMatches({
+        sellerId,
+        sku: product.sku,
+        asin: product.asin,
+        draftType,
+        factsHash
+      });
+      if (noDataMatches) skipTypes.add(draftType);
+    }
+
+    const candidates = await buildCandidates(product, aiState, skipTypes, factsHash);
     if (!candidates.length) {
       skippedCount += skipTypes.size > 0 ? skipTypes.size : 1;
       continue;
@@ -722,6 +825,10 @@ export async function listListingDrafts(input: {
     .from("listing_optimization_drafts")
     .select("*")
     .eq("seller_id", sellerId)
+    // NO_DATA rows are internal bookkeeping markers (see EXTRACTION_ONLY_NO_DATA_STATUS above) --
+    // they never had real proposed content and never got an approval action, so they're excluded
+    // from every founder-facing list/count.
+    .neq("status", EXTRACTION_ONLY_NO_DATA_STATUS)
     .order("created_at", { ascending: false })
     .limit(limit);
 
@@ -779,7 +886,14 @@ async function countDrafts(input: {
     .from("listing_optimization_drafts")
     .select("id", { count: "exact", head: true })
     .eq("seller_id", input.sellerId);
-  if (input.status) query = query.eq("status", input.status);
+  if (input.status) {
+    query = query.eq("status", input.status);
+  } else {
+    // Unfiltered counts (e.g. totalDrafts in getListingDraftSummary) should still exclude the
+    // internal NO_DATA bookkeeping rows -- a caller explicitly asking for status: "NO_DATA" is
+    // unaffected since the branch above already scopes the query in that case.
+    query = query.neq("status", EXTRACTION_ONLY_NO_DATA_STATUS);
+  }
   if (input.draftType) query = query.eq("draft_type", input.draftType);
   const { count, error } = await query;
   if (error) throw new Error(error.message);
