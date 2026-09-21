@@ -3,8 +3,18 @@ export type ListingDraftType =
   | "BULLETS"
   | "BACKEND_KEYWORDS"
   | "DESCRIPTION"
+  // Passport-only fields: these never go to Amazon. Approving one of these drafts just saves the
+  // AI-authored text into the Product Passport itself (see passport-draft-execution module), which
+  // is what the Brand Readiness score actually reads.
   | "BRAND_POSITIONING"
-  | "CUSTOMER_OBJECTIONS";
+  | "CUSTOMER_OBJECTIONS"
+  // Also passport-only. Unlike the two above (which are internal strategy notes), these describe
+  // real, factual things about the product — so the AI drafter is deliberately restricted to
+  // extracting only what's already explicitly stated in the seller's own real, synced Amazon
+  // bullet points (never inventing package items or compliance/safety claims). See the
+  // PACKAGE_CONTENTS/COMPLIANCE_NOTES prompts in listing-drafts.service.ts for the exact guardrail.
+  | "PACKAGE_CONTENTS"
+  | "COMPLIANCE_NOTES";
 
 export type ListingOptimizationDraftRow = {
   id: string;
