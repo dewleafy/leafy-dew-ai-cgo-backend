@@ -18,7 +18,7 @@ function toDateOnly(date: Date): string {
 function getDaysFromQuery(req: Request): number {
   const rawDays = typeof req.query.days === "string" ? Number(req.query.days) : 7;
   const days = Number.isFinite(rawDays) ? Math.floor(rawDays) : 7;
-  return Math.min(Math.max(days, 1), 31);
+  return Math.min(Math.max(days, 1), 90);
 }
 
 // Accepts either an explicit startDate/endDate (both YYYY-MM-DD) or a
