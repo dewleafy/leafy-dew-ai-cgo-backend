@@ -67,6 +67,18 @@ export type OrderEconomicsOrderRow = {
   orderAdSpend: number;
   orderEstimatedProfit: number | null;
   profitStatus: OrderEconomicsProfitStatus;
+  // Approximate repeat-customer signal. Amazon does not expose buyer name or
+  // email to this app, so this is built from matching normalized ship-to
+  // address (postal code + city/state) across the seller's full order
+  // history — not a confirmed buyer identity. See CAVEATS.
+  isRepeatShipTo: boolean;
+  shipToOrderCount: number;
+  otherOrdersAtAddress: Array<{
+    amazonOrderId: string;
+    purchaseDate: string | null;
+    orderRevenue: number;
+    productSummary: string | null;
+  }>;
 };
 
 export type OrderEconomicsProductRollup = {
