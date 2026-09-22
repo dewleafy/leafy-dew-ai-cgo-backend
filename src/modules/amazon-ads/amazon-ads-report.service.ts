@@ -10,6 +10,7 @@ import {
   AmazonAdsConnection,
   AmazonAdsRegion,
   AmazonAdsReportJob,
+  SafeAmazonAdsAdvertisedProductDailyMetric,
   SafeAmazonAdsCampaignDailyMetric,
   SafeAmazonAdsSearchTermDailyMetric
 } from "./amazon-ads.types";
@@ -57,6 +58,14 @@ type RawSearchTermMetricRow = RawCampaignMetricRow & {
   searchTerm?: string;
 };
 
+type RawAdvertisedProductMetricRow = RawCampaignMetricRow & {
+  adGroupId?: string | number;
+  adGroupName?: string;
+  adId?: string | number;
+  advertisedAsin?: string;
+  advertisedSku?: string;
+};
+
 type CampaignMetricRow = {
   campaign_id: string;
   campaign_name: string | null;
@@ -82,6 +91,14 @@ type SearchTermMetricRow = CampaignMetricRow & {
   match_type: string | null;
   targeting: string | null;
   search_term: string;
+};
+
+type AdvertisedProductMetricRow = CampaignMetricRow & {
+  ad_group_id: string;
+  ad_group_name: string | null;
+  ad_id: string | null;
+  advertised_asin: string;
+  advertised_sku: string | null;
 };
 
 type SearchTermSummaryMetricRow = {
@@ -175,6 +192,10 @@ function parseGzipJsonSearchTermRows(buffer: Buffer): RawSearchTermMetricRow[] {
   return parseGzipJsonRows(buffer) as RawSearchTermMetricRow[];
 }
 
+function parseGzipJsonAdvertisedProductRows(buffer: Buffer): RawAdvertisedProductMetricRow[] {
+  return parseGzipJsonRows(buffer) as RawAdvertisedProductMetricRow[];
+}
+
 function toMetricInsertRow(input: {
   row: RawCampaignMetricRow;
   connectionId: string;
@@ -236,6 +257,26 @@ function toSearchTermMetricInsertRow(input: {
   };
 }
 
+function toAdvertisedProductMetricInsertRow(input: {
+  row: RawAdvertisedProductMetricRow;
+  connectionId: string;
+  profileId: string;
+  sellerId: string;
+  fallbackDate: string;
+  syncedAt: string;
+}) {
+  const base = toMetricInsertRow(input);
+
+  return {
+    ...base,
+    ad_group_id: String(input.row.adGroupId ?? ""),
+    ad_group_name: input.row.adGroupName ?? null,
+    ad_id: input.row.adId == null ? null : String(input.row.adId),
+    advertised_asin: input.row.advertisedAsin ?? "",
+    advertised_sku: input.row.advertisedSku ?? null
+  };
+}
+
 function toSafeMetric(row: CampaignMetricRow): SafeAmazonAdsCampaignDailyMetric {
   return {
     campaignId: row.campaign_id,
@@ -266,6 +307,30 @@ function toSafeSearchTermMetric(row: SearchTermMetricRow): SafeAmazonAdsSearchTe
     matchType: row.match_type,
     targeting: row.targeting,
     searchTerm: row.search_term,
+    reportDate: row.report_date,
+    impressions: row.impressions,
+    clicks: row.clicks,
+    cost: row.cost,
+    sales: row.sales,
+    orders: row.orders,
+    acos: row.acos,
+    roas: row.roas,
+    cpc: row.cpc,
+    ctr: row.ctr,
+    conversionRate: row.conversion_rate,
+    lastSyncedAt: row.last_synced_at
+  };
+}
+
+function toSafeAdvertisedProductMetric(row: AdvertisedProductMetricRow): SafeAmazonAdsAdvertisedProductDailyMetric {
+  return {
+    campaignId: row.campaign_id,
+    campaignName: row.campaign_name,
+    adGroupId: row.ad_group_id,
+    adGroupName: row.ad_group_name,
+    adId: row.ad_id,
+    advertisedAsin: row.advertised_asin,
+    advertisedSku: row.advertised_sku,
     reportDate: row.report_date,
     impressions: row.impressions,
     clicks: row.clicks,
@@ -511,6 +576,110 @@ export async function requestSponsoredProductsSearchTermReport(input: {
   };
 }
 
+// The "Advertised Product" report is the only Sponsored Products report type
+// that ties spend/sales to a specific ASIN/SKU (via groupBy: ["advertiser"]),
+// which is what makes real per-order/per-product ad-spend attribution
+// possible -- the campaign and search-term reports above have no product
+// dimension at all. Column/groupBy names here follow the same Ads Reporting
+// API v3 request shape already proven working for the two report types
+// above; if Amazon rejects a column name, the raw error is logged and
+// surfaced (never guessed past) the same way the Brand Store probe surfaces
+// Amazon's raw responses, so a real fix is one round-trip away, not several.
+export async function requestSponsoredProductsAdvertisedProductReport(input: {
+  accessToken: string;
+  region: AmazonAdsRegion;
+  profileId: string;
+  connectionId: string;
+  sellerId: string;
+  date: string;
+}): Promise<{ jobId: string; reportId: string; status: string }> {
+  const endpoint = "/reporting/reports";
+  const body = {
+    name: `SP advertised product daily performance ${input.date}`,
+    startDate: input.date,
+    endDate: input.date,
+    configuration: {
+      adProduct: "SPONSORED_PRODUCTS",
+      reportTypeId: "spAdvertisedProduct",
+      groupBy: ["advertiser"],
+      timeUnit: "DAILY",
+      format: "GZIP_JSON",
+      columns: [
+        "date",
+        "campaignId",
+        "campaignName",
+        "adGroupId",
+        "adGroupName",
+        "adId",
+        "advertisedAsin",
+        "advertisedSku",
+        "impressions",
+        "clicks",
+        "cost",
+        "purchases14d",
+        "sales14d"
+      ]
+    }
+  };
+
+  const response = await retry(() =>
+    axios.post<CreateReportResponse>(`${AMAZON_ADS_API_ENDPOINTS[input.region]}${endpoint}`, body, {
+      headers: {
+        Authorization: `Bearer ${input.accessToken}`,
+        "Amazon-Advertising-API-ClientId": process.env.AMAZON_ADS_CLIENT_ID ?? "",
+        "Amazon-Advertising-API-Scope": input.profileId,
+        "Content-Type": "application/vnd.createasyncreportrequest.v3+json",
+        Accept: "application/vnd.createasyncreportresponse.v3+json"
+      }
+    })
+  );
+
+  await logAmazonAdsApiCall({
+    connectionId: input.connectionId,
+    endpoint,
+    method: "POST",
+    statusCode: response.status,
+    success: true
+  });
+
+  const reportId = response.data.reportId ?? response.data.report_id;
+
+  if (!reportId) {
+    throw new Error("Amazon Ads did not return a reportId.");
+  }
+
+  const status = response.data.status ?? "PENDING";
+  const { data, error } = await supabase
+    .from("amazon_ads_report_jobs")
+    .insert({
+      connection_id: input.connectionId,
+      profile_id: input.profileId,
+      seller_id: input.sellerId,
+      report_id: reportId,
+      report_type: "spAdvertisedProduct",
+      ad_product: "SPONSORED_PRODUCTS",
+      start_date: input.date,
+      end_date: input.date,
+      status,
+      requested_at: new Date().toISOString()
+    })
+    .select("id")
+    .single<{ id: string }>();
+
+  if (error || !data) {
+    if (error) {
+      logSafeAmazonAdsSupabaseError("Could not save Amazon Ads advertised product report job.", error);
+    }
+    throw new Error("Could not save Amazon Ads advertised product report job.");
+  }
+
+  return {
+    jobId: data.id,
+    reportId,
+    status
+  };
+}
+
 export async function hasCampaignMetricsForDate(input: {
   connectionId: string;
   profileId: string;
@@ -635,6 +804,56 @@ export async function hasSearchTermReportJobForDate(input: {
   return Boolean(data);
 }
 
+export async function hasAdvertisedProductMetricsForDate(input: {
+  connectionId: string;
+  profileId: string;
+  sellerId: string;
+  date: string;
+}): Promise<boolean> {
+  const { data, error } = await supabase
+    .from("amazon_ads_advertised_product_daily_metrics")
+    .select("advertised_asin")
+    .eq("connection_id", input.connectionId)
+    .eq("profile_id", input.profileId)
+    .eq("seller_id", input.sellerId)
+    .eq("report_date", input.date)
+    .limit(1)
+    .maybeSingle<{ advertised_asin: string }>();
+
+  if (error) {
+    logSafeAmazonAdsSupabaseError("Could not check existing Amazon Ads advertised product metrics.", error);
+    throw new Error("Could not check existing Amazon Ads advertised product metrics.");
+  }
+
+  return Boolean(data);
+}
+
+export async function hasAdvertisedProductReportJobForDate(input: {
+  connectionId: string;
+  profileId: string;
+  sellerId: string;
+  date: string;
+}): Promise<boolean> {
+  const { data, error } = await supabase
+    .from("amazon_ads_report_jobs")
+    .select("id")
+    .eq("connection_id", input.connectionId)
+    .eq("profile_id", input.profileId)
+    .eq("seller_id", input.sellerId)
+    .eq("report_type", "spAdvertisedProduct")
+    .eq("start_date", input.date)
+    .eq("end_date", input.date)
+    .limit(1)
+    .maybeSingle<{ id: string }>();
+
+  if (error) {
+    logSafeAmazonAdsSupabaseError("Could not check Amazon Ads advertised product report job for date.", error);
+    throw new Error("Could not check existing Amazon Ads advertised product report jobs.");
+  }
+
+  return Boolean(data);
+}
+
 export async function loadAmazonAdsReportJob(jobId: string): Promise<AmazonAdsReportJob> {
   const { data, error } = await supabase
     .from("amazon_ads_report_jobs")
@@ -703,6 +922,34 @@ export async function listProcessableSearchTermReportJobs(input: {
   if (error) {
     logSafeAmazonAdsSupabaseError("Could not list Amazon Ads search term report jobs.", error);
     throw new Error("Could not list Amazon Ads search term report jobs.");
+  }
+
+  return ((data ?? []) as AmazonAdsReportJob[])
+    .filter((job) => !FINISHED_REPORT_STATUSES.includes(job.status.toUpperCase()))
+    .slice(0, input.limit);
+}
+
+export async function listProcessableAdvertisedProductReportJobs(input: {
+  connectionId: string;
+  profileId: string;
+  sellerId: string;
+  limit: number;
+}): Promise<AmazonAdsReportJob[]> {
+  const { data, error } = await supabase
+    .from("amazon_ads_report_jobs")
+    .select(
+      "id, connection_id, profile_id, seller_id, report_id, report_type, ad_product, start_date, end_date, status, report_url, failure_reason, requested_at, completed_at"
+    )
+    .eq("connection_id", input.connectionId)
+    .eq("profile_id", input.profileId)
+    .eq("seller_id", input.sellerId)
+    .eq("report_type", "spAdvertisedProduct")
+    .order("requested_at", { ascending: false })
+    .limit(Math.max(input.limit * 3, input.limit));
+
+  if (error) {
+    logSafeAmazonAdsSupabaseError("Could not list Amazon Ads advertised product report jobs.", error);
+    throw new Error("Could not list Amazon Ads advertised product report jobs.");
   }
 
   return ((data ?? []) as AmazonAdsReportJob[])
@@ -922,6 +1169,98 @@ export async function downloadAndSaveSearchTermReport(job: AmazonAdsReportJob): 
   return mergedRows.length;
 }
 
+type AdvertisedProductInsertRow = ReturnType<typeof toAdvertisedProductMetricInsertRow>;
+
+// Same reasoning as mergeDuplicateSearchTermInsertRows above: Amazon can
+// return more than one row for the same campaign + ad group + advertised
+// ASIN on the same day (e.g. two different ads in the same ad group
+// promoting the same product), which would collide on our table's unique
+// key and make ON CONFLICT DO UPDATE reject the whole batch. Merge same-key
+// rows (summing their metrics) before upserting, same as search terms.
+function mergeDuplicateAdvertisedProductInsertRows(rows: AdvertisedProductInsertRow[]): AdvertisedProductInsertRow[] {
+  const merged = new Map<string, AdvertisedProductInsertRow>();
+
+  for (const row of rows) {
+    const key = `${row.profile_id}::${row.report_date}::${row.campaign_id}::${row.ad_group_id}::${row.advertised_asin}`;
+    const existing = merged.get(key);
+
+    if (!existing) {
+      merged.set(key, row);
+      continue;
+    }
+
+    const impressions = existing.impressions + row.impressions;
+    const clicks = existing.clicks + row.clicks;
+    const cost = existing.cost + row.cost;
+    const sales = existing.sales + row.sales;
+    const orders = existing.orders + row.orders;
+
+    merged.set(key, {
+      ...existing,
+      impressions,
+      clicks,
+      cost,
+      sales,
+      orders,
+      acos: safeDivide(cost, sales, 100),
+      roas: safeDivide(sales, cost),
+      cpc: safeDivide(cost, clicks),
+      ctr: safeDivide(clicks, impressions, 100),
+      conversion_rate: safeDivide(orders, clicks, 100),
+      raw_data: row.raw_data,
+      last_synced_at: row.last_synced_at,
+      updated_at: row.updated_at
+    });
+  }
+
+  return Array.from(merged.values());
+}
+
+export async function downloadAndSaveAdvertisedProductReport(job: AmazonAdsReportJob): Promise<number> {
+  if (job.report_type !== "spAdvertisedProduct") {
+    throw new Error("This report job is not a Sponsored Products advertised product report.");
+  }
+
+  if (job.status.toUpperCase() !== "COMPLETED" || !job.report_url) {
+    return 0;
+  }
+
+  const response = await axios.get<ArrayBuffer>(job.report_url, {
+    responseType: "arraybuffer"
+  });
+  const rows = parseGzipJsonAdvertisedProductRows(Buffer.from(response.data));
+  const syncedAt = new Date().toISOString();
+  const insertRows = rows
+    .map((row) =>
+      toAdvertisedProductMetricInsertRow({
+        row,
+        connectionId: job.connection_id,
+        profileId: job.profile_id,
+        sellerId: job.seller_id ?? "default",
+        fallbackDate: job.start_date,
+        syncedAt
+      })
+    )
+    .filter((row) => row.campaign_id.length > 0 && row.ad_group_id.length > 0 && row.advertised_asin.length > 0);
+
+  if (insertRows.length === 0) {
+    return 0;
+  }
+
+  const mergedRows = mergeDuplicateAdvertisedProductInsertRows(insertRows);
+
+  const { error } = await supabase.from("amazon_ads_advertised_product_daily_metrics").upsert(mergedRows, {
+    onConflict: "profile_id,report_date,campaign_id,ad_group_id,advertised_asin"
+  });
+
+  if (error) {
+    logSafeAmazonAdsSupabaseError("Could not save Amazon Ads advertised product daily metrics.", error);
+    throw new Error("Could not save Amazon Ads advertised product daily metrics.");
+  }
+
+  return mergedRows.length;
+}
+
 export async function markAmazonAdsReportJobSynced(jobId: string): Promise<void> {
   const { error } = await supabase
     .from("amazon_ads_report_jobs")
@@ -1041,6 +1380,85 @@ export async function listSearchTermDailyMetrics(input: {
     date: reportDate,
     metrics: ((data ?? []) as SearchTermMetricRow[]).map(toSafeSearchTermMetric)
   };
+}
+
+export async function listAdvertisedProductDailyMetrics(input: {
+  connectionId: string;
+  profileId: string;
+  date?: string;
+}): Promise<{ date: string | null; metrics: SafeAmazonAdsAdvertisedProductDailyMetric[] }> {
+  let reportDate = input.date;
+
+  if (!reportDate) {
+    const { data: latest, error: latestError } = await supabase
+      .from("amazon_ads_advertised_product_daily_metrics")
+      .select("report_date")
+      .eq("connection_id", input.connectionId)
+      .eq("profile_id", input.profileId)
+      .order("report_date", { ascending: false })
+      .limit(1)
+      .maybeSingle<{ report_date: string }>();
+
+    if (latestError) {
+      logSafeAmazonAdsSupabaseError("Could not find latest Amazon Ads advertised product metrics date.", latestError);
+      throw new Error("Could not load Amazon Ads advertised product daily metrics.");
+    }
+
+    reportDate = latest?.report_date;
+  }
+
+  if (!reportDate) {
+    return {
+      date: null,
+      metrics: []
+    };
+  }
+
+  const { data, error } = await supabase
+    .from("amazon_ads_advertised_product_daily_metrics")
+    .select(
+      "campaign_id, campaign_name, ad_group_id, ad_group_name, ad_id, advertised_asin, advertised_sku, report_date, impressions, clicks, cost, sales, orders, acos, roas, cpc, ctr, conversion_rate, last_synced_at"
+    )
+    .eq("connection_id", input.connectionId)
+    .eq("profile_id", input.profileId)
+    .eq("report_date", reportDate)
+    .order("cost", { ascending: false });
+
+  if (error) {
+    logSafeAmazonAdsSupabaseError("Could not load Amazon Ads advertised product daily metrics.", error);
+    throw new Error("Could not load Amazon Ads advertised product daily metrics.");
+  }
+
+  return {
+    date: reportDate,
+    metrics: ((data ?? []) as AdvertisedProductMetricRow[]).map(toSafeAdvertisedProductMetric)
+  };
+}
+
+// Seller-scoped, date-range read for the order-economics module: it needs
+// every day's per-ASIN spend/sales across a window (to blend ad spend into
+// real orders placed in that window), not just one day at a time.
+export async function listAdvertisedProductMetricsForDateRange(input: {
+  sellerId: string;
+  startDate: string;
+  endDate: string;
+}): Promise<SafeAmazonAdsAdvertisedProductDailyMetric[]> {
+  const { data, error } = await supabase
+    .from("amazon_ads_advertised_product_daily_metrics")
+    .select(
+      "campaign_id, campaign_name, ad_group_id, ad_group_name, ad_id, advertised_asin, advertised_sku, report_date, impressions, clicks, cost, sales, orders, acos, roas, cpc, ctr, conversion_rate, last_synced_at"
+    )
+    .eq("seller_id", input.sellerId)
+    .gte("report_date", input.startDate)
+    .lte("report_date", input.endDate)
+    .order("report_date", { ascending: true });
+
+  if (error) {
+    logSafeAmazonAdsSupabaseError("Could not load Amazon Ads advertised product metrics for date range.", error);
+    throw new Error("Could not load Amazon Ads advertised product metrics for date range.");
+  }
+
+  return ((data ?? []) as AdvertisedProductMetricRow[]).map(toSafeAdvertisedProductMetric);
 }
 
 function isAsinSearchTerm(searchTerm: string): boolean {
