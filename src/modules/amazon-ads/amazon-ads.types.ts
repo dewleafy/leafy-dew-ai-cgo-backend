@@ -115,6 +115,33 @@ export type SafeAmazonAdsSearchTermDailyMetric = {
   lastSyncedAt: string | null;
 };
 
+// Amazon's "Advertised Product" report (Sponsored Products, reportTypeId
+// "spAdvertisedProduct") is the one report type that actually ties ad spend
+// to a specific ASIN/SKU, day by day. Neither the campaign report nor the
+// search-term report above carries a product dimension at all — this is
+// what makes real per-order/per-product ad-spend attribution possible.
+export type SafeAmazonAdsAdvertisedProductDailyMetric = {
+  campaignId: string;
+  campaignName: string | null;
+  adGroupId: string;
+  adGroupName: string | null;
+  adId: string | null;
+  advertisedAsin: string;
+  advertisedSku: string | null;
+  reportDate: string;
+  impressions: number;
+  clicks: number;
+  cost: number;
+  sales: number;
+  orders: number;
+  acos: number | null;
+  roas: number | null;
+  cpc: number | null;
+  ctr: number | null;
+  conversionRate: number | null;
+  lastSyncedAt: string | null;
+};
+
 export type AmazonAdsSearchTermSummaryRow = {
   searchTerm: string;
   campaignId: string;
