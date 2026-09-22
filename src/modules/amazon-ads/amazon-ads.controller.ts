@@ -33,16 +33,21 @@ import {
 } from "./amazon-ads-ppc-recommendation.service";
 import { syncRecommendationsToActionLedger } from "../action-ledger/action-ledger-bridge.service";
 import {
+  downloadAndSaveAdvertisedProductReport,
   downloadAndSaveCampaignReport,
   downloadAndSaveSearchTermReport,
   getCampaignDashboardSummary,
   getSearchTermSummary,
   hasActiveCampaignReportJobForDate,
+  hasAdvertisedProductMetricsForDate,
+  hasAdvertisedProductReportJobForDate,
   hasCampaignMetricsForDate,
   hasCampaignReportJobForDate,
   hasSearchTermMetricsForDate,
   hasSearchTermReportJobForDate,
+  listAdvertisedProductDailyMetrics,
   listCampaignDailyMetrics,
+  listProcessableAdvertisedProductReportJobs,
   listProcessableCampaignReportJobs,
   listProcessableSearchTermReportJobs,
   listSearchTermDailyMetrics,
@@ -50,6 +55,7 @@ import {
   loadAmazonAdsReportJob,
   markAmazonAdsReportJobSynced,
   refreshAmazonAdsReportJobStatus,
+  requestSponsoredProductsAdvertisedProductReport,
   requestSponsoredProductsCampaignReport,
   requestSponsoredProductsSearchTermReport
 } from "./amazon-ads-report.service";
@@ -399,6 +405,75 @@ async function processAmazonAdsSearchTermReportJobsForContext(input: {
 
     if (status === "COMPLETED" && refreshedJob.report_url) {
       jobSyncedCount = await downloadAndSaveSearchTermReport(refreshedJob);
+      await markAmazonAdsReportJobSynced(refreshedJob.id);
+      syncedCount += 1;
+      results.push({
+        jobId: refreshedJob.id,
+        date: refreshedJob.start_date,
+        status: "SYNCED",
+        syncedCount: jobSyncedCount
+      });
+      continue;
+    }
+
+    if (["FAILED", "FAILURE", "CANCELLED", "CANCELED"].includes(status)) {
+      failedCount += 1;
+    } else {
+      pendingCount += 1;
+    }
+
+    results.push({
+      jobId: refreshedJob.id,
+      date: refreshedJob.start_date,
+      status: refreshedJob.status,
+      syncedCount: 0
+    });
+  }
+
+  return {
+    checkedCount: jobs.length,
+    syncedCount,
+    pendingCount,
+    failedCount,
+    results
+  };
+}
+
+async function processAmazonAdsAdvertisedProductReportJobsForContext(input: {
+  context: { connection: AmazonAdsConnection; profile: AmazonAdsStoredProfile };
+  sellerId: string;
+  limit: number;
+}): Promise<{
+  checkedCount: number;
+  syncedCount: number;
+  pendingCount: number;
+  failedCount: number;
+  results: Array<{ jobId: string; date: string; status: string; syncedCount: number }>;
+}> {
+  const reportSellerId = input.context.connection.seller_id ?? input.sellerId;
+  const accessToken = await getAmazonAdsAccessToken(input.context.connection.id);
+  const jobs = await listProcessableAdvertisedProductReportJobs({
+    connectionId: input.context.connection.id,
+    profileId: input.context.profile.profile_id,
+    sellerId: reportSellerId,
+    limit: input.limit
+  });
+  const results: Array<{ jobId: string; date: string; status: string; syncedCount: number }> = [];
+  let syncedCount = 0;
+  let pendingCount = 0;
+  let failedCount = 0;
+
+  for (const job of jobs) {
+    const refreshedJob = await refreshAmazonAdsReportJobStatus({
+      accessToken,
+      region: input.context.connection.region,
+      job
+    });
+    const status = refreshedJob.status.toUpperCase();
+    let jobSyncedCount = 0;
+
+    if (status === "COMPLETED" && refreshedJob.report_url) {
+      jobSyncedCount = await downloadAndSaveAdvertisedProductReport(refreshedJob);
       await markAmazonAdsReportJobSynced(refreshedJob.id);
       syncedCount += 1;
       results.push({
@@ -1159,6 +1234,267 @@ export async function postAmazonAdsProcessSearchTermReportJobs(req: Request, res
     res.status(400).json({
       ok: false,
       message: "Could not process Amazon Ads search term report jobs.",
+      details: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+  }
+}
+
+export async function postAmazonAdsRequestAdvertisedProductReport(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+
+  try {
+    const date = getDateFromQuery(req);
+    const context = await loadAmazonAdsCampaignContext(sellerId);
+
+    if (!context.ok) {
+      if (context.database) {
+        sendDatabaseFailure(res, context.message);
+        return;
+      }
+      sendBeginnerError(res, context.status, context.message);
+      return;
+    }
+
+    const accessToken = await getAmazonAdsAccessToken(context.connection.id);
+    const job = await requestSponsoredProductsAdvertisedProductReport({
+      accessToken,
+      region: context.connection.region,
+      profileId: context.profile.profile_id,
+      connectionId: context.connection.id,
+      sellerId: context.connection.seller_id ?? sellerId,
+      date
+    });
+
+    res.json({
+      ok: true,
+      jobId: job.jobId,
+      reportId: job.reportId,
+      status: job.status,
+      date
+    });
+  } catch (error) {
+    logger.warn("Amazon Ads advertised product report request failed safely.", {
+      sellerId,
+      message: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+
+    res.status(400).json({
+      ok: false,
+      message: "Could not request Amazon Ads advertised product report.",
+      details: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+  }
+}
+
+export async function postAmazonAdsDownloadAdvertisedProductReport(req: Request, res: Response): Promise<void> {
+  const jobId = req.params.jobId;
+
+  try {
+    const job = await loadAmazonAdsReportJob(jobId);
+
+    if (job.report_type !== "spAdvertisedProduct") {
+      sendBeginnerError(res, 400, "This report job is not a Sponsored Products advertised product report.");
+      return;
+    }
+
+    if (job.status.toUpperCase() !== "COMPLETED" || !job.report_url) {
+      res.json({
+        ok: false,
+        message: "Amazon Ads advertised product report is not ready yet.",
+        jobId,
+        status: job.status
+      });
+      return;
+    }
+
+    const syncedCount = await downloadAndSaveAdvertisedProductReport(job);
+
+    res.json({
+      ok: true,
+      jobId,
+      syncedCount
+    });
+  } catch (error) {
+    logger.warn("Amazon Ads advertised product report download failed safely.", {
+      jobId,
+      message: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+
+    res.status(400).json({
+      ok: false,
+      message: "Could not download Amazon Ads advertised product report.",
+      details: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+  }
+}
+
+export async function getAmazonAdsAdvertisedProductDailyMetrics(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+
+  try {
+    const date = typeof req.query.date === "string" && req.query.date.trim()
+      ? dateQuerySchema.parse(req.query.date.trim())
+      : undefined;
+    const context = await loadAmazonAdsCampaignContext(sellerId);
+
+    if (!context.ok) {
+      if (context.database) {
+        sendDatabaseFailure(res, context.message);
+        return;
+      }
+      sendBeginnerError(res, context.status, context.message);
+      return;
+    }
+
+    const result = await listAdvertisedProductDailyMetrics({
+      connectionId: context.connection.id,
+      profileId: context.profile.profile_id,
+      date
+    });
+
+    res.json({
+      ok: true,
+      sellerId,
+      profileId: context.profile.profile_id,
+      date: result.date,
+      metrics: result.metrics
+    });
+  } catch (error) {
+    logger.warn("Amazon Ads advertised product daily metrics request failed safely.", {
+      sellerId,
+      message: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+
+    res.status(400).json({
+      ok: false,
+      message: "Could not load Amazon Ads advertised product daily metrics.",
+      details: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+  }
+}
+
+export async function postAmazonAdsBackfillAdvertisedProductReports(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+
+  try {
+    const days = getDaysFromQuery(req);
+    const context = await loadAmazonAdsCampaignContext(sellerId);
+
+    if (!context.ok) {
+      if (context.database) {
+        sendDatabaseFailure(res, context.message);
+        return;
+      }
+      sendBeginnerError(res, context.status, context.message);
+      return;
+    }
+
+    const reportSellerId = context.connection.seller_id ?? sellerId;
+    const accessToken = await getAmazonAdsAccessToken(context.connection.id);
+    const jobs: Array<{ date: string; jobId: string; reportId: string; status: string }> = [];
+    let skippedCount = 0;
+
+    for (let offset = 1; offset <= days; offset += 1) {
+      const date = getBackfillDate(offset);
+      const metricsExist = await hasAdvertisedProductMetricsForDate({
+        connectionId: context.connection.id,
+        profileId: context.profile.profile_id,
+        sellerId: reportSellerId,
+        date
+      });
+
+      if (metricsExist) {
+        skippedCount += 1;
+        continue;
+      }
+
+      const jobExists = await hasAdvertisedProductReportJobForDate({
+        connectionId: context.connection.id,
+        profileId: context.profile.profile_id,
+        sellerId: reportSellerId,
+        date
+      });
+
+      if (jobExists) {
+        skippedCount += 1;
+        continue;
+      }
+
+      const job = await requestSponsoredProductsAdvertisedProductReport({
+        accessToken,
+        region: context.connection.region,
+        profileId: context.profile.profile_id,
+        connectionId: context.connection.id,
+        sellerId: reportSellerId,
+        date
+      });
+
+      jobs.push({
+        date,
+        jobId: job.jobId,
+        reportId: job.reportId,
+        status: job.status
+      });
+    }
+
+    res.json({
+      ok: true,
+      sellerId,
+      requestedCount: jobs.length,
+      skippedCount,
+      jobs
+    });
+  } catch (error) {
+    logger.warn("Amazon Ads advertised product report backfill failed safely.", {
+      sellerId,
+      message: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+
+    res.status(400).json({
+      ok: false,
+      message: "Could not backfill Amazon Ads advertised product reports.",
+      details: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+  }
+}
+
+export async function postAmazonAdsProcessAdvertisedProductReportJobs(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+
+  try {
+    const rawLimit = typeof req.query.limit === "string" ? Number(req.query.limit) : 5;
+    const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? Math.floor(rawLimit) : 5, 1), 50);
+    const context = await loadAmazonAdsCampaignContext(sellerId);
+
+    if (!context.ok) {
+      if (context.database) {
+        sendDatabaseFailure(res, context.message);
+        return;
+      }
+      sendBeginnerError(res, context.status, context.message);
+      return;
+    }
+
+    const processed = await processAmazonAdsAdvertisedProductReportJobsForContext({
+      context,
+      sellerId,
+      limit
+    });
+
+    res.json({
+      ok: true,
+      sellerId,
+      ...processed
+    });
+  } catch (error) {
+    logger.warn("Amazon Ads advertised product report job processing failed safely.", {
+      sellerId,
+      message: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+
+    res.status(400).json({
+      ok: false,
+      message: "Could not process Amazon Ads advertised product report jobs.",
       details: getSafeAmazonAdsUnknownErrorMessage(error)
     });
   }
