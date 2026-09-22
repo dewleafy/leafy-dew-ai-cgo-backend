@@ -623,6 +623,92 @@ export async function bulkApplyStandardComplianceNotes(input: {
   };
 }
 
+// Founder-confirmed on 2026-09-22: the 22 Ziro kart/Leafy Dew "Wooden Wall Hanging Acrylic Test
+// Tube Planter & Propagation Station" design/color variants missing package_contents are the same
+// physical product (wooden wall-mount stand, acrylic glass tubes, self-adhesive hook) as the 19
+// already-documented siblings in the same product name family -- they only differ by print/pattern.
+// The name match is deliberately scoped tight to this exact phrase so it never touches the
+// visually-similar but physically different "Table Top ... Mango Wood" or "Wall Planter - Wooden
+// Flower Vase & Test Tube Glass Vaas" products, which are separate items with their own contents.
+// Like bulkApplyStandardComplianceNotes above, this saves back exactly what the founder confirmed
+// in chat and never overwrites a product that already has package_contents on file.
+const TEST_TUBE_PLANTER_FAMILY_NAME_PATTERN = /wooden wall hanging acrylic test tube planter/i;
+const TEST_TUBE_PLANTER_PACKAGE_CONTENTS_TEXT = "Wooden stand  \nAcrylic glass tubes  \nSelf-adhesive hook";
+
+export async function bulkApplyTestTubePlanterPackageContents(input: {
+  sellerId: string;
+  text?: string | null;
+}): Promise<{
+  eligibleCount: number;
+  updatedCount: number;
+  failedCount: number;
+  failedIds: string[];
+  textApplied: string;
+}> {
+  const sellerId = cleanText(input.sellerId) ?? "default";
+  const text = cleanText(input.text ?? null) ?? TEST_TUBE_PLANTER_PACKAGE_CONTENTS_TEXT;
+
+  const { data, error } = await supabase
+    .from("product_passports")
+    .select("id, product_name, package_contents, status")
+    .eq("seller_id", sellerId);
+
+  if (error) {
+    logProductPassportError("Could not load product passports for bulk package contents update.", error);
+    throw new Error("Could not load product passports from Supabase.");
+  }
+
+  const rows = (data ?? []) as Array<{
+    id: string;
+    product_name: string | null;
+    package_contents: string | null;
+    status: string | null;
+  }>;
+  // Only touches products in the Test Tube Planter wall-hanging family that don't already have
+  // package_contents on file, and skips archived products.
+  const eligible = rows.filter(
+    (row) =>
+      (!row.package_contents || !row.package_contents.trim()) &&
+      row.status !== "ARCHIVED" &&
+      TEST_TUBE_PLANTER_FAMILY_NAME_PATTERN.test(row.product_name ?? "")
+  );
+
+  let updatedCount = 0;
+  const failedIds: string[] = [];
+
+  const BATCH_SIZE = 15;
+  for (let i = 0; i < eligible.length; i += BATCH_SIZE) {
+    const batch = eligible.slice(i, i + BATCH_SIZE);
+    const results = await Promise.all(
+      batch.map(async (row) => {
+        const { error: updateError } = await supabase
+          .from("product_passports")
+          .update({ package_contents: text, updated_at: new Date().toISOString() })
+          .eq("id", row.id);
+
+        if (updateError) {
+          logProductPassportError(`Could not apply Test Tube Planter package contents to product passport ${row.id}.`, updateError);
+        }
+
+        return { id: row.id, ok: !updateError };
+      })
+    );
+
+    for (const result of results) {
+      if (result.ok) updatedCount += 1;
+      else failedIds.push(result.id);
+    }
+  }
+
+  return {
+    eligibleCount: eligible.length,
+    updatedCount,
+    failedCount: failedIds.length,
+    failedIds,
+    textApplied: text
+  };
+}
+
 export async function archiveProductPassport(id: string): Promise<SafeProductPassportRow | null> {
   const existing = await getProductPassportById(id);
 
