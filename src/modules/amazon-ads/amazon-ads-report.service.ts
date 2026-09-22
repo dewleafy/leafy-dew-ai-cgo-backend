@@ -1461,6 +1461,27 @@ export async function listAdvertisedProductMetricsForDateRange(input: {
   return ((data ?? []) as AdvertisedProductMetricRow[]).map(toSafeAdvertisedProductMetric);
 }
 
+// The earliest date this seller has any real per-ASIN ad spend data at all.
+// Used to tell the founder honestly when an order shows ₹0 ad spend because
+// there genuinely was none that day, versus because this report type didn't
+// exist yet when that order happened (it only started syncing 2026-09-22).
+export async function getEarliestAdvertisedProductMetricDate(sellerId: string): Promise<string | null> {
+  const { data, error } = await supabase
+    .from("amazon_ads_advertised_product_daily_metrics")
+    .select("report_date")
+    .eq("seller_id", sellerId)
+    .order("report_date", { ascending: true })
+    .limit(1);
+
+  if (error) {
+    logSafeAmazonAdsSupabaseError("Could not load earliest advertised product metric date.", error);
+    return null;
+  }
+
+  const row = Array.isArray(data) && data[0] ? (data[0] as { report_date?: string }).report_date : null;
+  return row ?? null;
+}
+
 function isAsinSearchTerm(searchTerm: string): boolean {
   return /^B[A-Z0-9]{9}$/i.test(searchTerm.trim());
 }
