@@ -3,6 +3,7 @@ import { z } from "zod";
 import {
   archiveProductPassport,
   bulkApplyStandardComplianceNotes,
+  bulkApplyTestTubePlanterPackageContents,
   createProductPassport,
   getProductPassportById,
   isProductPassportStatus,
@@ -234,6 +235,21 @@ export async function postProductPassportBulkComplianceNotesRoute(req: Request, 
     res.json({ ok: true, sellerId, ...result });
   } catch (error) {
     sendDatabaseError(res, error instanceof Error ? error.message : "Could not apply compliance notes in bulk.");
+  }
+}
+
+// Founder-triggered, one-click bulk write scoped to the Test Tube Planter wall-hanging family --
+// see bulkApplyTestTubePlanterPackageContents for the founder confirmation and the exact name-match
+// scoping. Only touches products that don't already have a package_contents value.
+export async function postProductPassportBulkPackageContentsRoute(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+  const rawText = typeof (req.body as { text?: unknown } | undefined)?.text === "string" ? (req.body as { text: string }).text : undefined;
+
+  try {
+    const result = await bulkApplyTestTubePlanterPackageContents({ sellerId, text: rawText });
+    res.json({ ok: true, sellerId, ...result });
+  } catch (error) {
+    sendDatabaseError(res, error instanceof Error ? error.message : "Could not apply package contents in bulk.");
   }
 }
 
