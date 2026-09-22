@@ -1,10 +1,10 @@
 import { supabase } from "../../db/supabase";
 import { cleanText, logSafeAmazonSpError, toNumberOrNull } from "../amazon-sp/amazon-sp-utils";
 import { AmazonSpOrderItemRow, AmazonSpOrderRow } from "../amazon-sp/amazon-sp.types";
-import { listAmazonSpListings } from "../amazon-sp/amazon-sp.service";
+import { listProductPassports } from "../product-passports/product-passports.service";
 import { listProductEconomics } from "../product-economics/product-economics.service";
 import { SafeProductEconomicsRow } from "../product-economics/product-economics.types";
-import { listAdvertisedProductMetricsForDateRange } from "../amazon-ads/amazon-ads-report.service";
+import { getEarliestAdvertisedProductMetricDate, listAdvertisedProductMetricsForDateRange } from "../amazon-ads/amazon-ads-report.service";
 import {
   OrderEconomicsFeeBreakdown,
   OrderEconomicsLine,
@@ -25,7 +25,8 @@ const CAVEATS: string[] = [
   "Returns and refunds are not yet tracked (no Amazon Returns or Settlement feed connected yet), so an order shown as profit here can still turn into a loss later if it is returned.",
   "Cancelled orders are excluded from every total on this page.",
   "A product with no saved cost data in Product Economics shows as \"Needs cost data\" instead of a guessed profit number.",
-  "Customer details are limited to the ship-to city/state/postal code Amazon's general order report provides. Buyer name and street address are Amazon-restricted PII that this app does not currently have separate approved access to."
+  "Customer details are limited to the ship-to city/state/postal code Amazon's general order report provides. Buyer name and street address are Amazon-restricted PII that this app does not currently have separate approved access to.",
+  "\"Repeat customer\" is an approximate signal based on matching ship-to city/state/postal code across orders, not a verified buyer identity (Amazon does not expose buyer name or email to this app). Two different households that share a delivery address — an apartment block, an office, a PO box — can show as a false match, and this signal can only see orders whose ship-to data has been backfilled."
 ];
 
 function roundTwo(value: number): number {
@@ -118,6 +119,119 @@ function extractShipToInfo(rawPayload: Record<string, unknown> | null): {
   };
 }
 
+function shipToAddressKey(shipTo: { shipToCity: string | null; shipToState: string | null; shipToPostalCode: string | null }): string | null {
+  const city = normalizeKey(shipTo.shipToCity);
+  const state = normalizeKey(shipTo.shipToState);
+  const postal = normalizeKey(shipTo.shipToPostalCode);
+  // Postal code alone is the strongest signal Amazon gives us (city/state
+  // names vary in casing/spelling across orders); require at least postal
+  // code + one of city/state so two same-named-but-different towns can't
+  // collide.
+  if (!postal || (!city && !state)) return null;
+  return `${postal}|${city ?? ""}|${state ?? ""}`;
+}
+
+// A repeat-customer signal built only from ship-to address matching, since
+// Amazon does not give this app the buyer's real name or email (that needs
+// a separate, Amazon-approved restricted-data grant this app does not have —
+// see the caveat on this response). This scans the seller's FULL order
+// history, not just the requested date range, so a customer who ordered
+// three months ago still counts as a "repeat" today, and only strengthens
+// as more historical orders get their ship-to data backfilled.
+type ShipToAddressHistoryEntry = {
+  shipToOrderCount: number;
+  otherOrders: Array<{ amazonOrderId: string; purchaseDate: string | null; orderRevenue: number; productSummary: string | null }>;
+};
+
+async function loadShipToAddressHistory(sellerId: string): Promise<Map<string, ShipToAddressHistoryEntry>> {
+  const { data: allOrders, error } = await supabase
+    .from("amazon_sp_orders")
+    .select("amazon_order_id, purchase_date, order_status, raw_payload")
+    .eq("seller_id", sellerId)
+    .limit(2000);
+
+  if (error) {
+    logSafeAmazonSpError("Could not load Amazon SP-API order history for repeat-customer matching.", error);
+    return new Map();
+  }
+
+  const rows = (allOrders ?? []) as Array<Pick<AmazonSpOrderRow, "amazon_order_id" | "purchase_date" | "order_status" | "raw_payload">>;
+  const groups = new Map<string, Array<{ amazonOrderId: string; purchaseDate: string | null }>>();
+
+  for (const row of rows) {
+    if (isCancelledStatus(row.order_status)) continue;
+    const shipTo = extractShipToInfo(row.raw_payload as Record<string, unknown> | null);
+    const key = shipToAddressKey(shipTo);
+    if (!key) continue;
+    const list = groups.get(key) ?? [];
+    list.push({ amazonOrderId: row.amazon_order_id, purchaseDate: row.purchase_date });
+    groups.set(key, list);
+  }
+
+  const repeatGroups = new Map<string, Array<{ amazonOrderId: string; purchaseDate: string | null }>>();
+  const involvedOrderIds = new Set<string>();
+  for (const [key, list] of groups.entries()) {
+    if (list.length < 2) continue;
+    repeatGroups.set(key, list);
+    for (const entry of list) involvedOrderIds.add(entry.amazonOrderId);
+  }
+
+  if (involvedOrderIds.size === 0) {
+    return new Map();
+  }
+
+  const { data: itemRows, error: itemError } = await supabase
+    .from("amazon_sp_order_items")
+    .select("amazon_order_id, title, item_price_amount, promotion_discount_amount")
+    .eq("seller_id", sellerId)
+    .in("amazon_order_id", Array.from(involvedOrderIds));
+
+  if (itemError) {
+    logSafeAmazonSpError("Could not load order items for repeat-customer address history.", itemError);
+  }
+
+  const revenueByOrderId = new Map<string, number>();
+  const titlesByOrderId = new Map<string, string[]>();
+  for (const item of (itemRows ?? []) as Array<Pick<AmazonSpOrderItemRow, "amazon_order_id" | "title" | "item_price_amount" | "promotion_discount_amount">>) {
+    const price = toNumberOrNull(item.item_price_amount) ?? 0;
+    const promo = toNumberOrNull(item.promotion_discount_amount) ?? 0;
+    revenueByOrderId.set(item.amazon_order_id, roundTwo((revenueByOrderId.get(item.amazon_order_id) ?? 0) + (price - promo)));
+    const title = cleanText(item.title);
+    if (title) {
+      const titles = titlesByOrderId.get(item.amazon_order_id) ?? [];
+      if (!titles.includes(title)) titles.push(title);
+      titlesByOrderId.set(item.amazon_order_id, titles);
+    }
+  }
+
+  const summaryByOrderId = new Map<string, { amazonOrderId: string; purchaseDate: string | null; orderRevenue: number; productSummary: string | null }>();
+  for (const orderId of involvedOrderIds) {
+    const entry = rows.find((row) => row.amazon_order_id === orderId);
+    const titles = titlesByOrderId.get(orderId) ?? [];
+    summaryByOrderId.set(orderId, {
+      amazonOrderId: orderId,
+      purchaseDate: entry?.purchase_date ?? null,
+      orderRevenue: revenueByOrderId.get(orderId) ?? 0,
+      productSummary: titles.length > 0 ? titles.slice(0, 3).join(", ") + (titles.length > 3 ? ", …" : "") : null
+    });
+  }
+
+  const result = new Map<string, {
+    shipToOrderCount: number;
+    otherOrders: Array<{ amazonOrderId: string; purchaseDate: string | null; orderRevenue: number; productSummary: string | null }>;
+  }>();
+
+  for (const [key, list] of repeatGroups.entries()) {
+    const sorted = [...list].sort((a, b) => (b.purchaseDate ?? "").localeCompare(a.purchaseDate ?? ""));
+    const enriched = sorted
+      .map((entry) => summaryByOrderId.get(entry.amazonOrderId))
+      .filter((entry): entry is { amazonOrderId: string; purchaseDate: string | null; orderRevenue: number; productSummary: string | null } => Boolean(entry));
+    result.set(key, { shipToOrderCount: list.length, otherOrders: enriched });
+  }
+
+  return result;
+}
+
 function buildFeeBreakdown(economics: SafeProductEconomicsRow, multiplier: number): OrderEconomicsFeeBreakdown {
   const round = (value: number) => Math.round(value * multiplier * 100) / 100;
   return {
@@ -132,18 +246,26 @@ function buildFeeBreakdown(economics: SafeProductEconomicsRow, multiplier: numbe
   };
 }
 
-function buildImageMaps(listings: Array<{ sku: string; asin: string | null; mainImageUrl: string | null; imageUrl: string | null }>): {
+// Images come from Product Passports (backed by the real Amazon Listings
+// Items API, which syncAmazonSpListingAttributes already pulls in the
+// background), not from amazon_sp_listings — that table is populated from
+// Amazon's GET_MERCHANT_LISTINGS_ALL_DATA flat-file report, which has no
+// image column at all, so joining against it always returned nothing.
+function buildImageMaps(passports: Array<{ sku: string | null; asin: string | null; mainImageUrl: string | null; imageUrl: string | null; imageUrls: unknown[] }>): {
   bySku: Map<string, string>;
   byAsin: Map<string, string>;
 } {
   const bySku = new Map<string, string>();
   const byAsin = new Map<string, string>();
 
-  for (const listing of listings) {
-    const image = listing.mainImageUrl ?? listing.imageUrl ?? null;
+  for (const passport of passports) {
+    const firstFromList = Array.isArray(passport.imageUrls)
+      ? passport.imageUrls.find((value): value is string => typeof value === "string" && value.trim().length > 0)
+      : undefined;
+    const image = passport.mainImageUrl ?? passport.imageUrl ?? firstFromList ?? null;
     if (!image) continue;
-    const skuKey = normalizeKey(listing.sku);
-    const asinKey = normalizeKey(listing.asin);
+    const skuKey = normalizeKey(passport.sku);
+    const asinKey = normalizeKey(passport.asin);
     if (skuKey && !bySku.has(skuKey)) bySku.set(skuKey, image);
     if (asinKey && !byAsin.has(asinKey)) byAsin.set(asinKey, image);
   }
@@ -176,12 +298,21 @@ export async function getOrderEconomics(input: {
   const sellerId = cleanText(input.sellerId) ?? "default";
   const { startDate, endDate } = input;
 
-  const [{ orders, itemsByOrderId }, economicsRows, adMetrics, listings] = await Promise.all([
+  const [{ orders, itemsByOrderId }, economicsRows, adMetrics, passports, addressHistory, adSpendDataAvailableFrom] = await Promise.all([
     loadOrdersAndItems(sellerId, startDate, endDate),
     listProductEconomics(sellerId),
     listAdvertisedProductMetricsForDateRange({ sellerId, startDate, endDate }),
-    listAmazonSpListings(sellerId, 500).catch(() => [])
+    listProductPassports({ sellerId, limit: 500 }).catch(() => []),
+    loadShipToAddressHistory(sellerId).catch(() => new Map<string, ShipToAddressHistoryEntry>()),
+    getEarliestAdvertisedProductMetricDate(sellerId).catch(() => null)
   ]);
+
+  const dynamicCaveats = [...CAVEATS];
+  if (adSpendDataAvailableFrom && startDate < adSpendDataAvailableFrom) {
+    dynamicCaveats.push(
+      `Real per-product ad spend data only exists from ${adSpendDataAvailableFrom} onward — orders before that date show ₹0 ad spend because this app wasn't collecting that data yet, not because there was none. Revenue and cost figures for those older orders are still real.`
+    );
+  }
 
   const emptySummary: OrderEconomicsSummary = {
     ordersConsidered: 0,
@@ -206,12 +337,12 @@ export async function getOrderEconomics(input: {
       topLossProducts: [],
       topProfitProducts: [],
       productsNeedingCostData: [],
-      caveats: CAVEATS
+      caveats: dynamicCaveats
     };
   }
 
   const { bySku: economicsBySku, byAsin: economicsByAsin } = buildEconomicsMaps(economicsRows);
-  const { bySku: imageBySku, byAsin: imageByAsin } = buildImageMaps(listings);
+  const { bySku: imageBySku, byAsin: imageByAsin } = buildImageMaps(passports);
 
   // Sum real ad cost per ASIN per day, pooled across every campaign/ad group
   // that advertised it that day.
@@ -315,6 +446,11 @@ export async function getOrderEconomics(input: {
     const orderNonAdCost = hasAllCostData ? roundTwo(lines.reduce((sum, line) => sum + (line.nonAdCostTotal ?? 0), 0)) : null;
     const orderEstimatedProfit = hasAllCostData ? roundTwo(orderRevenue - (orderNonAdCost ?? 0) - orderAdSpend) : null;
     const shipToInfo = extractShipToInfo(order.raw_payload);
+    const addressKey = shipToAddressKey(shipToInfo);
+    const addressEntry = addressKey ? addressHistory.get(addressKey) : undefined;
+    const otherOrdersAtAddress = addressEntry
+      ? addressEntry.otherOrders.filter((entry) => entry.amazonOrderId !== order.amazon_order_id)
+      : [];
 
     orderRows.push({
       amazonOrderId: order.amazon_order_id,
@@ -329,7 +465,10 @@ export async function getOrderEconomics(input: {
       orderNonAdCost,
       orderAdSpend,
       orderEstimatedProfit,
-      profitStatus: classifyProfitStatus(orderEstimatedProfit)
+      profitStatus: classifyProfitStatus(orderEstimatedProfit),
+      isRepeatShipTo: otherOrdersAtAddress.length > 0,
+      shipToOrderCount: addressEntry?.shipToOrderCount ?? (shipToInfo.shipToCity || shipToInfo.shipToState ? 1 : 0),
+      otherOrdersAtAddress
     });
   }
 
@@ -429,6 +568,6 @@ export async function getOrderEconomics(input: {
     topLossProducts,
     topProfitProducts,
     productsNeedingCostData,
-    caveats: CAVEATS
+    caveats: dynamicCaveats
   };
 }
