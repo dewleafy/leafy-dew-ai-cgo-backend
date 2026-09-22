@@ -5,11 +5,15 @@ import { getFirstAmazonAdsProfile } from "../amazon-ads/amazon-ads-profile.servi
 import { getAmazonAdsAccessToken } from "../amazon-ads/amazon-ads-token.service";
 import { AmazonAdsConnection } from "../amazon-ads/amazon-ads.types";
 import {
+  downloadAndSaveAdvertisedProductReport,
   downloadAndSaveSearchTermReport,
+  hasAdvertisedProductReportJobForDate,
   hasSearchTermReportJobForDate,
+  listProcessableAdvertisedProductReportJobs,
   listProcessableSearchTermReportJobs,
   markAmazonAdsReportJobSynced,
   refreshAmazonAdsReportJobStatus,
+  requestSponsoredProductsAdvertisedProductReport,
   requestSponsoredProductsSearchTermReport
 } from "../amazon-ads/amazon-ads-report.service";
 
@@ -240,6 +244,130 @@ async function runSearchTermSync(sellerId: string): Promise<string> {
   }
 }
 
+// Same reasoning and same fire-and-poll pattern as runSearchTermSync above,
+// but for the "Advertised Product" report -- the only Amazon Ads report type
+// that ties spend/sales to a specific ASIN/SKU. Nothing was pulling this
+// report at all before, so there was no real per-product ad spend data for
+// the order-economics module to blend into individual orders.
+function getAdvertisedProductTargetDate(): string {
+  // Same reasoning as search terms: "today" isn't final yet on Amazon's side,
+  // so always sync yesterday's complete day.
+  return new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+async function markAdvertisedProductReportJobFailed(jobId: string, reason: string): Promise<void> {
+  const { error } = await supabase
+    .from("amazon_ads_report_jobs")
+    .update({
+      status: "FAILED",
+      failure_reason: reason,
+      completed_at: new Date().toISOString()
+    })
+    .eq("id", jobId);
+
+  if (error) {
+    logger.warn("Could not mark stale Amazon Ads advertised product report job as failed.", {
+      jobId,
+      message: error.message
+    });
+  }
+}
+
+async function runAdvertisedProductSync(sellerId: string): Promise<string> {
+  try {
+    const connection = await findConnectedAmazonAdsAccount(sellerId);
+
+    if (!connection) {
+      return "Advertised product: no connected Amazon Ads account, skipped.";
+    }
+
+    const profile = await getFirstAmazonAdsProfile(connection.id);
+
+    if (!profile) {
+      return "Advertised product: no Amazon Ads profile found, skipped.";
+    }
+
+    const effectiveSellerId = connection.seller_id ?? sellerId;
+
+    // First, finish any report already in flight so a report that just
+    // completed gets downloaded within minutes, not hours.
+    const pendingJobs = await listProcessableAdvertisedProductReportJobs({
+      connectionId: connection.id,
+      profileId: profile.profile_id,
+      sellerId: effectiveSellerId,
+      limit: 5
+    });
+
+    if (pendingJobs.length > 0) {
+      const accessToken = await getAmazonAdsAccessToken(connection.id);
+      const results: string[] = [];
+
+      for (const job of pendingJobs) {
+        let currentJob = job;
+
+        if (currentJob.status.toUpperCase() !== "COMPLETED") {
+          currentJob = await refreshAmazonAdsReportJobStatus({
+            accessToken,
+            region: connection.region,
+            job: currentJob
+          });
+        }
+
+        if (currentJob.status.toUpperCase() === "COMPLETED" && currentJob.report_url) {
+          try {
+            const savedCount = await downloadAndSaveAdvertisedProductReport(currentJob);
+            await markAmazonAdsReportJobSynced(currentJob.id);
+            results.push(`saved ${savedCount} row(s) for ${currentJob.start_date}`);
+          } catch (downloadError) {
+            // Most likely cause: the report finished a while ago and Amazon's
+            // download link has since expired. Stop retrying this job and let
+            // the next tick request a fresh report instead.
+            const message = downloadError instanceof Error ? downloadError.message : "Unknown error";
+            await markAdvertisedProductReportJobFailed(currentJob.id, message);
+            results.push(
+              `could not download the report for ${currentJob.start_date} (link likely expired) — will request a fresh one next run`
+            );
+          }
+        } else {
+          results.push(`still ${currentJob.status} for ${currentJob.start_date}`);
+        }
+      }
+
+      return `Advertised product: ${results.join("; ")}.`;
+    }
+
+    // Nothing in flight — request one new report per day (per date), fully
+    // automatic like every other background sync in this app.
+    const targetDate = getAdvertisedProductTargetDate();
+    const alreadyRequested = await hasAdvertisedProductReportJobForDate({
+      connectionId: connection.id,
+      profileId: profile.profile_id,
+      sellerId: effectiveSellerId,
+      date: targetDate
+    });
+
+    if (alreadyRequested) {
+      return `Advertised product: already up to date for ${targetDate}.`;
+    }
+
+    const accessToken = await getAmazonAdsAccessToken(connection.id);
+    await requestSponsoredProductsAdvertisedProductReport({
+      accessToken,
+      region: connection.region,
+      profileId: profile.profile_id,
+      connectionId: connection.id,
+      sellerId: effectiveSellerId,
+      date: targetDate
+    });
+
+    return `Advertised product: requested a new report for ${targetDate}.`;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    logger.warn("Background advertised product sync failed.", { message });
+    return `Advertised product sync skipped this run (${message}).`;
+  }
+}
+
 async function runBackgroundAmazonSync(sellerId: string = DEFAULT_SELLER_ID): Promise<void> {
   if (isRunning) {
     logger.info("Background Amazon sync already running, skipping this tick.");
@@ -250,8 +378,9 @@ async function runBackgroundAmazonSync(sellerId: string = DEFAULT_SELLER_ID): Pr
     const listingsSummary = await runListingsDiscovery(sellerId);
     const attributesSummary = await runAttributeSync(sellerId);
     const searchTermSummary = await runSearchTermSync(sellerId);
+    const advertisedProductSummary = await runAdvertisedProductSync(sellerId);
     lastRunAt = new Date().toISOString();
-    lastRunSummary = `${listingsSummary} ${attributesSummary} ${searchTermSummary}`;
+    lastRunSummary = `${listingsSummary} ${attributesSummary} ${searchTermSummary} ${advertisedProductSummary}`;
     logger.info("Background Amazon sync completed.", { summary: lastRunSummary });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
