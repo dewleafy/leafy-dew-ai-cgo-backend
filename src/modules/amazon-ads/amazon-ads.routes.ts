@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { asyncHandler } from "../../utils/async-handler";
 import {
+  getAmazonAdsAdvertisedProductDailyMetrics,
   getAmazonAdsConfigCheck,
   getAmazonAdsConnectUrl,
   getAmazonAdsCampaigns,
@@ -16,14 +17,18 @@ import {
   getAmazonAdsStatus,
   getAmazonAdsStoresProbe,
   handleAmazonAdsCallback,
+  postAmazonAdsBackfillAdvertisedProductReports,
   postAmazonAdsBackfillCampaignReports,
   postAmazonAdsBackfillSearchTermReports,
   postAmazonAdsDailyCampaignSync,
+  postAmazonAdsDownloadAdvertisedProductReport,
   postAmazonAdsDownloadCampaignReport,
   postAmazonAdsDownloadSearchTermReport,
   postAmazonAdsDisconnect,
+  postAmazonAdsProcessAdvertisedProductReportJobs,
   postAmazonAdsProcessCampaignReportJobs,
   postAmazonAdsProcessSearchTermReportJobs,
+  postAmazonAdsRequestAdvertisedProductReport,
   postAmazonAdsRequestCampaignReport,
   postAmazonAdsRequestSearchTermReport,
   postAmazonAdsSyncCampaigns,
@@ -43,18 +48,32 @@ amazonAdsRouter.get("/saved-campaigns", asyncHandler(getAmazonAdsSavedCampaigns)
 amazonAdsRouter.get("/campaign-daily-metrics", asyncHandler(getAmazonAdsCampaignDailyMetrics));
 amazonAdsRouter.get("/search-term-daily-metrics", asyncHandler(getAmazonAdsSearchTermDailyMetrics));
 amazonAdsRouter.get("/search-term-summary", asyncHandler(getAmazonAdsSearchTermSummary));
+amazonAdsRouter.get("/advertised-product-daily-metrics", asyncHandler(getAmazonAdsAdvertisedProductDailyMetrics));
 amazonAdsRouter.get("/ppc-recommendations", asyncHandler(getAmazonAdsPpcRecommendations));
 amazonAdsRouter.get("/dashboard-summary", asyncHandler(getAmazonAdsDashboardSummary));
 amazonAdsRouter.get("/stores-probe", asyncHandler(getAmazonAdsStoresProbe));
 amazonAdsRouter.get("/report-job/:jobId", asyncHandler(getAmazonAdsReportJob));
 amazonAdsRouter.post("/request-campaign-report", asyncHandler(postAmazonAdsRequestCampaignReport));
 amazonAdsRouter.post("/request-search-term-report", asyncHandler(postAmazonAdsRequestSearchTermReport));
+amazonAdsRouter.post("/request-advertised-product-report", asyncHandler(postAmazonAdsRequestAdvertisedProductReport));
 amazonAdsRouter.post("/download-campaign-report/:jobId", asyncHandler(postAmazonAdsDownloadCampaignReport));
 amazonAdsRouter.post("/download-search-term-report/:jobId", asyncHandler(postAmazonAdsDownloadSearchTermReport));
+amazonAdsRouter.post(
+  "/download-advertised-product-report/:jobId",
+  asyncHandler(postAmazonAdsDownloadAdvertisedProductReport)
+);
 amazonAdsRouter.post("/backfill-campaign-reports", asyncHandler(postAmazonAdsBackfillCampaignReports));
 amazonAdsRouter.post("/backfill-search-term-reports", asyncHandler(postAmazonAdsBackfillSearchTermReports));
+amazonAdsRouter.post(
+  "/backfill-advertised-product-reports",
+  asyncHandler(postAmazonAdsBackfillAdvertisedProductReports)
+);
 amazonAdsRouter.post("/process-campaign-report-jobs", asyncHandler(postAmazonAdsProcessCampaignReportJobs));
 amazonAdsRouter.post("/process-search-term-report-jobs", asyncHandler(postAmazonAdsProcessSearchTermReportJobs));
+amazonAdsRouter.post(
+  "/process-advertised-product-report-jobs",
+  asyncHandler(postAmazonAdsProcessAdvertisedProductReportJobs)
+);
 amazonAdsRouter.post("/daily-campaign-sync", asyncHandler(postAmazonAdsDailyCampaignSync));
 amazonAdsRouter.post("/sync-campaigns", asyncHandler(postAmazonAdsSyncCampaigns));
 amazonAdsRouter.post("/test-connection", asyncHandler(postAmazonAdsTestConnection));
