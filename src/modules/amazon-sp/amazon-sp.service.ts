@@ -2421,7 +2421,12 @@ export async function createDailyAmazonSpSyncJobs(sellerIdInput: string) {
   const connection = await requireConnectedConnection(sellerId);
   const accessToken = await getAmazonSpAccessToken(connection.id);
   const orderEndMs = Date.now() - 2 * 60 * 1000;
-  const orderStartMs = orderEndMs - 30 * 24 * 60 * 60 * 1000;
+  // Widened from 30 to 90 days so ship-to address data (buyer city/state/
+  // postal code, used for the repeat-customer signal and the order detail
+  // sheet) keeps getting refreshed for older orders too, not just the most
+  // recent month. Every daily run still re-pulls this whole window, so this
+  // is a resync of the same recent history, just further back.
+  const orderStartMs = orderEndMs - 90 * 24 * 60 * 60 * 1000;
   const orderDataStartTime = new Date(orderStartMs).toISOString();
   const orderDataEndTime = new Date(orderEndMs).toISOString();
   const listingReportId = await createListingsReport(accessToken, connection.region, connection.marketplace_id);
@@ -2429,7 +2434,7 @@ export async function createDailyAmazonSpSyncJobs(sellerIdInput: string) {
     accessToken,
     region: connection.region,
     marketplaceId: connection.marketplace_id,
-    days: 30,
+    days: 90,
     reportType: ORDERS_REPORT_TYPE,
     dataStartTime: orderDataStartTime,
     dataEndTime: orderDataEndTime
