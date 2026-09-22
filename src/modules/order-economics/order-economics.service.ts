@@ -1,10 +1,12 @@
 import { supabase } from "../../db/supabase";
 import { cleanText, logSafeAmazonSpError, toNumberOrNull } from "../amazon-sp/amazon-sp-utils";
 import { AmazonSpOrderItemRow, AmazonSpOrderRow } from "../amazon-sp/amazon-sp.types";
+import { listAmazonSpListings } from "../amazon-sp/amazon-sp.service";
 import { listProductEconomics } from "../product-economics/product-economics.service";
 import { SafeProductEconomicsRow } from "../product-economics/product-economics.types";
 import { listAdvertisedProductMetricsForDateRange } from "../amazon-ads/amazon-ads-report.service";
 import {
+  OrderEconomicsFeeBreakdown,
   OrderEconomicsLine,
   OrderEconomicsOrderRow,
   OrderEconomicsProductRollup,
@@ -22,7 +24,8 @@ const CAVEATS: string[] = [
   "Costs use each product's saved fee estimate from Product Economics (referral fee, closing fee, shipping, pick & pack, storage, GST), not Amazon's real Settlement/Finance report. Treat every number here as an estimate, not a settled figure.",
   "Returns and refunds are not yet tracked (no Amazon Returns or Settlement feed connected yet), so an order shown as profit here can still turn into a loss later if it is returned.",
   "Cancelled orders are excluded from every total on this page.",
-  "A product with no saved cost data in Product Economics shows as \"Needs cost data\" instead of a guessed profit number."
+  "A product with no saved cost data in Product Economics shows as \"Needs cost data\" instead of a guessed profit number.",
+  "Customer details are limited to the ship-to city/state/postal code Amazon's general order report provides. Buyer name and street address are Amazon-restricted PII that this app does not currently have separate approved access to."
 ];
 
 function roundTwo(value: number): number {
@@ -100,6 +103,54 @@ async function loadOrdersAndItems(sellerId: string, startDate: string, endDate: 
   return { orders, itemsByOrderId };
 }
 
+function extractShipToInfo(rawPayload: Record<string, unknown> | null): {
+  shipToCity: string | null;
+  shipToState: string | null;
+  shipToPostalCode: string | null;
+  shipToCountry: string | null;
+} {
+  const payload = rawPayload ?? {};
+  return {
+    shipToCity: cleanText(typeof payload.shipCity === "string" ? payload.shipCity : null),
+    shipToState: cleanText(typeof payload.shipState === "string" ? payload.shipState : null),
+    shipToPostalCode: cleanText(typeof payload.shipPostalCode === "string" ? payload.shipPostalCode : null),
+    shipToCountry: cleanText(typeof payload.shipCountry === "string" ? payload.shipCountry : null)
+  };
+}
+
+function buildFeeBreakdown(economics: SafeProductEconomicsRow, multiplier: number): OrderEconomicsFeeBreakdown {
+  const round = (value: number) => Math.round(value * multiplier * 100) / 100;
+  return {
+    landedCost: round(economics.landedCost),
+    referralFee: round(economics.referralFee),
+    closingFee: round(economics.closingFee),
+    shippingFee: round(economics.shippingFee),
+    pickAndPackFee: round(economics.pickAndPackFee),
+    storageFee: round(economics.storageFee),
+    gstOnAmazonFees: round(economics.gstOnAmazonFees),
+    returnReservePerUnit: round(economics.returnReservePerUnit)
+  };
+}
+
+function buildImageMaps(listings: Array<{ sku: string; asin: string | null; mainImageUrl: string | null; imageUrl: string | null }>): {
+  bySku: Map<string, string>;
+  byAsin: Map<string, string>;
+} {
+  const bySku = new Map<string, string>();
+  const byAsin = new Map<string, string>();
+
+  for (const listing of listings) {
+    const image = listing.mainImageUrl ?? listing.imageUrl ?? null;
+    if (!image) continue;
+    const skuKey = normalizeKey(listing.sku);
+    const asinKey = normalizeKey(listing.asin);
+    if (skuKey && !bySku.has(skuKey)) bySku.set(skuKey, image);
+    if (asinKey && !byAsin.has(asinKey)) byAsin.set(asinKey, image);
+  }
+
+  return { bySku, byAsin };
+}
+
 function buildEconomicsMaps(rows: SafeProductEconomicsRow[]): {
   bySku: Map<string, SafeProductEconomicsRow>;
   byAsin: Map<string, SafeProductEconomicsRow>;
@@ -125,10 +176,11 @@ export async function getOrderEconomics(input: {
   const sellerId = cleanText(input.sellerId) ?? "default";
   const { startDate, endDate } = input;
 
-  const [{ orders, itemsByOrderId }, economicsRows, adMetrics] = await Promise.all([
+  const [{ orders, itemsByOrderId }, economicsRows, adMetrics, listings] = await Promise.all([
     loadOrdersAndItems(sellerId, startDate, endDate),
     listProductEconomics(sellerId),
-    listAdvertisedProductMetricsForDateRange({ sellerId, startDate, endDate })
+    listAdvertisedProductMetricsForDateRange({ sellerId, startDate, endDate }),
+    listAmazonSpListings(sellerId, 500).catch(() => [])
   ]);
 
   const emptySummary: OrderEconomicsSummary = {
@@ -159,6 +211,7 @@ export async function getOrderEconomics(input: {
   }
 
   const { bySku: economicsBySku, byAsin: economicsByAsin } = buildEconomicsMaps(economicsRows);
+  const { bySku: imageBySku, byAsin: imageByAsin } = buildImageMaps(listings);
 
   // Sum real ad cost per ASIN per day, pooled across every campaign/ad group
   // that advertised it that day.
@@ -214,6 +267,9 @@ export async function getOrderEconomics(input: {
       const hasUsableCostData = Boolean(economics) && economics!.profitDataStatus === "AVAILABLE";
       const nonAdCostPerUnit = hasUsableCostData ? economics!.nonAdCost : null;
       const nonAdCostTotal = nonAdCostPerUnit !== null ? roundTwo(nonAdCostPerUnit * quantityOrdered) : null;
+      const feeBreakdownPerUnit = hasUsableCostData ? buildFeeBreakdown(economics!, 1) : null;
+      const feeBreakdownTotal = hasUsableCostData ? buildFeeBreakdown(economics!, quantityOrdered) : null;
+      const imageUrl = (skuKey ? imageBySku.get(skuKey) : undefined) ?? (asinKey ? imageByAsin.get(asinKey) : undefined) ?? null;
 
       const asinDateKey = asinKey && dateKey ? `${asinKey}|${dateKey}` : null;
       const dayAdCost = asinDateKey ? adCostByAsinDate.get(asinDateKey) ?? 0 : 0;
@@ -234,6 +290,7 @@ export async function getOrderEconomics(input: {
         sku,
         asin,
         productName: cleanText(item.title) ?? economics?.productName ?? null,
+        imageUrl,
         purchaseDate: order.purchase_date,
         quantityOrdered,
         itemRevenue,
@@ -242,6 +299,8 @@ export async function getOrderEconomics(input: {
         unitRevenue,
         nonAdCostPerUnit,
         nonAdCostTotal,
+        feeBreakdownPerUnit,
+        feeBreakdownTotal,
         allocatedAdSpend,
         hasAdSpendDataForAsinDate: dayAdCost > 0,
         estimatedProfit,
@@ -255,11 +314,15 @@ export async function getOrderEconomics(input: {
     const hasAllCostData = lines.length > 0 && lines.every((line) => line.nonAdCostTotal !== null);
     const orderNonAdCost = hasAllCostData ? roundTwo(lines.reduce((sum, line) => sum + (line.nonAdCostTotal ?? 0), 0)) : null;
     const orderEstimatedProfit = hasAllCostData ? roundTwo(orderRevenue - (orderNonAdCost ?? 0) - orderAdSpend) : null;
+    const shipToInfo = extractShipToInfo(order.raw_payload);
 
     orderRows.push({
       amazonOrderId: order.amazon_order_id,
       purchaseDate: order.purchase_date,
       orderStatus: order.order_status,
+      fulfillmentChannel: order.fulfillment_channel,
+      salesChannel: order.sales_channel,
+      ...shipToInfo,
       isCancelled: false,
       lines,
       orderRevenue,
