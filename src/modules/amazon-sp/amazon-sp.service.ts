@@ -1659,6 +1659,14 @@ function parseOrderReportText(text: string): OrderReportParsedResult {
     const asin = reportValue(row, ["asin"]);
     const title = reportValue(row, ["product-name", "item-name", "title"]);
     const currency = reportValue(row, ["currency"]) ?? "INR";
+    // Amazon's general order report includes the ship-to region (city/state/
+    // postal/country) without needing the separate restricted-PII grant that
+    // buyer name and street address require. This is order-level, not
+    // item-level, so it only needs capturing once per order below.
+    const shipCity = reportValue(row, ["ship-city"]);
+    const shipState = reportValue(row, ["ship-state"]);
+    const shipPostalCode = reportValue(row, ["ship-postal-code"]);
+    const shipCountry = reportValue(row, ["ship-country"]);
 
     const sanitizedItemPayload = {
       amazon_order_id: amazonOrderId,
@@ -1710,6 +1718,10 @@ function parseOrderReportText(text: string): OrderReportParsedResult {
         fulfillmentChannel,
         salesChannel,
         currency,
+        shipCity,
+        shipState,
+        shipPostalCode,
+        shipCountry,
         itemCount: 0
       }
     };
