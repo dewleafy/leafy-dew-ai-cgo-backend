@@ -8,6 +8,7 @@ import {
   getProductPassports,
   postProductPassport,
   postProductPassportBulkComplianceNotesRoute,
+  postProductPassportBulkPackageContentsRoute,
   putProductPassport
 } from "./product-passports.controller";
 import {
@@ -27,6 +28,7 @@ productPassportRoutes.post("/cost-completion/bulk-update", asyncHandler(postProd
 productPassportRoutes.post("/cost-completion/resolve-actions", asyncHandler(postProductPassportCostCompletionResolveActions));
 productPassportRoutes.get("/cost-completion/summary", asyncHandler(getProductPassportCostCompletionSummaryController));
 productPassportRoutes.post("/compliance-notes/bulk-apply", asyncHandler(postProductPassportBulkComplianceNotesRoute));
+productPassportRoutes.post("/package-contents/bulk-apply", asyncHandler(postProductPassportBulkPackageContentsRoute));
 productPassportRoutes.get("/:id/readiness", asyncHandler(getProductPassportReadiness));
 productPassportRoutes.get("/:id", asyncHandler(getProductPassport));
 productPassportRoutes.post("/", asyncHandler(postProductPassport));
