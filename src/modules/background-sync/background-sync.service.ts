@@ -16,6 +16,8 @@ import {
   requestSponsoredProductsAdvertisedProductReport,
   requestSponsoredProductsSearchTermReport
 } from "../amazon-ads/amazon-ads-report.service";
+import { runDailyOrchestrator } from "../daily-orchestrator/daily-orchestrator.service";
+import { generateAlerts } from "../alert-center/alert-center.service";
 
 const DEFAULT_SELLER_ID = "default";
 const INTERVAL_MS = 15 * 60 * 1000; // every 15 minutes
@@ -368,6 +370,72 @@ async function runAdvertisedProductSync(sellerId: string): Promise<string> {
   }
 }
 
+// The Daily AI-CGO orchestrator (300-engine registry + Alert Center) previously only ever
+// ran when someone opened Advanced Tools -> Automation -> "Daily AI Run" and clicked the
+// button themselves -- so it had gone quiet for weeks even though it was fully built and
+// safe (shadow mode, approval-first, no external execution). This makes it self-driving,
+// the same way every other sync in this file already is: checked every 15-minute tick, but
+// gated so the actual (heavier) engine run only fires roughly once a day, not 96 times.
+const DAILY_ORCHESTRATOR_MIN_GAP_MS = 20 * 60 * 60 * 1000;
+
+async function hasRecentScheduledOrchestratorRun(sellerId: string): Promise<boolean> {
+  const since = new Date(Date.now() - DAILY_ORCHESTRATOR_MIN_GAP_MS).toISOString();
+  const { data, error } = await supabase
+    .from("daily_orchestrator_runs")
+    .select("id")
+    .eq("seller_id", sellerId)
+    .eq("run_type", "CRON")
+    .gte("started_at", since)
+    .limit(1);
+
+  if (error) {
+    logger.warn("Could not check for a recent scheduled Daily AI-CGO run.", { message: error.message });
+    // Fail safe on a read error: assume one already ran, so a transient DB hiccup can never
+    // cause the orchestrator to fire on every single 15-minute tick back-to-back.
+    return true;
+  }
+
+  return (data ?? []).length > 0;
+}
+
+async function runScheduledDailyOrchestration(sellerId: string): Promise<string> {
+  try {
+    const alreadyRanRecently = await hasRecentScheduledOrchestratorRun(sellerId);
+    if (alreadyRanRecently) {
+      return "Daily AI-CGO: already ran in the last 20 hours, skipped.";
+    }
+
+    const result = await runDailyOrchestrator({
+      sellerId,
+      actor: "scheduler",
+      limit: 25,
+      categories: [],
+      runType: "CRON"
+    });
+
+    // Refresh the Alert Center right after, so anything the engine run just found (or any
+    // other change since the last check -- pending approvals, ACOS, cost-data gaps, etc.)
+    // is reflected before the founder next opens the Today page. generateAlerts() is
+    // idempotent -- it skips any rule that already has a matching open alert -- so calling
+    // it daily is safe and never creates duplicates.
+    const alertResult = await generateAlerts(sellerId).catch((error) => {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      logger.warn("Automatic Alert Center refresh after scheduled Daily AI-CGO run failed.", { message });
+      return null;
+    });
+    const alertText = alertResult ? ` Alert Center: ${alertResult.generatedCount} new alert(s).` : "";
+
+    return `Daily AI-CGO: ran ${result.enginesRun} engines, created ${result.actionsCreated} new recommendation(s), shadow mode only (no Amazon/Ads action taken).${alertText}`;
+  } catch (error) {
+    // runDailyOrchestrator already fails safely (shadow mode, no external action) on its own
+    // internal errors -- this catch is only for something unexpected escaping that, and must
+    // never take down the rest of this 15-minute sync tick.
+    const message = error instanceof Error ? error.message : "Unknown error";
+    logger.warn("Scheduled Daily AI-CGO run failed.", { message });
+    return `Daily AI-CGO run skipped this tick (${message}).`;
+  }
+}
+
 async function runBackgroundAmazonSync(sellerId: string = DEFAULT_SELLER_ID): Promise<void> {
   if (isRunning) {
     logger.info("Background Amazon sync already running, skipping this tick.");
@@ -379,8 +447,9 @@ async function runBackgroundAmazonSync(sellerId: string = DEFAULT_SELLER_ID): Pr
     const attributesSummary = await runAttributeSync(sellerId);
     const searchTermSummary = await runSearchTermSync(sellerId);
     const advertisedProductSummary = await runAdvertisedProductSync(sellerId);
+    const dailyOrchestratorSummary = await runScheduledDailyOrchestration(sellerId);
     lastRunAt = new Date().toISOString();
-    lastRunSummary = `${listingsSummary} ${attributesSummary} ${searchTermSummary} ${advertisedProductSummary}`;
+    lastRunSummary = `${listingsSummary} ${attributesSummary} ${searchTermSummary} ${advertisedProductSummary} ${dailyOrchestratorSummary}`;
     logger.info("Background Amazon sync completed.", { summary: lastRunSummary });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
