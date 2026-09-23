@@ -2,7 +2,13 @@ import { SafeActionLedgerRow } from "../action-ledger/action-ledger.types";
 
 // Passport draft types never go to Amazon — approving one just saves the AI-authored text
 // straight into the Product Passport row itself (the same data the Brand Readiness score reads).
-export type PassportDraftFieldType = "BRAND_POSITIONING" | "CUSTOMER_OBJECTIONS" | "PACKAGE_CONTENTS" | "COMPLIANCE_NOTES";
+export type PassportDraftFieldType =
+  | "BRAND_POSITIONING"
+  | "CUSTOMER_OBJECTIONS"
+  | "PACKAGE_CONTENTS"
+  | "COMPLIANCE_NOTES"
+  | "USE_CASE"
+  | "TARGET_CUSTOMER";
 
 export type PassportDraftExecutionResult = {
   ok: true;
