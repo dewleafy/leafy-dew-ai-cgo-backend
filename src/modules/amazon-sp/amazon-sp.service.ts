@@ -1303,7 +1303,7 @@ export async function syncAmazonSpListingAttributes(input: { sellerId: string; l
 
   const { data: rows, error: selectError } = await supabase
     .from("product_passports")
-    .select("id, sku, dimensions, weight, material, color, key_features, image_urls")
+    .select("id, sku, dimensions, weight, material, color, key_features, image_urls, category")
     .eq("seller_id", sellerId)
     .not("sku", "is", null)
     .order("updated_at", { ascending: true, nullsFirst: true })
@@ -1348,6 +1348,15 @@ export async function syncAmazonSpListingAttributes(input: { sellerId: string; l
       const updateRow: Record<string, unknown> = { updated_at: new Date().toISOString() };
 
       if (extractedProductType) updateRow.product_type = extractedProductType;
+      // Backfill the Brand Readiness "category" field from this same, already-fetched real
+      // Amazon product type whenever it's still empty. Found 2026-09-23: this sync has always
+      // set product_type from Amazon's real data (161/182 products already had it), but never
+      // copied that same real value into the separate "category" field Brand Readiness actually
+      // scores — so brandConsistency sat at 6% category coverage despite the real data already
+      // being on file. Only fills a gap, never overwrites a category a founder (or the older
+      // flat-file sync path) already set, so existing human-readable values like "Home Decor
+      // Products" are left exactly as they are.
+      if (extractedProductType && !row.category) updateRow.category = extractedProductType;
 
       // This sync is an explicit, manually-triggered action ("Sync from Amazon"), so it
       // always refreshes with Amazon's current data rather than only filling blanks —
