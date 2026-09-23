@@ -23,7 +23,15 @@ type AiDraftState = { calls: number; limit: number };
 
 type AiDraftType = Extract<
   ListingDraftType,
-  "TITLE" | "BULLETS" | "DESCRIPTION" | "BRAND_POSITIONING" | "CUSTOMER_OBJECTIONS" | "PACKAGE_CONTENTS" | "COMPLIANCE_NOTES"
+  | "TITLE"
+  | "BULLETS"
+  | "DESCRIPTION"
+  | "BRAND_POSITIONING"
+  | "CUSTOMER_OBJECTIONS"
+  | "PACKAGE_CONTENTS"
+  | "COMPLIANCE_NOTES"
+  | "USE_CASE"
+  | "TARGET_CUSTOMER"
 >;
 
 // PACKAGE_CONTENTS and COMPLIANCE_NOTES are extraction-only: the AI is instructed to reply with
@@ -200,7 +208,16 @@ const AI_DRAFT_INSTRUCTIONS: Record<AiDraftType, string> = {
   // age recommendation) is worse than no answer at all, even though this only ever saves to the
   // Product Passport and never touches the live Amazon listing.
   COMPLIANCE_NOTES:
-    `State any safety, regulatory, certification, or age-recommendation information for this product, using ONLY what is explicitly and unambiguously stated in the facts given below — most reliably the "Known key features" line, which is this seller's own real, already-published Amazon listing text. Do NOT invent, assume, imply, or add any certification, standard, safety claim, or age recommendation that is not directly and explicitly stated in the facts below — this includes never inventing things like "BIS certified", "CE marked", "food-grade", "non-toxic", or "ASTM compliant" unless those exact words or a clear, unambiguous equivalent already appear in the facts. If the facts below do not explicitly state any compliance, safety, or regulatory information, reply with exactly this one word and nothing else: ${AI_DRAFT_UNKNOWN_SENTINEL}. Otherwise reply with ONLY the compliance notes and nothing else.`
+    `State any safety, regulatory, certification, or age-recommendation information for this product, using ONLY what is explicitly and unambiguously stated in the facts given below — most reliably the "Known key features" line, which is this seller's own real, already-published Amazon listing text. Do NOT invent, assume, imply, or add any certification, standard, safety claim, or age recommendation that is not directly and explicitly stated in the facts below — this includes never inventing things like "BIS certified", "CE marked", "food-grade", "non-toxic", or "ASTM compliant" unless those exact words or a clear, unambiguous equivalent already appear in the facts. If the facts below do not explicitly state any compliance, safety, or regulatory information, reply with exactly this one word and nothing else: ${AI_DRAFT_UNKNOWN_SENTINEL}. Otherwise reply with ONLY the compliance notes and nothing else.`,
+  // Marketing judgment, not a hard fact -- same tier as BRAND_POSITIONING/CUSTOMER_OBJECTIONS, not
+  // the stricter extraction-only PACKAGE_CONTENTS/COMPLIANCE_NOTES pair. Reasonable, common-sense
+  // inference from the product's name/category/features is fine (e.g. inferring "home decor
+  // gifting" for a decorative planter with no bullet text spelling that out), but it may still not
+  // invent a spec, certification, or claim the facts don't support.
+  USE_CASE:
+    'Write a short, realistic description (1 sentence, or a few short comma-separated phrases) of how this product is typically used or the occasions/purposes it fits, using only the facts given below. Reasonable, common-sense inference from the product\'s name, category, and features is fine (e.g. a decorative wall planter is reasonably for "home decor and gifting" even if no bullet point spells that out) — but do not invent a specific technical capability, certification, or claim the facts do not support. Plain text, no HTML, no emojis, no promotional superlatives ("best", "#1", "guaranteed"). Reply with ONLY the use case text and nothing else.',
+  TARGET_CUSTOMER:
+    'Write a short description (1 to 2 sentences) of the kind of shopper likely to buy this specific product, using only the facts given below. Reasonable, common-sense inference from the product\'s name, category, features, and brand is fine (e.g. a premium wooden planter reasonably appeals to "home decor enthusiasts and plant lovers looking for a gifting-quality piece") — but do not invent specific demographic data, certifications, or claims the facts do not support. Plain text, no HTML, no emojis, no promotional superlatives ("best", "#1", "guaranteed"). Reply with ONLY the target customer description and nothing else.'
 };
 
 const AI_DRAFT_MAX_OUTPUT_TOKENS: Record<AiDraftType, number> = {
@@ -210,7 +227,9 @@ const AI_DRAFT_MAX_OUTPUT_TOKENS: Record<AiDraftType, number> = {
   BRAND_POSITIONING: 220,
   CUSTOMER_OBJECTIONS: 350,
   PACKAGE_CONTENTS: 150,
-  COMPLIANCE_NOTES: 150
+  COMPLIANCE_NOTES: 150,
+  USE_CASE: 120,
+  TARGET_CUSTOMER: 150
 };
 
 async function draftValueWithAi(input: {
@@ -425,6 +444,42 @@ async function buildCandidates(
     }
   }
 
+  // Also passport-only, also never go to Amazon. Like BRAND_POSITIONING/CUSTOMER_OBJECTIONS (not
+  // the extraction-only pair above), these are marketing judgment calls the AI may reasonably infer
+  // from the product's known facts rather than requiring an already-explicit answer -- see the
+  // USE_CASE/TARGET_CUSTOMER prompts above for the exact guardrail against inventing specs.
+  const useCase = cleanText(product.passport?.use_case);
+  if (!skipTypes.has("USE_CASE") && !useCase) {
+    const ai = await draftValueWithAi({ product, draftType: "USE_CASE", fallback: null, aiState });
+    if (ai.value) {
+      candidates.push({
+        draftType: "USE_CASE",
+        currentValue: useCase,
+        proposedValue: ai.value,
+        reason: "Use case is missing from this product's Product Passport.",
+        confidenceLabel: ai.aiCall ? "HIGH" : "LOW",
+        riskLevel: "LOW",
+        metadata: { aiCall: ai.aiCall, aiBlockedReason: ai.aiBlockedReason }
+      });
+    }
+  }
+
+  const targetCustomer = cleanText(product.passport?.target_customer);
+  if (!skipTypes.has("TARGET_CUSTOMER") && !targetCustomer) {
+    const ai = await draftValueWithAi({ product, draftType: "TARGET_CUSTOMER", fallback: null, aiState });
+    if (ai.value) {
+      candidates.push({
+        draftType: "TARGET_CUSTOMER",
+        currentValue: targetCustomer,
+        proposedValue: ai.value,
+        reason: "Target customer is missing from this product's Product Passport.",
+        confidenceLabel: ai.aiCall ? "HIGH" : "LOW",
+        riskLevel: "LOW",
+        metadata: { aiCall: ai.aiCall, aiBlockedReason: ai.aiBlockedReason }
+      });
+    }
+  }
+
   return candidates;
 }
 
@@ -611,6 +666,8 @@ function actionTypeForDraft(draftType: string): ActionLedgerActionType {
   if (draftType === "CUSTOMER_OBJECTIONS") return "PASSPORT_CUSTOMER_OBJECTIONS_DRAFT_REVIEW";
   if (draftType === "PACKAGE_CONTENTS") return "PASSPORT_PACKAGE_CONTENTS_DRAFT_REVIEW";
   if (draftType === "COMPLIANCE_NOTES") return "PASSPORT_COMPLIANCE_NOTES_DRAFT_REVIEW";
+  if (draftType === "USE_CASE") return "PASSPORT_USE_CASE_DRAFT_REVIEW";
+  if (draftType === "TARGET_CUSTOMER") return "PASSPORT_TARGET_CUSTOMER_DRAFT_REVIEW";
   return "LISTING_READINESS_REVIEW";
 }
 
@@ -730,7 +787,9 @@ export async function generateListingDrafts(sellerIdInput: string): Promise<List
     "BRAND_POSITIONING",
     "CUSTOMER_OBJECTIONS",
     "PACKAGE_CONTENTS",
-    "COMPLIANCE_NOTES"
+    "COMPLIANCE_NOTES",
+    "USE_CASE",
+    "TARGET_CUSTOMER"
   ];
 
   for (const product of products) {
