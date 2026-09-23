@@ -1383,6 +1383,19 @@ export async function syncAmazonSpListingAttributes(input: { sellerId: string; l
         }
       } else {
         skippedCount += 1;
+        // Bug found 2026-09-23: this branch used to leave the row's updated_at untouched
+        // whenever nothing new was extracted. Since the candidate query orders by
+        // updated_at ascending (nulls first) to pick the "most overdue" rows each run, a SKU
+        // that genuinely never returns useful attributes (an orphaned/child-variation SKU
+        // Amazon rejects, for example) would keep its old/null updated_at forever and stay
+        // permanently first in line — starving every real product behind it, including ones
+        // still waiting on their first category/dimensions/image backfill. Bumping the
+        // timestamp here (without counting it as a real update) sends a genuinely-tried SKU
+        // to the back of the queue instead, so the sync can reach the rest of the catalog;
+        // a SKU stuck like this simply gets retried roughly once per full cycle instead of
+        // blocking every cycle forever, and if Amazon's data for it ever improves, the next
+        // pass will still pick it up.
+        await supabase.from("product_passports").update({ updated_at: new Date().toISOString() }).eq("id", row.id);
         if (noUpdateDiagnosticsShown < 5) {
           noUpdateDiagnosticsShown += 1;
           const ownKeys = attributeKeys.slice().sort().join(", ") || "(no attributes at all)";
@@ -1399,6 +1412,17 @@ export async function syncAmazonSpListingAttributes(input: { sellerId: string; l
       }
     } catch (itemError) {
       skippedCount += 1;
+      // Same starvation fix as the skip branch above, for the "Amazon call itself failed"
+      // case (e.g. the InvalidInput errors seen on orphaned child-variation SKUs) — without
+      // this, a SKU that always errors would also camp permanently at the front of the queue.
+      await supabase
+        .from("product_passports")
+        .update({ updated_at: new Date().toISOString() })
+        .eq("id", row.id)
+        .then(
+          () => {},
+          () => {}
+        );
       const details = safeErrorDetails(itemError);
       if (typeof details === "string") {
         warnings.push(`SKU ${row.sku}: ${details}`);
