@@ -73,6 +73,12 @@ export const ACTION_LEDGER_ACTION_TYPES: ActionLedgerActionType[] = [
   // no data migration: existing rows already have the right value in the database.
   "PASSPORT_PACKAGE_CONTENTS_DRAFT_REVIEW",
   "PASSPORT_COMPLIANCE_NOTES_DRAFT_REVIEW",
+  // Added together with the ActionLedgerActionType union entry (action-ledger.types.ts) this time --
+  // see the comment above this array explaining why the two entries above once shipped without a
+  // matching runtime-array update, silently downgrading every one of those actions to "OTHER" on
+  // read. Both places are updated together here specifically to avoid repeating that bug.
+  "PASSPORT_USE_CASE_DRAFT_REVIEW",
+  "PASSPORT_TARGET_CUSTOMER_DRAFT_REVIEW",
   "IMAGE_CREATIVE_REVIEW",
   "A_PLUS_CONTENT_REVIEW",
   "LISTING_UPDATE",
