@@ -14,7 +14,15 @@ export type ListingDraftType =
   // bullet points (never inventing package items or compliance/safety claims). See the
   // PACKAGE_CONTENTS/COMPLIANCE_NOTES prompts in listing-drafts.service.ts for the exact guardrail.
   | "PACKAGE_CONTENTS"
-  | "COMPLIANCE_NOTES";
+  | "COMPLIANCE_NOTES"
+  // Also passport-only. Like BRAND_POSITIONING/CUSTOMER_OBJECTIONS (not PACKAGE_CONTENTS/
+  // COMPLIANCE_NOTES), these describe marketing judgment rather than a hard physical fact, so the
+  // AI is allowed reasonable, common-sense inference from the product's name/category/features
+  // (e.g. "home decor gifting" for a decorative planter) rather than requiring an explicit,
+  // already-stated answer. It still may not invent specs, certifications, or claims not supported
+  // by the given facts. See listing-drafts.service.ts's USE_CASE/TARGET_CUSTOMER prompts.
+  | "USE_CASE"
+  | "TARGET_CUSTOMER";
 
 export type ListingOptimizationDraftRow = {
   id: string;
