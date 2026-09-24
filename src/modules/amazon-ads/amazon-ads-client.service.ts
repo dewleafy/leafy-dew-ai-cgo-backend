@@ -227,3 +227,150 @@ export async function getSponsoredProductsCampaignsWithRaw(input: {
     throw new Error(`Amazon Ads campaigns request failed: ${sanitizeAmazonAdsLogValue(String(errorMessage))}`);
   }
 }
+
+export type CampaignStateUpdateOutcome = {
+  campaignId: string;
+  success: boolean;
+  errorMessage?: string;
+};
+
+// Writes a real state change (ENABLED/PAUSED) to one or more Sponsored Products
+// campaigns. This is the one function in this file that actually changes something
+// on Amazon rather than just reading -- used only by the ad dayparting feature, which
+// only ever pauses a campaign it itself paused or resumes one it itself paused (see
+// amazon-ads-dayparting.service.ts). Every call is logged the same way the read calls
+// above are, so a failed or partial update is always visible in amazon_ads_api_logs.
+export async function updateSponsoredProductsCampaignStates(input: {
+  accessToken: string;
+  region: AmazonAdsRegion;
+  profileId: string;
+  connectionId: string;
+  updates: Array<{ campaignId: string; state: "ENABLED" | "PAUSED" }>;
+}): Promise<CampaignStateUpdateOutcome[]> {
+  if (input.updates.length === 0) {
+    return [];
+  }
+
+  const startedAt = Date.now();
+  const endpoint = "/sp/campaigns";
+
+  try {
+    const response = await retry(() =>
+      axios.put<unknown>(
+        `${AMAZON_ADS_API_ENDPOINTS[input.region]}${endpoint}`,
+        {
+          campaigns: input.updates.map((update) => ({
+            campaignId: update.campaignId,
+            state: update.state
+          }))
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${input.accessToken}`,
+            "Amazon-Advertising-API-ClientId": process.env.AMAZON_ADS_CLIENT_ID ?? "",
+            "Amazon-Advertising-API-Scope": input.profileId,
+            "Content-Type": "application/vnd.spCampaign.v3+json",
+            Accept: "application/vnd.spCampaign.v3+json"
+          }
+        }
+      )
+    );
+
+    await logAmazonAdsApiCall({
+      connectionId: input.connectionId,
+      endpoint,
+      method: "PUT",
+      statusCode: response.status,
+      success: true,
+      durationMs: Date.now() - startedAt
+    });
+
+    return parseCampaignStateUpdateResponse(input.updates, response.data);
+  } catch (error) {
+    const statusCode = axios.isAxiosError(error) ? error.response?.status : undefined;
+    const responseBody = axios.isAxiosError(error) ? error.response?.data : undefined;
+    const errorMessage = axios.isAxiosError(error)
+      ? (responseBody && typeof responseBody === "object" && "message" in (responseBody as Record<string, unknown>)
+          ? String((responseBody as Record<string, unknown>).message)
+          : error.message)
+      : "Unknown Amazon Ads campaign update error.";
+
+    await logAmazonAdsApiCall({
+      connectionId: input.connectionId,
+      endpoint,
+      method: "PUT",
+      statusCode,
+      success: false,
+      errorMessage: sanitizeAmazonAdsLogValue(String(errorMessage)),
+      durationMs: Date.now() - startedAt
+    });
+
+    // The whole batch failed at the HTTP level (auth, throttling, malformed request) --
+    // report every campaign in this call as failed rather than guessing at a partial result.
+    const safeMessage = sanitizeAmazonAdsLogValue(String(errorMessage)) ?? "Unknown error";
+    return input.updates.map((update) => ({
+      campaignId: update.campaignId,
+      success: false,
+      errorMessage: safeMessage
+    }));
+  }
+}
+
+// Amazon's v3 Campaigns API returns per-item success/error results, but the exact
+// envelope shape isn't documented anywhere reliable -- this parses defensively across
+// the response shapes real Amazon Ads v3 endpoints are known to use, and falls back to
+// "assume success" only when the HTTP call itself returned 2xx and no per-item errors
+// were found anywhere in the body (a real failure would show up as a non-2xx above).
+function parseCampaignStateUpdateResponse(
+  updates: Array<{ campaignId: string; state: "ENABLED" | "PAUSED" }>,
+  responseData: unknown
+): CampaignStateUpdateOutcome[] {
+  const body = responseData && typeof responseData === "object" ? (responseData as Record<string, unknown>) : {};
+  const campaignsField = body.campaigns;
+  const errorEntries: Array<Record<string, unknown>> = [];
+
+  const collectErrors = (value: unknown) => {
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        if (entry && typeof entry === "object") {
+          errorEntries.push(entry as Record<string, unknown>);
+        }
+      }
+    }
+  };
+
+  if (campaignsField && typeof campaignsField === "object" && !Array.isArray(campaignsField)) {
+    collectErrors((campaignsField as Record<string, unknown>).error);
+  } else if (Array.isArray(campaignsField)) {
+    for (const entry of campaignsField) {
+      if (entry && typeof entry === "object") {
+        const record = entry as Record<string, unknown>;
+        const code = record.code ?? (record.success === false ? "ERROR" : undefined);
+        if (code) {
+          errorEntries.push(record);
+        }
+      }
+    }
+  }
+  collectErrors(body.error);
+
+  const failedCampaignIds = new Set<string>();
+  for (const entry of errorEntries) {
+    const index = typeof entry.index === "number" ? entry.index : null;
+    const campaignId =
+      typeof entry.campaignId === "string"
+        ? entry.campaignId
+        : index !== null && updates[index]
+          ? updates[index].campaignId
+          : null;
+    if (campaignId) {
+      failedCampaignIds.add(campaignId);
+    }
+  }
+
+  return updates.map((update) => ({
+    campaignId: update.campaignId,
+    success: !failedCampaignIds.has(update.campaignId),
+    errorMessage: failedCampaignIds.has(update.campaignId) ? "Amazon reported this campaign update as failed." : undefined
+  }));
+}
