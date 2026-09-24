@@ -16,6 +16,9 @@ import {
   getAmazonAdsSearchTermSummary,
   getAmazonAdsStatus,
   getAmazonAdsStoresProbe,
+  getDaypartingHistoryController,
+  getDaypartingSettingsController,
+  getDaypartingStatusController,
   handleAmazonAdsCallback,
   postAmazonAdsBackfillAdvertisedProductReports,
   postAmazonAdsBackfillCampaignReports,
@@ -32,7 +35,9 @@ import {
   postAmazonAdsRequestCampaignReport,
   postAmazonAdsRequestSearchTermReport,
   postAmazonAdsSyncCampaigns,
-  postAmazonAdsTestConnection
+  postAmazonAdsTestConnection,
+  postDaypartingRunNowController,
+  putDaypartingSettingsController
 } from "./amazon-ads.controller";
 
 export const amazonAdsRouter = Router();
@@ -78,3 +83,8 @@ amazonAdsRouter.post("/daily-campaign-sync", asyncHandler(postAmazonAdsDailyCamp
 amazonAdsRouter.post("/sync-campaigns", asyncHandler(postAmazonAdsSyncCampaigns));
 amazonAdsRouter.post("/test-connection", asyncHandler(postAmazonAdsTestConnection));
 amazonAdsRouter.post("/disconnect", asyncHandler(postAmazonAdsDisconnect));
+amazonAdsRouter.get("/dayparting/settings", asyncHandler(getDaypartingSettingsController));
+amazonAdsRouter.put("/dayparting/settings", asyncHandler(putDaypartingSettingsController));
+amazonAdsRouter.get("/dayparting/status", asyncHandler(getDaypartingStatusController));
+amazonAdsRouter.get("/dayparting/history", asyncHandler(getDaypartingHistoryController));
+amazonAdsRouter.post("/dayparting/run-now", asyncHandler(postDaypartingRunNowController));
