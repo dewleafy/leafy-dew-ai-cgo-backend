@@ -104,13 +104,36 @@ function normalizeCategory(value: string | null | undefined): string | null {
   return cleaned ? cleaned.toLowerCase() : null;
 }
 
+// Some products carry an informal/free-text subcategory in the Product Passport (e.g. a
+// founder or a bulk import typed "Planter" instead of picking one of the exact Amazon
+// subcategory names above). Rather than silently blocking the profit calculation for these,
+// map known informal terms to the closest real Amazon subcategory already in the table above.
+// Added 2026-09-24: "planter"/"planters" -> "home improvement - accessories", matching how the
+// other planter-type product already in this catalog (FENGZHITAO Self-Watering Planter,
+// SKU ER-NBXG-TZGE) was classified. Extend this list if the same NO_MATCH issue shows up again
+// for a different informal subcategory value.
+const subcategoryAliases: Record<string, string> = {
+  "planter": "home improvement - accessories",
+  "planters": "home improvement - accessories",
+  "plant pot": "home improvement - accessories",
+  "plant pots": "home improvement - accessories",
+  "flower pot": "home improvement - accessories",
+  "flower pots": "home improvement - accessories"
+};
+
+function resolveCategoryKey(subcategory: string): string {
+  if (referralFeeRules[subcategory]) return subcategory;
+  return subcategoryAliases[subcategory] ?? subcategory;
+}
+
 function getReferralFee(input: ProductEconomicsInput, sellingPrice: number): {
   source: "REFERRAL_FEE_TABLE" | "MISSING_SUBCATEGORY" | "NO_MATCH";
   percent: number | null;
   amount: number;
 } {
-  const subcategory = normalizeCategory(input.subcategoryOverride ?? input.subCategory);
-  if (!subcategory) return { source: "MISSING_SUBCATEGORY", percent: null, amount: 0 };
+  const rawSubcategory = normalizeCategory(input.subcategoryOverride ?? input.subCategory);
+  if (!rawSubcategory) return { source: "MISSING_SUBCATEGORY", percent: null, amount: 0 };
+  const subcategory = resolveCategoryKey(rawSubcategory);
 
   const rules = referralFeeRules[subcategory];
   if (!rules) return { source: "NO_MATCH", percent: null, amount: 0 };
