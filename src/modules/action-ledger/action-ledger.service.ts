@@ -414,11 +414,129 @@ function applyNullableDedupeFilter<T extends { eq: (column: string, value: strin
   return cleaned ? query.eq(column, cleaned) : query.is(column, null);
 }
 
+// Multiple independent things can flag the exact same real-world problem for the same
+// product/account: several of the 300 registry engines, plus the recommendation bridges
+// (PPC, product economics, CEO report). Each one calls ensureActionLedgerAction with its
+// own sourceId (often including its own engine name), so a naive exact-match dedupe never
+// catches these as the "same" card even though they are, from the founder's point of view,
+// one open issue re-flagged N times. This check looks for any OTHER still-open card for the
+// same seller + action type + product/entity, regardless of which source/engine created it,
+// before falling back to the narrower exact-source match below. It only looks at PENDING
+// cards so it never resurrects or merges into something already approved/rejected/completed.
+async function findOpenCrossSourceDuplicate(input: {
+  sellerId: string;
+  actionType: string;
+  entityType: string | null;
+  entityId: string | null;
+  sku: string | null;
+  asin: string | null;
+}): Promise<ActionLedgerRow | null> {
+  if (!input.sku && !input.asin && !input.entityId) {
+    // Nothing stable to match a different source's row against — skip the broad check
+    // rather than risk merging unrelated account-level cards together.
+    return null;
+  }
+
+  let query = supabase
+    .from("action_ledger")
+    .select("*")
+    .eq("seller_id", input.sellerId)
+    .eq("action_type", input.actionType)
+    .eq("approval_status", "PENDING")
+    .order("created_at", { ascending: true })
+    .limit(1);
+
+  if (input.sku) {
+    query = query.eq("sku", input.sku);
+  } else if (input.asin) {
+    query = query.eq("asin", input.asin);
+  } else {
+    query = query.eq("entity_id", input.entityId as string);
+    query = applyNullableDedupeFilter(query, "entity_type", input.entityType);
+  }
+
+  const { data, error } = await query.maybeSingle<ActionLedgerRow>();
+
+  if (error) {
+    logActionLedgerError("Could not check cross-source action ledger duplicate (failing open).", error);
+    return null;
+  }
+
+  return data ?? null;
+}
+
+// Keeps a record of every other engine/source that independently flagged the same issue,
+// on the one card that actually stays visible, so that signal isn't silently thrown away
+// just because we stopped creating a separate card for it. Best-effort: never blocks the
+// caller if it fails.
+async function recordCorroboratingSourceSafe(
+  actionId: string,
+  extra: { source: string; sourceId: string | null }
+): Promise<void> {
+  try {
+    const { data: existing, error: readError } = await supabase
+      .from("action_ledger")
+      .select("evidence")
+      .eq("id", actionId)
+      .maybeSingle<{ evidence: Record<string, unknown> | null }>();
+
+    if (readError || !existing) return;
+
+    const evidence = toJsonObject(existing.evidence);
+    const corroborating = Array.isArray(evidence.corroboratingSources)
+      ? (evidence.corroboratingSources as Array<{ source: string; sourceId: string | null }>)
+      : [];
+
+    const alreadyRecorded = corroborating.some(
+      (entry) => entry?.source === extra.source && entry?.sourceId === extra.sourceId
+    );
+    if (alreadyRecorded) return;
+
+    await supabase
+      .from("action_ledger")
+      .update({
+        evidence: {
+          ...evidence,
+          corroboratingSources: [
+            ...corroborating,
+            { source: extra.source, sourceId: extra.sourceId, notedAt: new Date().toISOString() }
+          ]
+        }
+      })
+      .eq("id", actionId);
+  } catch (error) {
+    logActionLedgerError(
+      "Could not record corroborating source on existing action ledger row (non-blocking).",
+      { message: error instanceof Error ? error.message : "Unknown error" }
+    );
+  }
+}
+
 export async function ensureActionLedgerAction(input: ActionLedgerInput): Promise<{ row: SafeActionLedgerRow; created: boolean }> {
   const insertRow = toInsertRow(input);
   const sellerId = String(insertRow.seller_id);
   const source = String(insertRow.source);
   const actionType = String(insertRow.action_type);
+
+  const crossSourceDuplicate = await findOpenCrossSourceDuplicate({
+    sellerId,
+    actionType,
+    entityType: (insertRow.entity_type as string | null) ?? null,
+    entityId: (insertRow.entity_id as string | null) ?? null,
+    sku: (insertRow.sku as string | null) ?? null,
+    asin: (insertRow.asin as string | null) ?? null
+  });
+
+  if (crossSourceDuplicate) {
+    await recordCorroboratingSourceSafe(crossSourceDuplicate.id, {
+      source,
+      sourceId: (insertRow.source_id as string | null) ?? null
+    });
+    return {
+      row: toSafeActionLedgerRow(crossSourceDuplicate),
+      created: false
+    };
+  }
 
   let query = supabase
     .from("action_ledger")
