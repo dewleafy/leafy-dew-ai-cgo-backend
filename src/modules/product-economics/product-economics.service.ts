@@ -104,26 +104,46 @@ function normalizeCategory(value: string | null | undefined): string | null {
   return cleaned ? cleaned.toLowerCase() : null;
 }
 
-// Some products carry an informal/free-text subcategory in the Product Passport (e.g. a
-// founder or a bulk import typed "Planter" instead of picking one of the exact Amazon
-// subcategory names above). Rather than silently blocking the profit calculation for these,
-// map known informal terms to the closest real Amazon subcategory already in the table above.
-// Added 2026-09-24: "planter"/"planters" -> "home improvement - accessories", matching how the
-// other planter-type product already in this catalog (FENGZHITAO Self-Watering Planter,
-// SKU ER-NBXG-TZGE) was classified. Extend this list if the same NO_MATCH issue shows up again
-// for a different informal subcategory value.
+// Some products carry an informal/free-text subcategory in the Product Passport instead of one
+// of the exact Amazon subcategory names above. Rather than silently blocking the profit
+// calculation for these, map known informal terms to the closest real Amazon subcategory
+// already in the table above.
+//
+// Added 2026-09-24: found this affecting Ziro kart products specifically, which use short
+// internal ALL_CAPS_WITH_UNDERSCORES codes (e.g. "PLANTER", "FUEL_LAMP") rather than Amazon's
+// real subcategory names the way Leafy Dew's product data does. resolveCategoryKey() below also
+// converts underscores to spaces before checking this list, so any other Ziro kart code in the
+// same style will match here once its underscore-to-space form is added.
+//
+// - "planter"/"planters"/"plant pot(s)"/"flower pot(s)" -> "home improvement - accessories",
+//   matching how the other planter-type product already in this catalog (FENGZHITAO
+//   Self-Watering Planter, SKU ER-NBXG-TZGE) was classified.
+// - "fuel lamp" -> "home decor products", for Ziro kart's gold-plated diya/deepam stand
+//   (SKU Ziro kart_ LD25UD002G_New) — a decorative pooja/festival item, not an electric
+//   lighting fixture, so "home decor products" fits better than "indoor lighting".
+//
+// Extend this list if the same NO_MATCH issue shows up again for a different informal value —
+// worth also flagging to the founder that fixing this at the source (using Amazon's real
+// subcategory names when Ziro kart product data is entered) would prevent it recurring.
 const subcategoryAliases: Record<string, string> = {
   "planter": "home improvement - accessories",
   "planters": "home improvement - accessories",
   "plant pot": "home improvement - accessories",
   "plant pots": "home improvement - accessories",
   "flower pot": "home improvement - accessories",
-  "flower pots": "home improvement - accessories"
+  "flower pots": "home improvement - accessories",
+  "fuel lamp": "home decor products"
 };
 
 function resolveCategoryKey(subcategory: string): string {
   if (referralFeeRules[subcategory]) return subcategory;
-  return subcategoryAliases[subcategory] ?? subcategory;
+  if (subcategoryAliases[subcategory]) return subcategoryAliases[subcategory];
+  const spaced = subcategory.replace(/_/g, " ").trim();
+  if (spaced !== subcategory) {
+    if (referralFeeRules[spaced]) return spaced;
+    if (subcategoryAliases[spaced]) return subcategoryAliases[spaced];
+  }
+  return subcategory;
 }
 
 function getReferralFee(input: ProductEconomicsInput, sellingPrice: number): {
@@ -1077,7 +1097,8 @@ export async function getCostCompletionQueue(sellerIdInput: string): Promise<Cos
       amazonImagePreferred: Boolean(input.listing)
     });
     const missingFields: string[] = [];
-    const hasSubcategoryMatch = Boolean(subcategory && referralFeeRules[normalizeCategory(subcategory) ?? ""]);
+    const normalizedSubcategory = normalizeCategory(subcategory);
+    const hasSubcategoryMatch = Boolean(normalizedSubcategory && referralFeeRules[resolveCategoryKey(normalizedSubcategory)]);
 
     if (!subcategory || !hasSubcategoryMatch) missingFields.push("subcategory");
     if (!existingEconomics || productCost <= 0) missingFields.push("productCost");
