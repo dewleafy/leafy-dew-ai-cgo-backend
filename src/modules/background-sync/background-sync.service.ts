@@ -18,6 +18,7 @@ import {
 } from "../amazon-ads/amazon-ads-report.service";
 import { runDailyOrchestrator } from "../daily-orchestrator/daily-orchestrator.service";
 import { generateAlerts } from "../alert-center/alert-center.service";
+import { runDaypartingCheck } from "../amazon-ads/amazon-ads-dayparting.service";
 
 const DEFAULT_SELLER_ID = "default";
 const INTERVAL_MS = 15 * 60 * 1000; // every 15 minutes
@@ -436,6 +437,22 @@ async function runScheduledDailyOrchestration(sellerId: string): Promise<string>
   }
 }
 
+// Checked every 15-minute tick, same as everything else in this file -- but unlike the
+// other syncs, this one can write a real state change to Amazon (pausing/resuming a real
+// Sponsored Products campaign). It does nothing at all unless the founder has explicitly
+// turned dayparting on from the app; runDaypartingCheck() itself enforces every other
+// safety rule (only pauses what's genuinely enabled, only resumes what it itself paused).
+async function runScheduledDaypartingCheck(sellerId: string): Promise<string> {
+  try {
+    const result = await runDaypartingCheck(sellerId);
+    return result.summary;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    logger.warn("Scheduled dayparting check failed.", { message });
+    return `Dayparting check skipped this tick (${message}).`;
+  }
+}
+
 async function runBackgroundAmazonSync(sellerId: string = DEFAULT_SELLER_ID): Promise<void> {
   if (isRunning) {
     logger.info("Background Amazon sync already running, skipping this tick.");
@@ -448,8 +465,9 @@ async function runBackgroundAmazonSync(sellerId: string = DEFAULT_SELLER_ID): Pr
     const searchTermSummary = await runSearchTermSync(sellerId);
     const advertisedProductSummary = await runAdvertisedProductSync(sellerId);
     const dailyOrchestratorSummary = await runScheduledDailyOrchestration(sellerId);
+    const daypartingSummary = await runScheduledDaypartingCheck(sellerId);
     lastRunAt = new Date().toISOString();
-    lastRunSummary = `${listingsSummary} ${attributesSummary} ${searchTermSummary} ${advertisedProductSummary} ${dailyOrchestratorSummary}`;
+    lastRunSummary = `${listingsSummary} ${attributesSummary} ${searchTermSummary} ${advertisedProductSummary} ${dailyOrchestratorSummary} ${daypartingSummary}`;
     logger.info("Background Amazon sync completed.", { summary: lastRunSummary });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
