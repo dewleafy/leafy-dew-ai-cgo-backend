@@ -33,6 +33,13 @@ import {
 } from "./amazon-ads-ppc-recommendation.service";
 import { syncRecommendationsToActionLedger } from "../action-ledger/action-ledger-bridge.service";
 import {
+  getOrCreateDaypartingSettings,
+  listDaypartingCampaignStates,
+  listDaypartingHistory,
+  runDaypartingCheck,
+  upsertDaypartingSettings
+} from "./amazon-ads-dayparting.service";
+import {
   downloadAndSaveAdvertisedProductReport,
   downloadAndSaveCampaignReport,
   downloadAndSaveSearchTermReport,
@@ -227,7 +234,7 @@ async function findAmazonAdsConnectionBySellerId(
   }
 }
 
-async function findAmazonAdsConnectionForCampaigns(
+export async function findAmazonAdsConnectionForCampaigns(
   sellerId: string
 ): Promise<{ ok: true; connection: AmazonAdsConnection | null } | { ok: false }> {
   try {
@@ -259,7 +266,7 @@ async function findAmazonAdsConnectionForCampaigns(
   }
 }
 
-async function loadAmazonAdsCampaignContext(
+export async function loadAmazonAdsCampaignContext(
   sellerId: string
 ): Promise<
   | { ok: true; connection: AmazonAdsConnection; profile: AmazonAdsStoredProfile }
@@ -1978,6 +1985,108 @@ export async function getAmazonAdsDbHealth(_req: Request, res: Response): Promis
     ok,
     tables
   });
+}
+
+const daypartingSettingsSchema = z.object({
+  sellerId: z.string().trim().min(1).optional().default("default"),
+  enabled: z.boolean().optional(),
+  activeStartHour: z.number().int().min(0).max(23).optional(),
+  activeEndHour: z.number().int().min(0).max(23).optional()
+});
+
+export async function getDaypartingSettingsController(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+
+  try {
+    const settings = await getOrCreateDaypartingSettings(sellerId);
+    res.json({ ok: true, settings });
+  } catch (error) {
+    res.status(503).json({
+      ok: false,
+      message: "Could not load dayparting settings.",
+      details: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+  }
+}
+
+export async function putDaypartingSettingsController(req: Request, res: Response): Promise<void> {
+  const parsed = daypartingSettingsSchema.safeParse(req.body ?? {});
+
+  if (!parsed.success) {
+    res.status(400).json({
+      ok: false,
+      message: "Please check the dayparting settings input values.",
+      issues: parsed.error.issues.map((issue) => ({ path: issue.path.join("."), message: issue.message }))
+    });
+    return;
+  }
+
+  try {
+    const settings = await upsertDaypartingSettings(parsed.data);
+    res.json({ ok: true, settings });
+  } catch (error) {
+    res.status(503).json({
+      ok: false,
+      message: "Could not save dayparting settings.",
+      details: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+  }
+}
+
+export async function getDaypartingStatusController(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+
+  try {
+    const [settings, campaignStates] = await Promise.all([
+      getOrCreateDaypartingSettings(sellerId),
+      listDaypartingCampaignStates(sellerId)
+    ]);
+    const systemPaused = campaignStates.filter((row) => row.pausedBySystem);
+    res.json({
+      ok: true,
+      settings,
+      systemPausedCount: systemPaused.length,
+      campaignStates
+    });
+  } catch (error) {
+    res.status(503).json({
+      ok: false,
+      message: "Could not load dayparting status.",
+      details: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+  }
+}
+
+export async function getDaypartingHistoryController(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+  const limit = typeof req.query.limit === "string" ? Number(req.query.limit) : 50;
+
+  try {
+    const history = await listDaypartingHistory(sellerId, Number.isFinite(limit) ? limit : 50);
+    res.json({ ok: true, history });
+  } catch (error) {
+    res.status(503).json({
+      ok: false,
+      message: "Could not load dayparting history.",
+      details: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+  }
+}
+
+export async function postDaypartingRunNowController(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+
+  try {
+    const result = await runDaypartingCheck(sellerId);
+    res.json({ ok: true, ...result });
+  } catch (error) {
+    logger.warn("Manual dayparting check failed.", { sellerId, message: getSafeAmazonAdsUnknownErrorMessage(error) });
+    res.status(503).json({
+      ok: false,
+      message: "Could not run the dayparting check.",
+      details: getSafeAmazonAdsUnknownErrorMessage(error)
+    });
+  }
 }
 
 export async function getAmazonAdsStoresProbe(req: Request, res: Response): Promise<void> {
