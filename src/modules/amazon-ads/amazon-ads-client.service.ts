@@ -276,16 +276,28 @@ export async function updateSponsoredProductsCampaignStates(input: {
       )
     );
 
+    const outcomes = parseCampaignStateUpdateResponse(input.updates, response.data);
+    const failedOutcomes = outcomes.filter((outcome) => !outcome.success);
+
+    // Amazon can return HTTP 2xx for this endpoint while still rejecting individual
+    // campaigns inside the response body -- log the real per-item outcome here instead
+    // of a blanket "success: true", so a partial failure is actually visible in
+    // amazon_ads_api_logs rather than looking like a clean successful call.
     await logAmazonAdsApiCall({
       connectionId: input.connectionId,
       endpoint,
       method: "PUT",
       statusCode: response.status,
-      success: true,
+      success: failedOutcomes.length === 0,
+      errorMessage: failedOutcomes.length
+        ? sanitizeAmazonAdsLogValue(
+            failedOutcomes.map((outcome) => `${outcome.campaignId}: ${outcome.errorMessage}`).join(" | ")
+          )
+        : undefined,
       durationMs: Date.now() - startedAt
     });
 
-    return parseCampaignStateUpdateResponse(input.updates, response.data);
+    return outcomes;
   } catch (error) {
     const statusCode = axios.isAxiosError(error) ? error.response?.status : undefined;
     const responseBody = axios.isAxiosError(error) ? error.response?.data : undefined;
@@ -314,6 +326,27 @@ export async function updateSponsoredProductsCampaignStates(input: {
       errorMessage: safeMessage
     }));
   }
+}
+
+// Pulls together whatever fields Amazon actually put on a per-item error entry into one
+// readable string. The exact envelope shape isn't documented anywhere reliable, so this
+// checks every field name Amazon's v3 endpoints are known to use for the error code and
+// the human-readable explanation, rather than assuming one fixed shape.
+function describeCampaignUpdateError(entry: Record<string, unknown>): string {
+  const firstString = (...values: unknown[]): string | null => {
+    for (const value of values) {
+      if (typeof value === "string" && value.trim()) return value.trim();
+    }
+    return null;
+  };
+
+  const code = firstString(entry.code, entry.errorType, entry.errorCode);
+  const detail = firstString(entry.details, entry.description, entry.message, entry.errorMessage, entry.reason);
+
+  if (code && detail) return `${code}: ${detail}`;
+  if (detail) return detail;
+  if (code) return code;
+  return "Amazon reported this campaign update as failed (no further detail in the response).";
 }
 
 // Amazon's v3 Campaigns API returns per-item success/error results, but the exact
@@ -354,7 +387,7 @@ function parseCampaignStateUpdateResponse(
   }
   collectErrors(body.error);
 
-  const failedCampaignIds = new Set<string>();
+  const errorByCampaignId = new Map<string, string>();
   for (const entry of errorEntries) {
     const index = typeof entry.index === "number" ? entry.index : null;
     const campaignId =
@@ -363,14 +396,15 @@ function parseCampaignStateUpdateResponse(
         : index !== null && updates[index]
           ? updates[index].campaignId
           : null;
-    if (campaignId) {
-      failedCampaignIds.add(campaignId);
+    if (campaignId && !errorByCampaignId.has(campaignId)) {
+      const readable = describeCampaignUpdateError(entry);
+      errorByCampaignId.set(campaignId, sanitizeAmazonAdsLogValue(readable) ?? readable);
     }
   }
 
   return updates.map((update) => ({
     campaignId: update.campaignId,
-    success: !failedCampaignIds.has(update.campaignId),
-    errorMessage: failedCampaignIds.has(update.campaignId) ? "Amazon reported this campaign update as failed." : undefined
+    success: !errorByCampaignId.has(update.campaignId),
+    errorMessage: errorByCampaignId.get(update.campaignId)
   }));
 }
