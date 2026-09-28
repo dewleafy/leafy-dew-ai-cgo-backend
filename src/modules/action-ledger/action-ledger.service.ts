@@ -338,13 +338,22 @@ export async function listActionLedgerRows(input: {
   sku?: string;
   asin?: string;
   limit: number;
+  // Added 2026-09-28: this endpoint's `offset` query param was silently ignored - every "page"
+  // request returned byte-identical rows, making anything past the first `limit` invisible
+  // through the API (real backlog was 697 rows; the frontend could never see past 200 of them).
+  // Supabase's range() is the paginated equivalent of limit() - offset defaults to 0 so every
+  // existing caller (none of which passed offset) behaves exactly as before.
+  offset?: number;
 }): Promise<SafeActionLedgerRow[]> {
+  const offset = Math.max(Math.floor(input.offset ?? 0), 0);
+  const limit = Math.max(Math.floor(input.limit), 1);
+
   let query = supabase
     .from("action_ledger")
     .select("*")
     .eq("seller_id", cleanText(input.sellerId) ?? "default")
     .order("created_at", { ascending: false })
-    .limit(input.limit);
+    .range(offset, offset + limit - 1);
 
   if (input.approvalStatus) query = query.eq("approval_status", input.approvalStatus);
   if (input.state) query = query.eq("state", input.state);
