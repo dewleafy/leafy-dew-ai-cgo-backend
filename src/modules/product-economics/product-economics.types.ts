@@ -39,6 +39,16 @@ export type ProductEconomicsInput = {
   targetProfit?: number;
   preserveMissingRequiredProfit?: boolean;
   notes?: string | null;
+  // Real-cost-of-a-return inputs (added 2026-09-28, founder-confirmed business process):
+  // most returns ARE resold after a repackaging job, and damaged units are claimed back from
+  // Amazon rather than absorbed as a full loss - see returnRecoverable below.
+  returnPenaltyFractionPercent?: number;
+  returnRecoverable?: boolean;
+  repackagingCost?: number;
+  // TCS (Tax Collected at Source, ~0.5% of ex-GST sale value on every Amazon India order) -
+  // a real cash deduction that IS reclaimable as a credit, so it reduces cash-in-hand today
+  // but not true economic profit. See tcsAmount / realCashToday on the calculation output.
+  tcsPercent?: number;
 };
 
 export type ProfitBand = {
@@ -102,6 +112,18 @@ export type ProductEconomicsCalculation = {
   approval: ProfitBandApproval | null;
   feeRulesVersion: string;
   reason: string;
+  // Added 2026-09-28 — see product-economics.service.ts header comment for the full rationale.
+  referralFeeConfidence: "CONFIRMED" | "UNVERIFIED_LEGACY";
+  closingFeeChannelUsed: string;
+  refundCommissionPerReturn: number;
+  tcsAmount: number;
+  amazonSettlementEstimate: number | null;
+  realCashToday: number | null;
+  realAdSpendPerUnit: number | null;
+  realAdSpendWindowDays: number | null;
+  realAdSpendDataAvailable: boolean;
+  realNetProfitAfterAds: number | null;
+  realProfitMarginPercent: number | null;
 };
 
 export type ProductEconomicsExplanation = {
@@ -145,6 +167,22 @@ export type ProductEconomicsRow = {
   notes: string | null;
   created_at: string | null;
   updated_at: string | null;
+  // Added 2026-09-28 by amazon_product_economics_real_profit.sql - nullable/defaulted so this
+  // reads safely even before that migration has been run in a given environment.
+  return_penalty_fraction_percent?: number | string | null;
+  return_recoverable?: boolean | null;
+  repackaging_cost?: number | string | null;
+  tcs_percent?: number | string | null;
+  tcs_amount?: number | string | null;
+  amazon_settlement_estimate?: number | string | null;
+  real_cash_today?: number | string | null;
+  referral_fee_confidence?: string | null;
+  closing_fee_channel_used?: string | null;
+  refund_commission_per_return?: number | string | null;
+  real_ad_spend_per_unit?: number | string | null;
+  real_ad_spend_window_days?: number | string | null;
+  real_ad_spend_data_available?: boolean | null;
+  real_net_profit_after_ads?: number | string | null;
 };
 
 export type SafeProductEconomicsRow = {
@@ -210,6 +248,22 @@ export type SafeProductEconomicsRow = {
   notes: string | null;
   createdAt: string | null;
   updatedAt: string | null;
+  // Added 2026-09-28 - see product-economics.service.ts header comment.
+  returnPenaltyFractionPercent: number;
+  returnRecoverable: boolean;
+  repackagingCost: number;
+  tcsPercent: number;
+  tcsAmount: number;
+  amazonSettlementEstimate: number | null;
+  realCashToday: number | null;
+  referralFeeConfidence: "CONFIRMED" | "UNVERIFIED_LEGACY";
+  closingFeeChannelUsed: string;
+  refundCommissionPerReturn: number;
+  realAdSpendPerUnit: number | null;
+  realAdSpendWindowDays: number | null;
+  realAdSpendDataAvailable: boolean;
+  realNetProfitAfterAds: number | null;
+  realProfitMarginPercent: number | null;
 };
 
 export type CostCompletionQueueRow = {
