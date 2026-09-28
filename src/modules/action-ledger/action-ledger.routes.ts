@@ -15,6 +15,7 @@ import {
   getActionLedgerRows,
   getActionLedgerSummaryRoute,
   getActionLedgerWorkflowRoute,
+  getPpcGuardrailTriageRoute,
   monitorActionLedgerRow,
   postActionLedgerRow,
   reopenActionLedgerRow,
@@ -29,6 +30,7 @@ actionLedgerRoutes.get("/summary", asyncHandler(getActionLedgerSummaryRoute));
 actionLedgerRoutes.post(["", "/"], asyncHandler(postActionLedgerRow));
 actionLedgerRoutes.post("/sync-recommendations", asyncHandler(syncRecommendationsToActionLedgerRoute));
 actionLedgerRoutes.get("/daily-priorities", asyncHandler(getActionLedgerDailyPrioritiesRoute));
+actionLedgerRoutes.get("/ppc-guardrail-triage", asyncHandler(getPpcGuardrailTriageRoute));
 actionLedgerRoutes.post("/batch/reject", asyncHandler(batchRejectActionLedgerRows));
 actionLedgerRoutes.post("/batch/monitor", asyncHandler(batchMonitorActionLedgerRows));
 actionLedgerRoutes.post("/batch/complete", asyncHandler(batchCompleteActionLedgerRows));
