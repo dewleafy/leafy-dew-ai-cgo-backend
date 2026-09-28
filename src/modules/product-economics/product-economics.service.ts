@@ -71,13 +71,31 @@ function parseWeightKg(weight: string | null | undefined): number {
   return match ? toNumber(match[1]) : 0;
 }
 
-const FEE_RULES_VERSION = "amazon_fee_engine_v1_strict";
+const FEE_RULES_VERSION = "amazon_fee_engine_v2_real_data_2026_09_28";
+
+// referralFeeRules — 2026-09-28 update.
+//
+// Amazon introduced a zero-referral-fee-under-Rs.1,000 policy in March 2026 across a large
+// share of its India catalog. Two categories below have been directly, word-for-word confirmed
+// against Amazon's own live Referral Fees table (sell.amazon.in/fees-and-pricing, re-checked
+// 2026-09-25) AND cross-checked against real August 2026 settlement data for this account:
+//   - "home decor products": 0% <= Rs.1,000, 17% above (was wrongly coded here as a flat 12%
+//     above 1000 - the confirmed real rate is 17%, not 12%).
+//   - "home improvement - accessories": 0% <= Rs.1,000, 13.5% above (was wrongly coded as a
+//     flat 12% at ANY price - this category never had its zero-fee tier at all before this fix).
+// Every OTHER category below is still the ORIGINAL, UNVERIFIED flat rate this file has always
+// used. Given how broad Amazon's March 2026 policy change was, it is very likely several of
+// these are also wrong (missing a zero-fee-under-Rs.1,000 tier), but each one needs its own
+// check against Amazon's live fee table before being changed - do not assume the same fix
+// applies without checking, and do not guess a number that hasn't been confirmed (see
+// referralFeeConfidence on the calculation output, which flags exactly this).
+const CONFIRMED_REFERRAL_CATEGORIES = new Set(["home decor products", "home improvement - accessories"]);
 
 const referralFeeRules: Record<string, Array<{ maxPrice: number; percent: number }>> = {
-  "home decor products": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "home decor products": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 17 }],
   "home - other products": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
   "home improvement - other products": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
-  "home improvement - accessories": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "home improvement - accessories": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 13.5 }],
   "home storage": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
   "home furnishing": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
   "home - fragrance & candles": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
@@ -150,30 +168,141 @@ function getReferralFee(input: ProductEconomicsInput, sellingPrice: number): {
   source: "REFERRAL_FEE_TABLE" | "MISSING_SUBCATEGORY" | "NO_MATCH";
   percent: number | null;
   amount: number;
+  confidence: "CONFIRMED" | "UNVERIFIED_LEGACY";
 } {
   const rawSubcategory = normalizeCategory(input.subcategoryOverride ?? input.subCategory);
-  if (!rawSubcategory) return { source: "MISSING_SUBCATEGORY", percent: null, amount: 0 };
+  if (!rawSubcategory) return { source: "MISSING_SUBCATEGORY", percent: null, amount: 0, confidence: "UNVERIFIED_LEGACY" };
   const subcategory = resolveCategoryKey(rawSubcategory);
+  const confidence: "CONFIRMED" | "UNVERIFIED_LEGACY" = CONFIRMED_REFERRAL_CATEGORIES.has(subcategory)
+    ? "CONFIRMED"
+    : "UNVERIFIED_LEGACY";
 
   const rules = referralFeeRules[subcategory];
-  if (!rules) return { source: "NO_MATCH", percent: null, amount: 0 };
+  if (!rules) return { source: "NO_MATCH", percent: null, amount: 0, confidence };
 
   const rule = rules.find((item) => sellingPrice <= item.maxPrice);
-  if (!rule) return { source: "NO_MATCH", percent: null, amount: 0 };
+  if (!rule) return { source: "NO_MATCH", percent: null, amount: 0, confidence };
 
   return {
     source: "REFERRAL_FEE_TABLE",
     percent: rule.percent,
-    amount: roundTwo((sellingPrice * rule.percent) / 100)
+    amount: roundTwo((sellingPrice * rule.percent) / 100),
+    confidence
   };
 }
 
-function getClosingFee(sellingPrice: number, categoryException?: boolean | null): number {
-  if (categoryException) return 0;
-  if (sellingPrice <= 250) return 5;
-  if (sellingPrice <= 500) return 22;
-  if (sellingPrice <= 1000) return 25;
-  return 50;
+// getClosingFee — rewritten 2026-09-28.
+//
+// The previous version used ONE flat schedule (<=250:5, <=500:22, <=1000:25, else:50) regardless
+// of fulfillment channel, and had never been updated for Amazon's Sept 7, 2026 closing-fee
+// increase (confirmed live on Amazon's fees page: +Rs.1 for items <=Rs.500, +Rs.3 above). Real
+// August 2026 settlement data for this account's Easy Ship orders confirms the Easy Ship figures
+// below EXACTLY (Rs.2 for <=300, Rs.23 for 301-500). The FC, Self Ship and Seller Flex figures
+// come from Amazon's own published post-increase rate but have NOT been checked against a real
+// settled order on those channels for this account (this account's real order data seen so far
+// is 100% Easy Ship) - safe to use, worth a real-order check if/when this account starts
+// fulfilling through one of those other channels.
+//
+// categoryException keeps its EXISTING meaning from before this change (a flag that fully waives
+// the closing fee to Rs.0) - that behavior is unchanged here, since it was not part of what was
+// checked/confirmed this round.
+const CLOSING_FEE_BANDS: Record<string, Array<{ maxPrice: number; fee: number }>> = {
+  fc: [
+    { maxPrice: 300, fee: 27 },
+    { maxPrice: 500, fee: 23 },
+    { maxPrice: 1000, fee: 25 },
+    { maxPrice: Number.POSITIVE_INFINITY, fee: 75 }
+  ],
+  easy_ship: [
+    { maxPrice: 300, fee: 2 },
+    { maxPrice: 500, fee: 23 },
+    { maxPrice: 1000, fee: 36 },
+    { maxPrice: Number.POSITIVE_INFINITY, fee: 67 }
+  ],
+  easy_ship_prime: [
+    { maxPrice: 300, fee: 2 },
+    { maxPrice: 500, fee: 23 },
+    { maxPrice: 1000, fee: 36 },
+    { maxPrice: Number.POSITIVE_INFINITY, fee: 67 }
+  ],
+  self_ship: [
+    { maxPrice: 300, fee: 20 },
+    { maxPrice: 500, fee: 26 },
+    { maxPrice: 1000, fee: 50 },
+    { maxPrice: Number.POSITIVE_INFINITY, fee: 100 }
+  ],
+  seller_flex: [
+    { maxPrice: 300, fee: 7 },
+    { maxPrice: 500, fee: 13 },
+    { maxPrice: 1000, fee: 36 },
+    { maxPrice: Number.POSITIVE_INFINITY, fee: 67 }
+  ]
+};
+
+function getClosingFee(
+  sellingPrice: number,
+  categoryException: boolean | null | undefined,
+  fulfillmentType: string | null | undefined
+): { fee: number; channelUsed: string } {
+  if (categoryException) return { fee: 0, channelUsed: "category_exception_waived" };
+
+  const normalizedChannel = normalizeFulfillmentType(fulfillmentType);
+  // Default to Easy Ship when the channel is missing/unrecognized - this account's real orders
+  // are overwhelmingly Easy Ship, so this is the safer fallback than the old channel-blind table.
+  const channelKey = normalizedChannel && CLOSING_FEE_BANDS[normalizedChannel] ? normalizedChannel : "easy_ship";
+  const bands = CLOSING_FEE_BANDS[channelKey];
+  const band = bands.find((item) => sellingPrice <= item.maxPrice) ?? bands[bands.length - 1];
+
+  return { fee: band.fee, channelUsed: channelKey };
+}
+
+// getRefundCommission — Amazon India's real "Refund Commission" charge, confirmed 2026-09-25
+// against real August 2026 settlement data (7 of 9 real refunded orders matched one of these two
+// figures with no exceptions) and against Amazon India seller-forum reports describing the same
+// fee. Charged INSTEAD of reversing the original referral+closing fee on some refunds.
+function getRefundCommission(sellingPrice: number): number {
+  if (sellingPrice <= 0) return 0;
+  return sellingPrice <= 300 ? 59 : 88.5; // Rs.50+18% GST, or Rs.75+18% GST
+}
+
+// getReturnCostPerUnit — replaces the old flat "10% of selling price" return reserve.
+//
+// Built 2026-09-28 from real, direct evidence: querying every refunded order in the real August
+// 2026 settlement CSV found 6 of 9 refunds (66.7%) never had their original referral+closing fee
+// OR their shipping fee reversed, and instead were charged a brand-new Refund Commission - a
+// genuine "triple hit," not just a lost sale. The other 3 of 9 (33.3%) got everything reversed
+// cleanly with no extra fee cost. This blends both outcomes using the real split, then smears the
+// expected extra cost across the successful (non-returned) orders - the same math the founder
+// described from his own observed 1-in-4 return pattern ("divide return charges in 3 orders"),
+// generalized to any return rate: cost * (rate/100) / (1 - rate/100).
+//
+// returnRecoverable (founder-confirmed 2026-09-28): most returned units ARE resold after a
+// repackaging job (his stated cost: ~Rs.10), and damaged units are claimed back from Amazon
+// rather than absorbed as a full loss - so the default product-cost impact of a return is the
+// repackaging cost, not the full purchase price. Set returnRecoverable=false for a specific
+// product/case that is genuinely a total write-off.
+function getReturnCostPerUnit(input: {
+  returnRatePercent: number;
+  returnPenaltyFractionPercent: number;
+  returnRecoverable: boolean;
+  repackagingCost: number;
+  referralFee: number;
+  closingFee: number;
+  shippingFee: number;
+  productCost: number;
+  sellingPrice: number;
+}): number {
+  if (input.returnRatePercent <= 0) return 0;
+
+  const refundCommission = getRefundCommission(input.sellingPrice);
+  const penaltyCost = input.referralFee + input.closingFee + input.shippingFee + refundCommission;
+  const penaltyFraction = Math.min(Math.max(input.returnPenaltyFractionPercent, 0), 100) / 100;
+  const expectedFeeCost = penaltyFraction * penaltyCost;
+  const productLossPerReturn = input.returnRecoverable ? input.repackagingCost : input.productCost;
+  const totalCostPerReturn = expectedFeeCost + productLossPerReturn;
+
+  const rate = Math.min(Math.max(input.returnRatePercent, 0), 99.9) / 100;
+  return roundTwo((totalCostPerReturn * rate) / (1 - rate));
 }
 
 function getShippingFee(input: ProductEconomicsInput): number {
@@ -476,11 +605,18 @@ export function calculateProductEconomics(input: ProductEconomicsInput): Product
   const { targetProfit, targetProfitRule } = getTargetProfit(input);
   const productGstRatePercent = toNumber(input.productGstRatePercent ?? 18);
   const amazonFeeGstRatePercent = toNumber(input.amazonFeeGstRatePercent ?? 18);
-  const returnRatePercent = toNumber(input.returnRatePercent ?? 10);
+  // Default changed 10 -> 25 on 2026-09-28: the founder's own stated, observed return pattern
+  // is "1 in 4 orders returned" (25%). Still fully overridable per product.
+  const returnRatePercent = toNumber(input.returnRatePercent ?? 25);
+  const returnPenaltyFractionPercent = toNumber(input.returnPenaltyFractionPercent ?? 66.7);
+  const returnRecoverable = input.returnRecoverable ?? true;
+  const repackagingCost = toNumber(input.repackagingCost ?? 10);
+  const tcsPercent = toNumber(input.tcsPercent ?? 0.5);
   const minimumApprovedProfit = toNumber(input.minimumApprovedProfit ?? targetProfit);
   const profitFlexEnabled = Boolean(input.profitFlexEnabled);
   const referralFee = getReferralFee(input, sellingPrice);
-  const closingFee = getClosingFee(sellingPrice, input.categoryException);
+  const closingFeeResult = getClosingFee(sellingPrice, input.categoryException, input.fulfillmentType);
+  const closingFee = closingFeeResult.fee;
   const shippingFee = getShippingFee(input);
   const pickAndPackFee = getPickAndPackFee(input);
   const storageFee = getStorageFee(input);
@@ -497,12 +633,31 @@ export function calculateProductEconomics(input: ProductEconomicsInput): Product
   const hasMissingRequiredProfit = input.preserveMissingRequiredProfit === true && targetProfit <= 0;
   const hasMissingSubcategory = referralFee.source === "MISSING_SUBCATEGORY";
   const hasReferralNoMatch = referralFee.source === "NO_MATCH";
-  const returnReservePerUnit = roundTwo(sellingPrice * (returnRatePercent / 100));
+  // Real, evidence-based return cost (see getReturnCostPerUnit) - replaces the old flat
+  // "10% of selling price" placeholder with the confirmed triple-hit / resale-aware model.
+  const returnReservePerUnit = getReturnCostPerUnit({
+    returnRatePercent,
+    returnPenaltyFractionPercent,
+    returnRecoverable,
+    repackagingCost,
+    referralFee: referralFee.amount,
+    closingFee,
+    shippingFee,
+    productCost,
+    sellingPrice
+  });
   const netProfitBeforeAds =
     netRevenueBeforeGst === null
       ? null
       : roundTwo(netRevenueBeforeGst - productCost - totalAmazonFees - gstOnAmazonFees - returnReservePerUnit);
   const nonAdCost = roundTwo(productCost + totalAmazonFees + gstOnAmazonFees + returnReservePerUnit);
+  // "Real Cash From Amazon Today" vs. true profit - the same distinction proven out in the
+  // founder's Excel profit calculator this week: Amazon Settlement is what actually lands in the
+  // bank (after TCS withholding), which is different from true economic profit (which credits
+  // TCS back, since it's a reclaimable tax credit, not a real expense).
+  const amazonSettlementEstimate = sellingPrice > 0 ? roundTwo(sellingPrice - totalAmazonFees - gstOnAmazonFees) : null;
+  const tcsAmount = netRevenueBeforeGst === null ? 0 : roundTwo(netRevenueBeforeGst * (tcsPercent / 100));
+  const realCashToday = amazonSettlementEstimate === null ? null : roundTwo(amazonSettlementEstimate - tcsAmount);
   const maxAllowableAdSpend = netProfitBeforeAds === null ? 0 : netProfitBeforeAds - targetProfit;
   const breakEvenAcos = sellingPrice > 0 && netProfitBeforeAds !== null ? (netProfitBeforeAds / sellingPrice) * 100 : 0;
   const targetAcos = sellingPrice > 0 && netProfitBeforeAds !== null ? (maxAllowableAdSpend / sellingPrice) * 100 : 0;
@@ -580,7 +735,24 @@ export function calculateProductEconomics(input: ProductEconomicsInput): Product
     recommendedProfitBandReason: recommendation.recommendedProfitBandReason,
     approval: recommendation.approval,
     feeRulesVersion: FEE_RULES_VERSION,
-    reason
+    reason,
+    referralFeeConfidence: referralFee.confidence,
+    closingFeeChannelUsed: closingFeeResult.channelUsed,
+    refundCommissionPerReturn: getRefundCommission(sellingPrice),
+    tcsAmount,
+    amazonSettlementEstimate,
+    realCashToday,
+    // Real ad spend needs a live Supabase lookup (amazon_ads_advertised_product_daily_metrics),
+    // which this function can't do since it's a pure/sync calculator. saveProductEconomics()
+    // fills these in for real, persisted rows right after calling this function - see
+    // getRealAdSpendPerUnit() below. getProductEconomicsFormulaCheckExample() and any other
+    // caller of this function directly will correctly see these as "not available" rather than
+    // a guessed number.
+    realAdSpendPerUnit: null,
+    realAdSpendWindowDays: null,
+    realAdSpendDataAvailable: false,
+    realNetProfitAfterAds: null,
+    realProfitMarginPercent: null
   };
 }
 
@@ -741,7 +913,38 @@ export function toSafeProductEconomicsRow(row: ProductEconomicsRow): SafeProduct
         : getProfitReason(row.profit_status),
     notes: row.notes,
     createdAt: row.created_at,
-    updatedAt: row.updated_at
+    updatedAt: row.updated_at,
+    // Added 2026-09-28 - read from the new columns (amazon_product_economics_real_profit.sql).
+    // Falls back to sensible defaults if that migration hasn't been run yet in a given
+    // environment, so this never throws on an older row shape.
+    returnPenaltyFractionPercent: row.return_penalty_fraction_percent !== undefined && row.return_penalty_fraction_percent !== null
+      ? toNumber(row.return_penalty_fraction_percent)
+      : 66.7,
+    returnRecoverable: row.return_recoverable ?? true,
+    repackagingCost: row.repackaging_cost !== undefined && row.repackaging_cost !== null ? toNumber(row.repackaging_cost) : 10,
+    tcsPercent: row.tcs_percent !== undefined && row.tcs_percent !== null ? toNumber(row.tcs_percent) : 0.5,
+    tcsAmount: toNumber(row.tcs_amount),
+    amazonSettlementEstimate: row.amazon_settlement_estimate !== undefined && row.amazon_settlement_estimate !== null
+      ? toNumber(row.amazon_settlement_estimate)
+      : null,
+    realCashToday: row.real_cash_today !== undefined && row.real_cash_today !== null ? toNumber(row.real_cash_today) : null,
+    referralFeeConfidence: (row.referral_fee_confidence as SafeProductEconomicsRow["referralFeeConfidence"]) ?? "UNVERIFIED_LEGACY",
+    closingFeeChannelUsed: row.closing_fee_channel_used ?? "easy_ship",
+    refundCommissionPerReturn: toNumber(row.refund_commission_per_return),
+    realAdSpendPerUnit: row.real_ad_spend_per_unit !== undefined && row.real_ad_spend_per_unit !== null
+      ? toNumber(row.real_ad_spend_per_unit)
+      : null,
+    realAdSpendWindowDays: row.real_ad_spend_window_days !== undefined && row.real_ad_spend_window_days !== null
+      ? toNumber(row.real_ad_spend_window_days)
+      : null,
+    realAdSpendDataAvailable: Boolean(row.real_ad_spend_data_available),
+    realNetProfitAfterAds: row.real_net_profit_after_ads !== undefined && row.real_net_profit_after_ads !== null
+      ? toNumber(row.real_net_profit_after_ads)
+      : null,
+    realProfitMarginPercent:
+      row.real_net_profit_after_ads !== undefined && row.real_net_profit_after_ads !== null && toNumber(row.selling_price) > 0
+        ? roundTwo((toNumber(row.real_net_profit_after_ads) / toNumber(row.selling_price)) * 100)
+        : null
   };
 }
 
@@ -886,8 +1089,102 @@ async function ensureProductEconomicsAlerts(row: SafeProductEconomicsRow): Promi
   }
 }
 
+// getRealAdSpendPerUnit — added 2026-09-28, Workstream 1 of the founder's "make ad cost real"
+// request. The app already syncs real, per-ASIN/per-SKU daily ad spend and attributed orders
+// into amazon_ads_advertised_product_daily_metrics (built for the Sponsored Products report,
+// see amazon-ads-report.service.ts) - this reuses that same real data rather than adding a new
+// sync path. Sums cost and attributed orders over a trailing window and returns spend per unit
+// actually sold (cost / orders), which is the real, backward-looking cost of ads for this
+// product - distinct from the existing maxAllowableAdSpend/targetAcos, which are forward-looking
+// BUDGET ceilings, not what was actually spent. Both are useful; they answer different questions.
+//
+// Deliberately returns null (not 0) when there's no attributed order in the window, rather than
+// silently treating "no orders" as "no ad cost" - ads can spend real money with zero attributed
+// sales (this account's own Today page has shown ACOS above 100%), and reporting Rs.0 in that
+// case would hide exactly the problem the founder flagged ("ad cost is very high, almost the
+// product price").
+export async function getRealAdSpendPerUnit(input: {
+  sellerId: string;
+  asin?: string | null;
+  sku?: string | null;
+  windowDays?: number;
+}): Promise<{
+  adSpendPerUnit: number | null;
+  windowDays: number;
+  totalCost: number;
+  totalOrders: number;
+  dataAvailable: boolean;
+}> {
+  const windowDays = input.windowDays ?? 30;
+  const asin = cleanText(input.asin);
+  const sku = cleanText(input.sku);
+
+  if (!asin && !sku) {
+    return { adSpendPerUnit: null, windowDays, totalCost: 0, totalOrders: 0, dataAvailable: false };
+  }
+
+  const sinceDate = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  let query = supabase
+    .from("amazon_ads_advertised_product_daily_metrics")
+    .select("cost, orders")
+    .eq("seller_id", cleanText(input.sellerId) ?? "default")
+    .gte("report_date", sinceDate);
+
+  query = asin ? query.eq("advertised_asin", asin) : query.eq("advertised_sku", sku as string);
+
+  const { data, error } = await query;
+
+  if (error) {
+    logger.warn("Could not load real ad spend for product economics.", {
+      message: sanitizeErrorMessage(error.message)
+    });
+    return { adSpendPerUnit: null, windowDays, totalCost: 0, totalOrders: 0, dataAvailable: false };
+  }
+
+  const rows = (data ?? []) as Array<{ cost: number | string | null; orders: number | string | null }>;
+  const totalCost = roundTwo(rows.reduce((sum, row) => sum + toNumber(row.cost), 0));
+  const totalOrders = rows.reduce((sum, row) => sum + toNumber(row.orders), 0);
+
+  if (rows.length === 0) {
+    return { adSpendPerUnit: null, windowDays, totalCost: 0, totalOrders: 0, dataAvailable: false };
+  }
+
+  if (totalOrders <= 0) {
+    return { adSpendPerUnit: null, windowDays, totalCost, totalOrders, dataAvailable: true };
+  }
+
+  return { adSpendPerUnit: roundTwo(totalCost / totalOrders), windowDays, totalCost, totalOrders, dataAvailable: true };
+}
+
 export async function saveProductEconomics(input: ProductEconomicsInput): Promise<SafeProductEconomicsRow> {
   const calculation = calculateProductEconomics(input);
+
+  // Enrich with real ad spend right after the pure calculation - see getRealAdSpendPerUnit above.
+  // Wrapped in try/catch so a temporary Supabase hiccup on the ads tables never blocks saving the
+  // rest of a product's (already-correct) fee/profit numbers.
+  try {
+    const adSpend = await getRealAdSpendPerUnit({
+      sellerId: cleanText(input.sellerId) ?? "default",
+      asin: input.asin,
+      sku: input.sku
+    });
+    calculation.realAdSpendPerUnit = adSpend.adSpendPerUnit;
+    calculation.realAdSpendWindowDays = adSpend.windowDays;
+    calculation.realAdSpendDataAvailable = adSpend.dataAvailable;
+    calculation.realNetProfitAfterAds =
+      calculation.netProfitBeforeAds !== null && adSpend.adSpendPerUnit !== null
+        ? roundTwo(calculation.netProfitBeforeAds - adSpend.adSpendPerUnit)
+        : null;
+    calculation.realProfitMarginPercent =
+      calculation.realNetProfitAfterAds !== null && toNumber(input.sellingPrice) > 0
+        ? roundTwo((calculation.realNetProfitAfterAds / toNumber(input.sellingPrice)) * 100)
+        : null;
+  } catch (adSpendError) {
+    logger.warn("Could not enrich product economics with real ad spend.", {
+      message: sanitizeErrorMessage(adSpendError instanceof Error ? adSpendError.message : "Unknown ad spend error")
+    });
+  }
+
   const now = new Date().toISOString();
   const upsertRow = {
     seller_id: cleanText(input.sellerId) ?? "default",
@@ -916,7 +1213,22 @@ export async function saveProductEconomics(input: ProductEconomicsInput): Promis
     target_acos: calculation.targetAcos,
     profit_status: calculation.profitStatus,
     notes: buildCalculationNotes(input, calculation),
-    updated_at: now
+    updated_at: now,
+    // Added 2026-09-28 - see amazon_product_economics_real_profit.sql.
+    return_penalty_fraction_percent: roundTwo(toNumber(input.returnPenaltyFractionPercent ?? 66.7)),
+    return_recoverable: input.returnRecoverable ?? true,
+    repackaging_cost: roundTwo(toNumber(input.repackagingCost ?? 10)),
+    tcs_percent: roundTwo(toNumber(input.tcsPercent ?? 0.5)),
+    tcs_amount: calculation.tcsAmount,
+    amazon_settlement_estimate: calculation.amazonSettlementEstimate,
+    real_cash_today: calculation.realCashToday,
+    referral_fee_confidence: calculation.referralFeeConfidence,
+    closing_fee_channel_used: calculation.closingFeeChannelUsed,
+    refund_commission_per_return: calculation.refundCommissionPerReturn,
+    real_ad_spend_per_unit: calculation.realAdSpendPerUnit,
+    real_ad_spend_window_days: calculation.realAdSpendWindowDays,
+    real_ad_spend_data_available: calculation.realAdSpendDataAvailable,
+    real_net_profit_after_ads: calculation.realNetProfitAfterAds
   };
 
   const sellerId = cleanText(input.sellerId) ?? "default";
