@@ -16,6 +16,9 @@ import {
   ActionLedgerSource,
   ActionLedgerState,
   ActionLedgerSummary,
+  PpcGuardrailCampaignGroup,
+  PpcGuardrailProductGroup,
+  PpcGuardrailTriageReport,
   SafeActionLedgerRow
 } from "./action-ledger.types";
 
@@ -972,6 +975,148 @@ export async function getDailyPriorities(input: {
     limit,
     totalPending,
     rows
+  };
+}
+
+// The real backlog was 517 rows as of 2026-09-28. This is set far above that on purpose -- see
+// the project's action plan for the two hidden-row-limit bugs (product-economics list, action
+// ledger pagination) found the same day, both from a cap that looked generous when written but
+// quietly hid real rows once the backlog grew past it.
+const PPC_GUARDRAIL_TRIAGE_ROW_LIMIT = 5000;
+
+function readEvidenceCost(row: SafeActionLedgerRow): number | null {
+  const recommendationEvidence = row.evidence.recommendationEvidence;
+  if (recommendationEvidence && typeof recommendationEvidence === "object") {
+    const cost = (recommendationEvidence as Record<string, unknown>).cost;
+    if (typeof cost === "number" && Number.isFinite(cost)) return cost;
+  }
+  return null;
+}
+
+function readPayloadText(row: SafeActionLedgerRow, key: string): string | null {
+  const value = row.payload[key];
+  return typeof value === "string" ? cleanText(value) : null;
+}
+
+function roundRupees(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+// Groups the PPC_GUARDRAIL_REVIEW backlog by real pattern and ranks by real rupees at risk, so
+// the founder can act on a whole campaign or product at once instead of reviewing hundreds of
+// rows one by one. Built 2026-09-28 after finding that a naive `asin || sku || 'unknown'` grouping
+// would have buried the majority of real ad-spend-at-risk in a meaningless "unknown" bucket: 272
+// of ~517 real rows are KEYWORD-level (no ASIN/SKU at all -- Amazon only gives a keyword string
+// and a campaign/ad-group id for these), concentrated in just 6 real campaigns, with one campaign
+// alone accounting for ~240 of those rows and over half of all real rupees at risk in this action
+// type. Product-level rows (ASIN/SKU present) get one row per product today, so they are ranked
+// rather than grouped. `evidence.recommendationEvidence.cost` is the real per-row ad spend behind
+// this guardrail flag -- the top-level expectedProfitImpact/expectedSalesImpact fields are null
+// for every row this action type produces, so this is the only real rupee figure available.
+export async function getPpcGuardrailTriage(sellerIdInput: string): Promise<PpcGuardrailTriageReport> {
+  const sellerId = cleanText(sellerIdInput) ?? "default";
+  const rows = await listActionLedgerRows({
+    sellerId,
+    actionType: "PPC_GUARDRAIL_REVIEW",
+    approvalStatus: "PENDING",
+    limit: PPC_GUARDRAIL_TRIAGE_ROW_LIMIT
+  });
+
+  let totalRealCostAtRisk = 0;
+  let rowsWithRealCostData = 0;
+  const productGroups: PpcGuardrailProductGroup[] = [];
+
+  type CampaignAccumulator = {
+    campaignId: string | null;
+    campaignName: string;
+    adGroupId: string | null;
+    adGroupName: string | null;
+    recommendedActionCounts: Map<string, number>;
+    keywordCount: number;
+    realCostAtRisk: number;
+    sampleKeywords: string[];
+    actionLedgerIds: string[];
+  };
+  const campaignGroupMap = new Map<string, CampaignAccumulator>();
+
+  for (const row of rows) {
+    const cost = readEvidenceCost(row);
+    if (cost !== null) {
+      totalRealCostAtRisk += cost;
+      rowsWithRealCostData += 1;
+    }
+
+    if (row.asin || row.sku) {
+      productGroups.push({
+        asin: row.asin,
+        sku: row.sku,
+        productTitle: cleanText(row.title),
+        recommendedAction: row.recommendedAction,
+        realCostAtRisk: cost !== null ? roundRupees(cost) : 0,
+        actionLedgerId: row.id
+      });
+      continue;
+    }
+
+    const campaignId = readPayloadText(row, "campaignId");
+    const campaignName = readPayloadText(row, "campaignName") ?? "Unlabeled campaign";
+    const adGroupId = readPayloadText(row, "adGroupId");
+    const adGroupName = readPayloadText(row, "adGroupName");
+    const groupKey = `${campaignId ?? campaignName}::${adGroupId ?? adGroupName ?? ""}`;
+
+    let group = campaignGroupMap.get(groupKey);
+    if (!group) {
+      group = {
+        campaignId,
+        campaignName,
+        adGroupId,
+        adGroupName,
+        recommendedActionCounts: new Map(),
+        keywordCount: 0,
+        realCostAtRisk: 0,
+        sampleKeywords: [],
+        actionLedgerIds: []
+      };
+      campaignGroupMap.set(groupKey, group);
+    }
+
+    group.keywordCount += 1;
+    group.realCostAtRisk += cost ?? 0;
+    group.actionLedgerIds.push(row.id);
+    if (row.entityId && group.sampleKeywords.length < 8 && !group.sampleKeywords.includes(row.entityId)) {
+      group.sampleKeywords.push(row.entityId);
+    }
+    const actionKey = row.recommendedAction ?? "UNKNOWN";
+    group.recommendedActionCounts.set(actionKey, (group.recommendedActionCounts.get(actionKey) ?? 0) + 1);
+  }
+
+  const campaignGroups: PpcGuardrailCampaignGroup[] = Array.from(campaignGroupMap.values())
+    .map((group): PpcGuardrailCampaignGroup => {
+      const dominantAction = Array.from(group.recommendedActionCounts.entries())
+        .sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+      return {
+        campaignId: group.campaignId,
+        campaignName: group.campaignName,
+        adGroupId: group.adGroupId,
+        adGroupName: group.adGroupName,
+        recommendedAction: dominantAction,
+        keywordCount: group.keywordCount,
+        realCostAtRisk: roundRupees(group.realCostAtRisk),
+        sampleKeywords: group.sampleKeywords,
+        actionLedgerIds: group.actionLedgerIds
+      };
+    })
+    .sort((a, b) => b.realCostAtRisk - a.realCostAtRisk);
+
+  productGroups.sort((a, b) => b.realCostAtRisk - a.realCostAtRisk);
+
+  return {
+    sellerId,
+    totalPendingRows: rows.length,
+    rowsWithRealCostData,
+    totalRealCostAtRisk: roundRupees(totalRealCostAtRisk),
+    campaignGroups,
+    productGroups
   };
 }
 
