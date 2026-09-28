@@ -218,3 +218,43 @@ export type ActionLedgerDailyPriorities = {
   totalPending: number;
   rows: SafeActionLedgerRow[];
 };
+
+// PPC_GUARDRAIL_REVIEW backlog triage (added 2026-09-28): this action type produces one row per
+// flagged product OR per flagged keyword, so a real backlog quickly grows into hundreds of rows
+// the founder would otherwise have to click through one at a time. Two group shapes reflect the
+// two real row shapes found in the data: a keyword-level row has no ASIN/SKU at all (entityType
+// "KEYWORD", entityId is the keyword text), so those are rolled up by campaign + ad group --
+// fixing that one campaign's targeting/bids resolves every keyword flagged under it at once. A
+// product-level row already has an ASIN/SKU and Amazon only ever produces one such row per
+// product today, so those are just ranked, not further grouped.
+export type PpcGuardrailCampaignGroup = {
+  campaignId: string | null;
+  campaignName: string;
+  adGroupId: string | null;
+  adGroupName: string | null;
+  // The recommendedAction shared by (almost always all of) the rows in this group -- included so
+  // the UI can show what Amazon/the guardrail is actually recommending without opening every row.
+  recommendedAction: string | null;
+  keywordCount: number;
+  realCostAtRisk: number;
+  sampleKeywords: string[];
+  actionLedgerIds: string[];
+};
+
+export type PpcGuardrailProductGroup = {
+  asin: string | null;
+  sku: string | null;
+  productTitle: string | null;
+  recommendedAction: string | null;
+  realCostAtRisk: number;
+  actionLedgerId: string;
+};
+
+export type PpcGuardrailTriageReport = {
+  sellerId: string;
+  totalPendingRows: number;
+  rowsWithRealCostData: number;
+  totalRealCostAtRisk: number;
+  campaignGroups: PpcGuardrailCampaignGroup[];
+  productGroups: PpcGuardrailProductGroup[];
+};
