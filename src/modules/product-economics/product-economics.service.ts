@@ -1288,7 +1288,13 @@ export async function listProductEconomics(sellerId: string): Promise<SafeProduc
     .select("*")
     .eq("seller_id", cleanText(sellerId) ?? "default")
     .order("created_at", { ascending: false })
-    .limit(100);
+    // Raised 100 -> 2000 on 2026-09-28: only 19 rows exist today so this never bit, but the
+    // Cost Completion Queue backlog (173 products) means this table is meant to grow past 100
+    // rows, and a silent cap here would quietly drop products from every downstream view that
+    // calls this (Product Economics page, and the new Cost Reduction Opportunities check below)
+    // without any error or indication anything was missing. Matches the founder's own catalog
+    // size (187 products) with headroom.
+    .limit(2000);
 
   if (error) {
     logger.warn("Could not list product economics rows.", {
@@ -1527,4 +1533,148 @@ export async function getCostCompletionQueue(sellerIdInput: string): Promise<Cos
 
     return statusOrder[a.costStatus] - statusOrder[b.costStatus] || (a.productName ?? a.sku ?? "").localeCompare(b.productName ?? b.sku ?? "");
   });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Cost Reduction Opportunities (Workstream 3, 2026-09-28) — built on top of the real-profit
+// fields shipped in the 2026-09-28 "real profit" patch (referral fee confidence, real ad spend,
+// return-cost model). Founder's own instruction: "purpose of finding actual spend & charges is
+// to minimize expenses/charges & maximize profit... it is all about maximizing sales on min to
+// min spend & minimize other charges." This turns that real data into a ranked, actionable list
+// instead of just a dashboard number.
+//
+// Deliberately does NOT include a "recurring Refund Commission" or "real observed return rate"
+// section: this app does not yet track individual return/refund events per product (no Amazon
+// Returns or Settlement feed connected — see order-economics.service.ts's own note on this).
+// Building either of those today would mean inventing a trend from a single blended assumption,
+// which is exactly the kind of fabricated-precision this app's standing rules forbid. Both become
+// real, buildable sections once Workstream 2 (SP-API Finances/Settlement auto-extraction) lands.
+// Until then, the return-rate section below surfaces the founder's own INPUT ASSUMPTION per
+// product (clearly labeled as such), not a measured trend.
+// ---------------------------------------------------------------------------------------------
+
+// The founder's own stated, observed blended return pattern ("each 4 orders 1 will be
+// returned") - see returnRatePercent's default in product-economics.controller.ts. Used here
+// only as the baseline a product's own assumption is compared against, not as a measurement.
+const FOUNDER_BASELINE_RETURN_RATE_PERCENT = 25;
+
+// The real, settlement-confirmed high end of the Easy Ship shipping-fee band from this week's
+// profit/loss audit (this account's orders are ~100% Easy Ship). A shipping fee estimate above
+// this is worth a second look; a fee of exactly 0 means the estimate was never entered, not that
+// shipping is free, so it is excluded rather than treated as a win.
+const EASY_SHIP_TYPICAL_SHIPPING_FEE_HIGH_RUPEES = 137;
+
+// The founder's own words for what "ad cost is very high" means: "almost the product price."
+// 50% is a literal reading of "almost" as a floor, not a target - a product can still be flagged
+// below this if it's already realized a real, measured loss after ads (see the impact-based
+// filter below), so this ratio only widens the net for products still nominally profitable.
+const AD_SPEND_NEAR_PRICE_RATIO = 0.5;
+
+export type CostReductionOpportunityConfidence = "REAL" | "ASSUMPTION_INPUT" | "ESTIMATE";
+
+export type CostReductionOpportunity = {
+  sku: string | null;
+  asin: string | null;
+  productName: string | null;
+  sellingPrice: number;
+  metricLabel: string;
+  metricValue: number;
+  estimatedRupeeImpact: number | null;
+  confidence: CostReductionOpportunityConfidence;
+  message: string;
+};
+
+export type CostReductionOpportunitiesReport = {
+  sellerId: string;
+  productsWithCostData: number;
+  productsWithRealAdSpendData: number;
+  adSpendOpportunities: CostReductionOpportunity[];
+  returnRateOpportunities: CostReductionOpportunity[];
+  shippingFeeOpportunities: CostReductionOpportunity[];
+  summary: string;
+};
+
+export async function getCostReductionOpportunities(sellerIdInput: string): Promise<CostReductionOpportunitiesReport> {
+  const sellerId = cleanText(sellerIdInput) ?? "default";
+  const rows = await listProductEconomics(sellerId);
+  const label = (row: SafeProductEconomicsRow): string | null => row.productName ?? row.sku ?? row.asin ?? null;
+
+  const adSpendCandidates = rows
+    .filter((row): row is SafeProductEconomicsRow & { realAdSpendPerUnit: number } =>
+      row.realAdSpendDataAvailable && row.realAdSpendPerUnit !== null && row.sellingPrice > 0)
+    .map((row) => {
+      const ratio = row.realAdSpendPerUnit / row.sellingPrice;
+      const realLossPerUnit = row.realNetProfitAfterAds !== null && row.realNetProfitAfterAds < 0
+        ? roundTwo(-row.realNetProfitAfterAds)
+        : null;
+      return { row, ratio, realLossPerUnit };
+    })
+    .filter(({ ratio, realLossPerUnit }) => ratio >= AD_SPEND_NEAR_PRICE_RATIO || realLossPerUnit !== null);
+
+  const adSpendOpportunities: CostReductionOpportunity[] = adSpendCandidates
+    .sort((a, b) => (b.realLossPerUnit ?? 0) - (a.realLossPerUnit ?? 0) || b.ratio - a.ratio)
+    .map(({ row, ratio, realLossPerUnit }) => {
+      const spendText = `Real ad spend is ${roundTwo(row.realAdSpendPerUnit)} per unit (${roundTwo(ratio * 100)}% of the ${row.sellingPrice} selling price), based on real spend and real attributed orders over the last ${row.realAdSpendWindowDays ?? 30} days.`;
+      const lossText = realLossPerUnit !== null
+        ? ` This product is realizing a real loss of ${realLossPerUnit} per unit after ads.`
+        : " Not yet a realized loss, but ad spend alone is eating roughly half or more of the selling price - worth checking bids/targeting before it becomes one.";
+
+      return {
+        sku: row.sku,
+        asin: row.asin,
+        productName: label(row),
+        sellingPrice: row.sellingPrice,
+        metricLabel: "Real ad spend per unit (trailing window)",
+        metricValue: roundTwo(row.realAdSpendPerUnit),
+        estimatedRupeeImpact: realLossPerUnit,
+        confidence: "REAL",
+        message: spendText + lossText
+      };
+    });
+
+  const returnRateOpportunities: CostReductionOpportunity[] = rows
+    .filter((row) => row.returnRatePercent > FOUNDER_BASELINE_RETURN_RATE_PERCENT)
+    .sort((a, b) => b.returnRatePercent - a.returnRatePercent)
+    .map((row) => ({
+      sku: row.sku,
+      asin: row.asin,
+      productName: label(row),
+      sellingPrice: row.sellingPrice,
+      metricLabel: "Assumed return rate (input, not yet measured)",
+      metricValue: row.returnRatePercent,
+      estimatedRupeeImpact: null,
+      confidence: "ASSUMPTION_INPUT",
+      message: `This product's return-rate assumption is set to ${row.returnRatePercent}%, above your ${FOUNDER_BASELINE_RETURN_RATE_PERCENT}% blended baseline. This is the input you (or a default) set for this product's cost calculation, not a measured figure - real per-product return tracking isn't connected yet. Worth checking whether this assumption is still accurate, and if it is, worth investigating why this product returns more than the rest (listing accuracy, sizing, quality).`
+    }));
+
+  const shippingFeeOpportunities: CostReductionOpportunity[] = rows
+    .filter((row) => row.shippingFee > EASY_SHIP_TYPICAL_SHIPPING_FEE_HIGH_RUPEES)
+    .sort((a, b) => b.shippingFee - a.shippingFee)
+    .map((row) => ({
+      sku: row.sku,
+      asin: row.asin,
+      productName: label(row),
+      sellingPrice: row.sellingPrice,
+      metricLabel: "Shipping fee estimate",
+      metricValue: row.shippingFee,
+      estimatedRupeeImpact: roundTwo(row.shippingFee - EASY_SHIP_TYPICAL_SHIPPING_FEE_HIGH_RUPEES),
+      confidence: "ESTIMATE",
+      message: `Shipping fee is ${row.shippingFee}, above the ${EASY_SHIP_TYPICAL_SHIPPING_FEE_HIGH_RUPEES} typical high end confirmed for Easy Ship this year. Worth checking this product's weight/packaging entry, or whether a different fulfillment channel would be cheaper.`
+    }));
+
+  const productsWithRealAdSpendData = rows.filter((row) => row.realAdSpendDataAvailable).length;
+
+  const summary = rows.length === 0
+    ? "No products have completed cost data yet, so there is nothing to check for cost-reduction opportunities. Complete entries in the Cost Completion Queue first."
+    : `Checked ${rows.length} product(s) with completed cost data for real ad-spend losses, above-baseline return-rate assumptions, and shipping-fee outliers. ${productsWithRealAdSpendData} of those ${rows.length} currently have real, measured ad-spend data - this will grow as more Sponsored Products orders get attributed to specific products.`;
+
+  return {
+    sellerId,
+    productsWithCostData: rows.length,
+    productsWithRealAdSpendData,
+    adSpendOpportunities,
+    returnRateOpportunities,
+    shippingFeeOpportunities,
+    summary
+  };
 }
