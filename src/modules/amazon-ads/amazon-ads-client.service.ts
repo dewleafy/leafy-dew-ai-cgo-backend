@@ -279,6 +279,27 @@ export async function updateSponsoredProductsCampaignStates(input: {
     const outcomes = parseCampaignStateUpdateResponse(input.updates, response.data);
     const failedOutcomes = outcomes.filter((outcome) => !outcome.success);
 
+    // 2026-09-28 diagnostic addition: every failed pause/resume attempt so far has fallen
+    // through to the generic "no further detail in the response" message, which means
+    // either Amazon truly sends nothing usable, or the real detail lives in a response
+    // shape parseCampaignStateUpdateResponse isn't checking yet. Rather than guess, log
+    // the FULL raw response body here (sanitized, truncated) so the actual JSON Amazon
+    // sent is visible in Railway logs the next time this fails -- this is the only way
+    // to tell those two cases apart. Safe to remove once the real failure reason is known.
+    if (failedOutcomes.length > 0) {
+      let rawResponseDump: string;
+      try {
+        rawResponseDump = JSON.stringify(response.data);
+      } catch {
+        rawResponseDump = String(response.data);
+      }
+      logger.warn("Dayparting campaign update rejected by Amazon - raw response for diagnosis", {
+        statusCode: response.status,
+        failedCampaignIds: failedOutcomes.map((outcome) => outcome.campaignId),
+        rawResponseBody: sanitizeAmazonAdsLogValue(rawResponseDump)?.slice(0, 4000)
+      });
+    }
+
     // Amazon can return HTTP 2xx for this endpoint while still rejecting individual
     // campaigns inside the response body -- log the real per-item outcome here instead
     // of a blanket "success: true", so a partial failure is actually visible in
