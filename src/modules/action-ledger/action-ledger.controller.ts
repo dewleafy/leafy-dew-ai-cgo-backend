@@ -16,7 +16,8 @@ import {
   isActionLedgerRiskLevel,
   isActionLedgerSource,
   isActionLedgerState,
-  listActionLedgerRows
+  listActionLedgerRows,
+  getPpcGuardrailTriage
 } from "./action-ledger.service";
 import {
   ActionLedgerActionType,
@@ -448,6 +449,17 @@ export async function getActionLedgerDailyPrioritiesRoute(req: Request, res: Res
     });
   } catch {
     sendDatabaseError(res, "Could not load action ledger daily priorities from Supabase.");
+  }
+}
+
+export async function getPpcGuardrailTriageRoute(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+
+  try {
+    const report = await getPpcGuardrailTriage(sellerId);
+    res.json({ ok: true, ...report });
+  } catch {
+    sendDatabaseError(res, "Could not load PPC guardrail triage from Supabase.");
   }
 }
 
