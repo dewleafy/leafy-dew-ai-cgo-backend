@@ -3,6 +3,7 @@ import { z } from "zod";
 import {
   buildProductEconomicsExplanation,
   getCostCompletionQueue,
+  getCostReductionOpportunities,
   getProductEconomicsById,
   listProductEconomics,
   saveProductEconomics
@@ -274,6 +275,21 @@ export async function getProductEconomics(req: Request, res: Response): Promise<
     });
   } catch {
     sendProductEconomicsError(res, "Could not load product economics from Supabase.");
+  }
+}
+
+export async function getProductEconomicsCostReductionOpportunities(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+
+  try {
+    const report = await getCostReductionOpportunities(sellerId);
+
+    res.json({
+      ok: true,
+      ...report
+    });
+  } catch {
+    sendProductEconomicsError(res, "Could not load cost reduction opportunities from Supabase.");
   }
 }
 
