@@ -44,6 +44,20 @@ const booleanSchema = z.preprocess((value) => {
   return value;
 }, z.boolean().default(false));
 
+// Same normalization as booleanSchema, but defaults to true when omitted - used for
+// returnRecoverable below, where "recoverable" (resold after repackaging, or claimed from
+// Amazon) is the founder's confirmed NORMAL case, not the exception.
+const booleanSchemaDefaultTrue = z.preprocess((value) => {
+  if (value === undefined || value === null) return true;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["yes", "y", "true", "1"].includes(normalized)) return true;
+    if (["no", "n", "false", "0", ""].includes(normalized)) return false;
+  }
+  return value;
+}, z.boolean().default(true));
+
 const productEconomicsBodySchema = z.object({
   sellerId: z.string().trim().min(1).default("default"),
   marketplaceId: nullableTextSchema,
@@ -74,9 +88,18 @@ const productEconomicsBodySchema = z.object({
   amazonFeeEstimate: z.coerce.number().min(0).default(0),
   shippingFeeEstimate: z.coerce.number().min(0).default(0),
   taxEstimate: z.coerce.number().min(0).default(0),
-  returnRatePercent: z.coerce.number().min(0).default(10),
+  // Default changed 10 -> 25 on 2026-09-28: the founder's own stated, observed return pattern is
+  // "1 in 4 orders returned" (25%). Still fully overridable per product from the frontend.
+  returnRatePercent: z.coerce.number().min(0).default(25),
   returnCostPerReturn: z.coerce.number().min(0).default(0),
   returnReservePerUnit: z.coerce.number().min(0).optional(),
+  // Added 2026-09-28 - see product-economics.service.ts (getReturnCostPerUnit) for the full
+  // rationale. Defaults match the founder's confirmed real business process: most returns are
+  // resold after a Rs.10 repackaging job, or claimed back from Amazon if damaged.
+  returnPenaltyFractionPercent: z.coerce.number().min(0).max(100).default(66.7),
+  returnRecoverable: booleanSchemaDefaultTrue,
+  repackagingCost: z.coerce.number().min(0).default(10),
+  tcsPercent: z.coerce.number().min(0).default(0.5),
   influencerCostAllocationPerUnit: z.coerce.number().min(0).default(0),
   socialMarketingCostPerUnit: z.coerce.number().min(0).default(0),
   couponDiscountEstimate: z.coerce.number().min(0).default(0),
@@ -146,7 +169,23 @@ function toFounderEconomics(row: Awaited<ReturnType<typeof saveProductEconomics>
     profitStatus: row.profitStatus,
     profitDataStatus: row.profitDataStatus,
     feeRulesVersion: row.feeRulesVersion,
-    reason: row.reason
+    reason: row.reason,
+    // Added 2026-09-28
+    referralFeeConfidence: row.referralFeeConfidence,
+    closingFeeChannelUsed: row.closingFeeChannelUsed,
+    refundCommissionPerReturn: row.refundCommissionPerReturn,
+    returnPenaltyFractionPercent: row.returnPenaltyFractionPercent,
+    returnRecoverable: row.returnRecoverable,
+    repackagingCost: row.repackagingCost,
+    tcsPercent: row.tcsPercent,
+    tcsAmount: row.tcsAmount,
+    amazonSettlementEstimate: row.amazonSettlementEstimate,
+    realCashToday: row.realCashToday,
+    realAdSpendPerUnit: row.realAdSpendPerUnit,
+    realAdSpendWindowDays: row.realAdSpendWindowDays,
+    realAdSpendDataAvailable: row.realAdSpendDataAvailable,
+    realNetProfitAfterAds: row.realNetProfitAfterAds,
+    realProfitMarginPercent: row.realProfitMarginPercent
   };
 }
 
