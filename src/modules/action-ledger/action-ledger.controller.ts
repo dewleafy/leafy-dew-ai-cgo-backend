@@ -171,7 +171,15 @@ function getOptionalQueryText(req: Request, key: string): string | undefined {
 function getLimitFromQuery(req: Request): number {
   const rawLimit = typeof req.query.limit === "string" ? Number(req.query.limit) : 50;
   const limit = Number.isFinite(rawLimit) ? Math.floor(rawLimit) : 50;
-  return Math.min(Math.max(limit, 1), 200);
+  // Cap raised 200 -> 1000 on 2026-09-28: the real backlog (697 WAITING_FOR_APPROVAL rows) was
+  // silently invisible past row 200 through this endpoint, on top of the offset bug fixed below.
+  return Math.min(Math.max(limit, 1), 1000);
+}
+
+function getOffsetFromQuery(req: Request): number {
+  const rawOffset = typeof req.query.offset === "string" ? Number(req.query.offset) : 0;
+  const offset = Number.isFinite(rawOffset) ? Math.floor(rawOffset) : 0;
+  return Math.max(offset, 0);
 }
 
 function getDismissLimitFromBody(value: unknown): number {
@@ -379,6 +387,8 @@ export async function getActionLedgerRows(req: Request, res: Response): Promise<
   }
 
   try {
+    const limit = getLimitFromQuery(req);
+    const offset = getOffsetFromQuery(req);
     const rows = await listActionLedgerRows({
       sellerId,
       approvalStatus,
@@ -386,13 +396,19 @@ export async function getActionLedgerRows(req: Request, res: Response): Promise<
       actionType,
       sku: getOptionalQueryText(req, "sku"),
       asin: getOptionalQueryText(req, "asin"),
-      limit: getLimitFromQuery(req)
+      limit,
+      offset
     });
 
     res.json({
       ok: true,
       sellerId,
       count: rows.length,
+      limit,
+      offset,
+      // Lets a paginating caller know whether to request the next page, without a separate count
+      // query: a full page back means there may be more; a short page means this was the last one.
+      hasMore: rows.length === limit,
       rows
     });
   } catch {
