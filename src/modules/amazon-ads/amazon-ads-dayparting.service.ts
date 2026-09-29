@@ -192,6 +192,26 @@ function formatHourLabel(hour: number): string {
   return `${displayHour}${period}`;
 }
 
+// 2026-09-29: found via Railway diagnostic logs -- Amazon rejects every pause/resume
+// attempt on a campaign whose endDate has already passed with "Ended campaign cannot
+// be updated without end date extension" (reason UPDATING_ENDED_CAMPAIGN_WITHOUT_EXTENSION),
+// even though the campaign's `state` field still reads ENABLED/PAUSED in the list API.
+// Dayparting has no business extending a campaign's end date on its own -- that's a
+// call only the founder should make -- so these campaigns are skipped and logged
+// instead of retried (and counted as a failure) on every single background-sync tick.
+const ENDED_CAMPAIGN_REASON = "Amazon has already marked this campaign's end date as passed. It blocks any pause/resume update until the end date is extended in Seller Central -- dayparting will not do that automatically, so this campaign is skipped.";
+
+function isCampaignEndedInThePast(endDate: string | null | undefined): boolean {
+  if (!endDate) return false;
+  const parsed = new Date(endDate);
+  if (Number.isNaN(parsed.getTime())) return false;
+  // Compare against the start of today (UTC) so a campaign ending "today" is not
+  // treated as already-ended a few hours early.
+  const startOfTodayUtc = new Date();
+  startOfTodayUtc.setUTCHours(0, 0, 0, 0);
+  return parsed.getTime() < startOfTodayUtc.getTime();
+}
+
 async function logDaypartingAction(input: {
   sellerId: string;
   campaignId: string;
@@ -263,7 +283,8 @@ export async function runDaypartingCheck(sellerId: string): Promise<DaypartingCh
       currentlyActiveHours: null,
       pausedCount: 0,
       resumedCount: 0,
-      failedCount: 0
+      failedCount: 0,
+      skippedEndedCount: 0
     };
   }
 
@@ -275,7 +296,8 @@ export async function runDaypartingCheck(sellerId: string): Promise<DaypartingCh
       currentlyActiveHours: null,
       pausedCount: 0,
       resumedCount: 0,
-      failedCount: 0
+      failedCount: 0,
+      skippedEndedCount: 0
     };
   }
 
@@ -311,7 +333,8 @@ export async function runDaypartingCheck(sellerId: string): Promise<DaypartingCh
       currentlyActiveHours: shouldBeActive,
       pausedCount: 0,
       resumedCount: 0,
-      failedCount: 0
+      failedCount: 0,
+      skippedEndedCount: 0
     };
   }
 
@@ -321,9 +344,32 @@ export async function runDaypartingCheck(sellerId: string): Promise<DaypartingCh
   let pausedCount = 0;
   let resumedCount = 0;
   let failedCount = 0;
+  let skippedEndedCount = 0;
 
   if (!shouldBeActive) {
-    const toPause = liveCampaigns.filter((campaign) => (campaign.state ?? "").toUpperCase() === "ENABLED");
+    const enabledCampaigns = liveCampaigns.filter((campaign) => (campaign.state ?? "").toUpperCase() === "ENABLED");
+    const toPause = enabledCampaigns.filter((campaign) => !isCampaignEndedInThePast(campaign.endDate));
+    const skippedEnded = enabledCampaigns.filter((campaign) => isCampaignEndedInThePast(campaign.endDate));
+
+    for (const campaign of skippedEnded) {
+      skippedEndedCount += 1;
+      await upsertCampaignState({
+        sellerId: effectiveSellerId,
+        campaignId: campaign.campaignId,
+        campaignName: campaign.name,
+        pausedBySystem: false,
+        lastAction: "SKIPPED_ENDED",
+        lastError: null
+      });
+      await logDaypartingAction({
+        sellerId: effectiveSellerId,
+        campaignId: campaign.campaignId,
+        campaignName: campaign.name,
+        action: "SKIPPED_ENDED",
+        reason: ENDED_CAMPAIGN_REASON,
+        success: true
+      });
+    }
 
     if (toPause.length > 0) {
       const outcomes = await updateSponsoredProductsCampaignStates({
@@ -378,10 +424,39 @@ export async function runDaypartingCheck(sellerId: string): Promise<DaypartingCh
     }
   } else {
     const systemPaused = (await listDaypartingCampaignStates(effectiveSellerId)).filter((row) => row.pausedBySystem);
-    const toResume = systemPaused.filter((row) => {
+    const eligibleToResume = systemPaused.filter((row) => {
       const live = byId.get(row.campaignId);
       return live && (live.state ?? "").toUpperCase() === "PAUSED";
     });
+    const toResume = eligibleToResume.filter((row) => {
+      const live = byId.get(row.campaignId);
+      return !isCampaignEndedInThePast(live?.endDate);
+    });
+    const skippedEnded = eligibleToResume.filter((row) => {
+      const live = byId.get(row.campaignId);
+      return isCampaignEndedInThePast(live?.endDate);
+    });
+
+    for (const row of skippedEnded) {
+      skippedEndedCount += 1;
+      await upsertCampaignState({
+        sellerId: effectiveSellerId,
+        campaignId: row.campaignId,
+        campaignName: row.campaignName,
+        pausedBySystem: true,
+        lastAction: "SKIPPED_ENDED",
+        lastError: null
+      });
+      await logDaypartingAction({
+        sellerId: effectiveSellerId,
+        campaignId: row.campaignId,
+        campaignName: row.campaignName,
+        action: "SKIPPED_ENDED",
+        reason: ENDED_CAMPAIGN_REASON,
+        success: true
+      });
+    }
+
     // Any campaign this feature marked as system-paused but that is no longer PAUSED
     // live (someone else changed it, or it's gone) just has its flag cleared below --
     // never touched via the API, since it was never ours to force back to any state.
@@ -459,7 +534,12 @@ export async function runDaypartingCheck(sellerId: string): Promise<DaypartingCh
   if (pausedCount > 0) parts.push(`Paused ${pausedCount} campaign(s).`);
   if (resumedCount > 0) parts.push(`Resumed ${resumedCount} campaign(s).`);
   if (failedCount > 0) parts.push(`${failedCount} update(s) failed -- see history.`);
-  if (pausedCount === 0 && resumedCount === 0 && failedCount === 0) parts.push("Nothing to change.");
+  if (skippedEndedCount > 0)
+    parts.push(
+      `${skippedEndedCount} campaign(s) skipped -- Amazon has marked their end date as passed and blocks updates until it's extended.`
+    );
+  if (pausedCount === 0 && resumedCount === 0 && failedCount === 0 && skippedEndedCount === 0)
+    parts.push("Nothing to change.");
 
   return {
     ran: true,
@@ -467,6 +547,7 @@ export async function runDaypartingCheck(sellerId: string): Promise<DaypartingCh
     currentlyActiveHours: shouldBeActive,
     pausedCount,
     resumedCount,
-    failedCount
+    failedCount,
+    skippedEndedCount
   };
 }
