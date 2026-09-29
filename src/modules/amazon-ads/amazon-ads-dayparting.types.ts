@@ -75,4 +75,9 @@ export type DaypartingCheckResult = {
   pausedCount: number;
   resumedCount: number;
   failedCount: number;
+  // Campaigns Amazon has already marked ENDED (endDate in the past). Amazon rejects
+  // any state update to these ("Ended campaign cannot be updated without end date
+  // extension") no matter what dayparting does, so these are skipped rather than
+  // retried every run and counted as failures. See amazon-ads-dayparting.service.ts.
+  skippedEndedCount: number;
 };
