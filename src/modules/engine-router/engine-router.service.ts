@@ -2,6 +2,8 @@ import { env } from "../../config/env";
 import { supabase } from "../../db/supabase";
 import { logger } from "../../utils/logger";
 import { ensureActionLedgerAction } from "../action-ledger/action-ledger.service";
+import { getAmazonAdsPpcRecommendations, RecommendationItem } from "../amazon-ads/amazon-ads-ppc-recommendation.service";
+import { getListingReadinessByProductPassportId, getListingReadinessSummary } from "../listing-readiness/listing-readiness.service";
 import {
   ActionLedgerActionType,
   ActionLedgerApprovalTier,
@@ -611,12 +613,398 @@ async function runAccountHealthCheck(engine: SafeEngineRegistryRow, sellerId: st
   };
 }
 
+async function resolveEffectiveTargetAcos(sellerId: string): Promise<number> {
+  const report = (await getDailyCeoReport({ sellerId, days: 14 })) as CeoReportShape;
+  const targetAcos = toNumber(report.profitGuardrail?.effectiveTargetAcos ?? report.profitGuardrail?.targetAcos);
+  // 25% is a conservative fallback ceiling only used when no profit-guardrail target exists yet;
+  // getAmazonAdsPpcRecommendations further caps this against real cost data internally.
+  return targetAcos > 0 ? targetAcos : 25;
+}
+
+function isLikelyAsin(term: string): boolean {
+  return /^B0[A-Z0-9]{8}$/.test(term.trim().toUpperCase());
+}
+
+function ppcOpportunityActionDraft(input: {
+  item: RecommendationItem;
+  actionType: string;
+  entityType: "KEYWORD" | "ASIN" | "SEARCH_TERM";
+  titlePrefix: string;
+}): EngineRouterActionDraft {
+  const { item, actionType, entityType, titlePrefix } = input;
+  return {
+    actionType,
+    entityType,
+    entityId: `${item.campaignId}:${item.adGroupId}:${item.searchTerm}`,
+    sku: null,
+    asin: entityType === "ASIN" ? item.searchTerm.toUpperCase() : null,
+    title: `${titlePrefix} "${item.searchTerm}"`,
+    summary: item.reason,
+    recommendedAction: item.recommendedAction,
+    expectedSalesImpact: item.evidence.sales,
+    riskLevel: item.riskLevel,
+    confidenceLabel: item.confidenceLabel,
+    approvalTier: item.approvalTier,
+    evidence: {
+      campaignId: item.campaignId,
+      campaignName: item.campaignName,
+      adGroupId: item.adGroupId,
+      adGroupName: item.adGroupName,
+      searchTerm: item.searchTerm,
+      performance: item.evidence,
+      profitEvidence: item.profitEvidence,
+      priorityScore: item.priorityScore,
+      confidenceScore: item.confidenceScore,
+      recommendationType: item.recommendationType
+    }
+  };
+}
+
+async function runKeywordOpportunityCheck(engine: SafeEngineRegistryRow, sellerId: string): Promise<EnginePreviewDecision> {
+  const lookbackDays = toNumber(engine.ruleConfig?.lookbackDays) || 14;
+  const targetAcos = await resolveEffectiveTargetAcos(sellerId);
+  const recommendations = await getAmazonAdsPpcRecommendations({ sellerId, days: lookbackDays, targetAcos });
+
+  if (!recommendations.summary.totalGroupedTerms) {
+    return {
+      status: "SKIPPED_NO_DATA",
+      summary: "No PPC search term data found for the lookback window.",
+      evidence: { engineKey: engine.engineKey, lookbackDays }
+    };
+  }
+
+  const item = recommendations.exactMatchOpportunities[0];
+  if (!item) {
+    return {
+      status: "PREVIEW_NO_ACTION",
+      summary: "No exact-match keyword opportunities found.",
+      evidence: {
+        engineKey: engine.engineKey,
+        totalGroupedTerms: recommendations.summary.totalGroupedTerms,
+        effectiveTargetAcos: recommendations.effectiveTargetAcos
+      }
+    };
+  }
+
+  const draft = ppcOpportunityActionDraft({
+    item,
+    actionType: "ADD_EXACT_KEYWORD_AFTER_APPROVAL",
+    entityType: "KEYWORD",
+    titlePrefix: "Add exact-match keyword"
+  });
+  draft.evidence.engineKey = engine.engineKey;
+  draft.evidence.effectiveTargetAcos = recommendations.effectiveTargetAcos;
+
+  return {
+    status: "PREVIEW_ACTION_CREATED",
+    summary: `Exact-match keyword opportunity found: "${item.searchTerm}".`,
+    actionDraft: draft
+  };
+}
+
+async function runRoasOpportunityCheck(engine: SafeEngineRegistryRow, sellerId: string): Promise<EnginePreviewDecision> {
+  const lookbackDays = toNumber(engine.ruleConfig?.lookbackDays) || 14;
+  const targetAcos = await resolveEffectiveTargetAcos(sellerId);
+  const recommendations = await getAmazonAdsPpcRecommendations({ sellerId, days: lookbackDays, targetAcos });
+
+  if (!recommendations.summary.totalGroupedTerms) {
+    return {
+      status: "SKIPPED_NO_DATA",
+      summary: "No PPC search term data found for the lookback window.",
+      evidence: { engineKey: engine.engineKey, lookbackDays }
+    };
+  }
+
+  const item = recommendations.productTargetingOpportunities[0];
+  if (!item) {
+    return {
+      status: "PREVIEW_NO_ACTION",
+      summary: "No product-targeting (ROAS) opportunities found.",
+      evidence: {
+        engineKey: engine.engineKey,
+        totalGroupedTerms: recommendations.summary.totalGroupedTerms,
+        effectiveTargetAcos: recommendations.effectiveTargetAcos
+      }
+    };
+  }
+
+  const draft = ppcOpportunityActionDraft({
+    item,
+    actionType: "ADD_PRODUCT_TARGET_AFTER_APPROVAL",
+    entityType: isLikelyAsin(item.searchTerm) ? "ASIN" : "SEARCH_TERM",
+    titlePrefix: "Add product-targeting opportunity"
+  });
+  draft.evidence.engineKey = engine.engineKey;
+  draft.evidence.effectiveTargetAcos = recommendations.effectiveTargetAcos;
+
+  return {
+    status: "PREVIEW_ACTION_CREATED",
+    summary: `Product-targeting (ROAS) opportunity found: "${item.searchTerm}".`,
+    actionDraft: draft
+  };
+}
+
+async function runNegativeKeywordReview(engine: SafeEngineRegistryRow, sellerId: string): Promise<EnginePreviewDecision> {
+  const lookbackDays = toNumber(engine.ruleConfig?.lookbackDays) || 14;
+  const targetAcos = await resolveEffectiveTargetAcos(sellerId);
+  const recommendations = await getAmazonAdsPpcRecommendations({ sellerId, days: lookbackDays, targetAcos });
+
+  if (!recommendations.summary.totalGroupedTerms) {
+    return {
+      status: "SKIPPED_NO_DATA",
+      summary: "No PPC search term data found for the lookback window.",
+      evidence: { engineKey: engine.engineKey, lookbackDays }
+    };
+  }
+
+  // CHECK_LISTING_BEFORE_NEGATIVE is deliberately routed through a listing check first, per the
+  // blueprint's PPC guardrail "no broad-match scaling without search-term evidence" rule -
+  // this engine never proposes negating a term outright, only flags it for review.
+  const sourceCategory = recommendations.productPageCheckWarnings.length ? "productPageCheckWarnings" : "negativeKeywordCandidates";
+  const item = recommendations.productPageCheckWarnings[0] ?? recommendations.negativeKeywordCandidates[0];
+
+  if (!item) {
+    return {
+      status: "PREVIEW_NO_ACTION",
+      summary: "No wasteful search terms found that need a listing check before negation.",
+      evidence: {
+        engineKey: engine.engineKey,
+        totalGroupedTerms: recommendations.summary.totalGroupedTerms,
+        effectiveTargetAcos: recommendations.effectiveTargetAcos
+      }
+    };
+  }
+
+  const draft = ppcOpportunityActionDraft({
+    item,
+    actionType: "CHECK_LISTING_BEFORE_NEGATIVE",
+    entityType: "SEARCH_TERM",
+    titlePrefix: "Check listing before negating"
+  });
+  draft.evidence.engineKey = engine.engineKey;
+  draft.evidence.effectiveTargetAcos = recommendations.effectiveTargetAcos;
+  draft.evidence.sourceCategory = sourceCategory;
+
+  return {
+    status: "PREVIEW_ACTION_CREATED",
+    summary: `Wasteful search term "${item.searchTerm}" needs a listing check before any negative-keyword action.`,
+    actionDraft: draft
+  };
+}
+
+function isThinMarginRow(row: SafeProductEconomicsRow): boolean {
+  return row.profitDataStatus === "AVAILABLE" && row.profitMarginPercent !== null && row.profitMarginPercent < 8;
+}
+
+async function runPricingRiskCheck(engine: SafeEngineRegistryRow, sellerId: string): Promise<EnginePreviewDecision> {
+  const rows = await listProductEconomics(sellerId);
+  const priced = rows.filter((row) => row.profitDataStatus === "AVAILABLE" && row.profitMarginPercent !== null);
+
+  if (!priced.length) {
+    return {
+      status: "SKIPPED_NO_DATA",
+      summary: "No product economics rows with a confirmed margin found.",
+      evidence: { engineKey: engine.engineKey, economicsRows: rows.length }
+    };
+  }
+
+  const row = priced.filter(isThinMarginRow).sort((a, b) => (a.profitMarginPercent ?? 0) - (b.profitMarginPercent ?? 0))[0];
+
+  if (!row) {
+    return {
+      status: "PREVIEW_NO_ACTION",
+      summary: "No thin-margin pricing risk found.",
+      evidence: { engineKey: engine.engineKey, pricedRows: priced.length }
+    };
+  }
+
+  const highRisk = row.profitMarginPercent !== null && row.profitMarginPercent <= 0;
+  return {
+    status: "PREVIEW_ACTION_CREATED",
+    summary: `Pricing margin risk found for ${row.sku ?? row.asin ?? row.productName ?? "product"}.`,
+    actionDraft: {
+      actionType: "PRICING_REVIEW",
+      entityType: row.sku ? "SKU" : row.asin ? "ASIN" : "ACCOUNT",
+      entityId: row.sku ?? row.asin ?? "pricing-risk",
+      sku: row.sku,
+      asin: row.asin,
+      title: `Review pricing/margin for ${row.sku ?? row.productName ?? row.asin ?? "product"}`,
+      summary: `Profit margin is ${row.profitMarginPercent}% at a selling price of ${row.sellingPrice}.`,
+      recommendedAction: "REVIEW_PRICING_MARGIN",
+      expectedProfitImpact: row.netProfit,
+      riskLevel: highRisk ? "HIGH" : "MEDIUM",
+      confidenceLabel: "HIGH",
+      approvalTier: highRisk ? "TIER_3" : "TIER_2",
+      evidence: {
+        engineKey: engine.engineKey,
+        productEconomicsId: row.id,
+        sellingPrice: row.sellingPrice,
+        landedCost: row.landedCost,
+        netProfit: row.netProfit,
+        profitMarginPercent: row.profitMarginPercent,
+        minimumApprovedProfit: row.minimumApprovedProfit
+      }
+    }
+  };
+}
+
+const SEO_GAP_ITEMS = new Set([
+  "at_least_5_seo_keywords",
+  "at_least_10_seo_keywords",
+  "category",
+  "product_type",
+  "use_case",
+  "target_customer"
+]);
+
+const CONVERSION_GAP_ITEMS = new Set([
+  "material",
+  "dimensions",
+  "weight",
+  "package_contents",
+  "at_least_2_customer_objections",
+  "compliance_notes",
+  "at_least_3_key_features",
+  "at_least_5_key_features"
+]);
+
+async function runListingSeoGapCheck(engine: SafeEngineRegistryRow, sellerId: string): Promise<EnginePreviewDecision> {
+  const summary = await getListingReadinessSummary(sellerId);
+
+  if (!summary.rows.length) {
+    return {
+      status: "SKIPPED_NO_DATA",
+      summary: "No product passports found for listing SEO review.",
+      evidence: { engineKey: engine.engineKey, productCount: 0 }
+    };
+  }
+
+  const candidate = summary.rows.find(
+    (row) => row.readinessStatus !== "READY" && row.topMissingItems.some((item) => SEO_GAP_ITEMS.has(item))
+  );
+
+  if (!candidate) {
+    return {
+      status: "PREVIEW_NO_ACTION",
+      summary: "No listing SEO gaps found.",
+      evidence: { engineKey: engine.engineKey, productCount: summary.rows.length }
+    };
+  }
+
+  const detail = await getListingReadinessByProductPassportId(candidate.productPassportId);
+  const seoSection = detail?.sections.seoReadiness;
+
+  if (!seoSection || seoSection.score >= 60) {
+    return {
+      status: "PREVIEW_NO_ACTION",
+      summary: "No listing SEO gaps confirmed after detail review.",
+      evidence: { engineKey: engine.engineKey, productPassportId: candidate.productPassportId, seoScore: seoSection?.score ?? null }
+    };
+  }
+
+  return {
+    status: "PREVIEW_ACTION_CREATED",
+    summary: `SEO keyword gaps found for ${candidate.sku ?? candidate.asin ?? candidate.productName}.`,
+    actionDraft: {
+      actionType: "LISTING_SEO_REVIEW",
+      entityType: candidate.asin ? "ASIN" : candidate.sku ? "SKU" : "ACCOUNT",
+      entityId: candidate.asin ?? candidate.sku ?? candidate.productPassportId,
+      sku: candidate.sku,
+      asin: candidate.asin,
+      title: `Fix SEO keyword gaps for ${candidate.sku ?? candidate.productName ?? candidate.asin ?? "product"}`,
+      summary: `SEO readiness score is ${seoSection.score}/100. Missing: ${seoSection.missingItems.join(", ")}.`,
+      recommendedAction: "IMPROVE_LISTING_SEO",
+      riskLevel: seoSection.score < 30 ? "HIGH" : "MEDIUM",
+      confidenceLabel: "HIGH",
+      approvalTier: "TIER_2",
+      evidence: {
+        engineKey: engine.engineKey,
+        productPassportId: candidate.productPassportId,
+        seoScore: seoSection.score,
+        missingItems: seoSection.missingItems,
+        overallScore: candidate.overallScore
+      }
+    }
+  };
+}
+
+async function runConversionRiskCheck(engine: SafeEngineRegistryRow, sellerId: string): Promise<EnginePreviewDecision> {
+  const summary = await getListingReadinessSummary(sellerId);
+
+  if (!summary.rows.length) {
+    return {
+      status: "SKIPPED_NO_DATA",
+      summary: "No product passports found for conversion risk review.",
+      evidence: { engineKey: engine.engineKey, productCount: 0 }
+    };
+  }
+
+  const candidate = summary.rows.find(
+    (row) => row.readinessStatus !== "READY" && row.topMissingItems.some((item) => CONVERSION_GAP_ITEMS.has(item))
+  );
+
+  if (!candidate) {
+    return {
+      status: "PREVIEW_NO_ACTION",
+      summary: "No conversion risk gaps found.",
+      evidence: { engineKey: engine.engineKey, productCount: summary.rows.length }
+    };
+  }
+
+  const detail = await getListingReadinessByProductPassportId(candidate.productPassportId);
+  const trustSection = detail?.sections.trustReadiness;
+  const bulletSection = detail?.sections.bulletReadiness;
+  const worstScore = Math.min(trustSection?.score ?? 100, bulletSection?.score ?? 100);
+
+  if (!trustSection || !bulletSection || worstScore >= 60) {
+    return {
+      status: "PREVIEW_NO_ACTION",
+      summary: "No conversion risk confirmed after detail review.",
+      evidence: { engineKey: engine.engineKey, productPassportId: candidate.productPassportId, worstScore }
+    };
+  }
+
+  const missingItems = Array.from(new Set([...trustSection.missingItems, ...bulletSection.missingItems]));
+
+  return {
+    status: "PREVIEW_ACTION_CREATED",
+    summary: `Conversion risk found for ${candidate.sku ?? candidate.asin ?? candidate.productName}.`,
+    actionDraft: {
+      actionType: "LISTING_CONVERSION_REVIEW",
+      entityType: candidate.asin ? "ASIN" : candidate.sku ? "SKU" : "ACCOUNT",
+      entityId: candidate.asin ?? candidate.sku ?? candidate.productPassportId,
+      sku: candidate.sku,
+      asin: candidate.asin,
+      title: `Fix trust/conversion gaps for ${candidate.sku ?? candidate.productName ?? candidate.asin ?? "product"}`,
+      summary: `Trust score ${trustSection.score}/100, bullet score ${bulletSection.score}/100. Missing: ${missingItems.join(", ")}.`,
+      recommendedAction: "IMPROVE_LISTING_CONVERSION",
+      riskLevel: worstScore < 30 ? "HIGH" : "MEDIUM",
+      confidenceLabel: "MEDIUM",
+      approvalTier: "TIER_2",
+      evidence: {
+        engineKey: engine.engineKey,
+        productPassportId: candidate.productPassportId,
+        trustScore: trustSection.score,
+        bulletScore: bulletSection.score,
+        missingItems,
+        overallScore: candidate.overallScore
+      }
+    }
+  };
+}
+
 async function runDeterministicPreview(engine: SafeEngineRegistryRow, sellerId: string): Promise<EnginePreviewDecision> {
   if (engine.ruleTemplate === "MISSING_DATA_CHECK") return runMissingDataCheck(engine, sellerId);
   if (engine.ruleTemplate === "PROFIT_GUARDRAIL_CHECK") return runProfitGuardrailCheck(engine, sellerId);
   if (engine.ruleTemplate === "ACOS_GUARDRAIL_CHECK") return runAcosGuardrailCheck(engine, sellerId);
   if (engine.ruleTemplate === "LISTING_READINESS_CHECK") return runListingReadinessCheck(engine, sellerId);
   if (engine.ruleTemplate === "ACCOUNT_HEALTH_CHECK") return runAccountHealthCheck(engine, sellerId);
+  if (engine.ruleTemplate === "ROAS_OPPORTUNITY_CHECK") return runRoasOpportunityCheck(engine, sellerId);
+  if (engine.ruleTemplate === "KEYWORD_OPPORTUNITY_CHECK") return runKeywordOpportunityCheck(engine, sellerId);
+  if (engine.ruleTemplate === "NEGATIVE_KEYWORD_REVIEW") return runNegativeKeywordReview(engine, sellerId);
+  if (engine.ruleTemplate === "LISTING_SEO_GAP_CHECK") return runListingSeoGapCheck(engine, sellerId);
+  if (engine.ruleTemplate === "CONVERSION_RISK_CHECK") return runConversionRiskCheck(engine, sellerId);
+  if (engine.ruleTemplate === "PRICING_RISK_CHECK") return runPricingRiskCheck(engine, sellerId);
 
   return {
     status: "SKIPPED_TEMPLATE_NOT_IMPLEMENTED",
