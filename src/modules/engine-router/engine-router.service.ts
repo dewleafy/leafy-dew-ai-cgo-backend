@@ -1227,6 +1227,23 @@ async function loadInventoryVelocity(sellerId: string, windowDays: number): Prom
     .filter((row): row is InventoryVelocityRow => row !== null);
 }
 
+// Out-of-stock-with-real-demand is always the worst case; otherwise rank by fewest days of cover
+// among SKUs that are actually selling (a SKU with zero sales in the window has no velocity signal
+// either way, so it is never flagged here - that is a data-quality gap, not an inventory risk).
+// Shared by INVENTORY_RISK_CHECK and SEASONAL_OPPORTUNITY_CHECK so both use the exact same,
+// already-tested real-data logic.
+function pickWorstInventoryRow(rows: InventoryVelocityRow[]): InventoryVelocityRow | undefined {
+  const outOfStockWithDemand = rows
+    .filter((row) => row.quantity <= 0 && row.dailyVelocity > 0)
+    .sort((a, b) => b.dailyVelocity - a.dailyVelocity)[0];
+
+  const lowCover = rows
+    .filter((row) => row.quantity > 0 && row.daysOfCover !== null && row.daysOfCover < 14)
+    .sort((a, b) => (a.daysOfCover ?? 0) - (b.daysOfCover ?? 0))[0];
+
+  return outOfStockWithDemand ?? lowCover;
+}
+
 async function runInventoryRiskCheck(engine: SafeEngineRegistryRow, sellerId: string): Promise<EnginePreviewDecision> {
   const windowDays = toNumber(engine.ruleConfig?.lookbackDays) || 14;
   const rows = await loadInventoryVelocity(sellerId, windowDays);
@@ -1239,18 +1256,7 @@ async function runInventoryRiskCheck(engine: SafeEngineRegistryRow, sellerId: st
     };
   }
 
-  // Out-of-stock-with-real-demand is always the worst case; otherwise rank by fewest days of cover
-  // among SKUs that are actually selling (a SKU with zero sales in the window has no velocity signal
-  // either way, so it is never flagged here - that is a data-quality gap, not an inventory risk).
-  const outOfStockWithDemand = rows
-    .filter((row) => row.quantity <= 0 && row.dailyVelocity > 0)
-    .sort((a, b) => b.dailyVelocity - a.dailyVelocity)[0];
-
-  const lowCover = rows
-    .filter((row) => row.quantity > 0 && row.daysOfCover !== null && row.daysOfCover < 14)
-    .sort((a, b) => (a.daysOfCover ?? 0) - (b.daysOfCover ?? 0))[0];
-
-  const worst = outOfStockWithDemand ?? lowCover;
+  const worst = pickWorstInventoryRow(rows);
 
   if (!worst) {
     return {
@@ -1296,6 +1302,90 @@ async function runInventoryRiskCheck(engine: SafeEngineRegistryRow, sellerId: st
   };
 }
 
+// SEASONALITY (15 engines): fixed, publicly-known Indian shopping/gifting calendar dates
+// (verified 2026-09-29, not Amazon-specific promo dates which aren't announced this far out)
+// combined with the same real, already-tested inventory-velocity data INVENTORY_RISK_CHECK
+// uses. No fabricated "seasonal demand" data anywhere - just a real calendar fact plus real
+// current stock/sales data. Only the near-term, already-verified dates are listed; once an
+// event passes, it simply stops being "next" - nothing needs to be pruned.
+const SEASONAL_EVENTS: Array<{ name: string; date: string }> = [
+  { name: "Dussehra / Vijayadashami", date: "2026-10-20" },
+  { name: "Diwali", date: "2026-11-08" },
+  { name: "Christmas", date: "2026-12-25" },
+  { name: "New Year", date: "2027-01-01" },
+  { name: "Republic Day", date: "2027-01-26" }
+];
+
+function getNextSeasonalEvent(withinDays: number): { name: string; date: string; daysUntil: number } | null {
+  const now = Date.now();
+  const maxMs = withinDays * 24 * 60 * 60 * 1000;
+
+  const upcoming = SEASONAL_EVENTS.map((event) => ({
+    ...event,
+    daysUntil: Math.ceil((new Date(`${event.date}T00:00:00Z`).getTime() - now) / (24 * 60 * 60 * 1000))
+  }))
+    .filter((event) => event.daysUntil >= 0 && event.daysUntil * 24 * 60 * 60 * 1000 <= maxMs)
+    .sort((a, b) => a.daysUntil - b.daysUntil);
+
+  return upcoming[0] ?? null;
+}
+
+async function runSeasonalOpportunityCheck(engine: SafeEngineRegistryRow, sellerId: string): Promise<EnginePreviewDecision> {
+  const windowDays = toNumber(engine.ruleConfig?.lookbackDays) || 60;
+  const nextEvent = getNextSeasonalEvent(windowDays);
+
+  if (!nextEvent) {
+    return {
+      status: "PREVIEW_NO_ACTION",
+      summary: `No major Indian shopping/gifting event within the next ${windowDays} days.`,
+      evidence: { engineKey: engine.engineKey, windowDays }
+    };
+  }
+
+  const inventoryRows = await loadInventoryVelocity(sellerId, 14);
+  const worst = pickWorstInventoryRow(inventoryRows);
+
+  if (!worst) {
+    return {
+      status: "PREVIEW_NO_ACTION",
+      summary: `${nextEvent.name} is on ${nextEvent.date} (${nextEvent.daysUntil} days away). No current stockout or low-cover risk found that would affect it.`,
+      evidence: { engineKey: engine.engineKey, event: nextEvent, listingsChecked: inventoryRows.length }
+    };
+  }
+
+  const isOutOfStock = worst.quantity <= 0;
+  const riskLevel = isOutOfStock || (worst.daysOfCover !== null && worst.daysOfCover < 7) ? "HIGH" : "MEDIUM";
+
+  return {
+    status: "PREVIEW_ACTION_CREATED",
+    summary: `${nextEvent.name} is in ${nextEvent.daysUntil} days (${nextEvent.date}) and ${worst.sku} ${isOutOfStock ? "is already out of stock with real recent demand" : `has only ${roundTo(worst.daysOfCover ?? 0, 1)} days of stock cover left`} - restock before the event or risk missing peak demand sales.`,
+    actionDraft: {
+      actionType: "SEASONAL_ACTION_REVIEW",
+      entityType: worst.asin ? "ASIN" : "SKU",
+      entityId: worst.asin ?? worst.sku,
+      sku: worst.sku,
+      asin: worst.asin,
+      title: `Restock ${worst.sku} before ${nextEvent.name} (${nextEvent.date})`,
+      summary: `${nextEvent.name} is ${nextEvent.daysUntil} days away. Current stock ${worst.quantity} units, selling ${roundTo(worst.dailyVelocity, 2)} units/day over the last 14 days.`,
+      recommendedAction: "REVIEW_RESTOCK_PLAN",
+      riskLevel,
+      confidenceLabel: worst.unitsSoldInWindow >= 5 ? "HIGH" : "MEDIUM",
+      approvalTier: "TIER_2",
+      evidence: {
+        engineKey: engine.engineKey,
+        event: nextEvent,
+        sku: worst.sku,
+        asin: worst.asin,
+        quantity: worst.quantity,
+        unitsSoldInWindow: worst.unitsSoldInWindow,
+        dailyVelocity: worst.dailyVelocity,
+        daysOfCover: worst.daysOfCover,
+        listingsChecked: inventoryRows.length
+      }
+    }
+  };
+}
+
 async function runDeterministicPreview(engine: SafeEngineRegistryRow, sellerId: string): Promise<EnginePreviewDecision> {
   if (engine.ruleTemplate === "MISSING_DATA_CHECK") return runMissingDataCheck(engine, sellerId);
   if (engine.ruleTemplate === "PROFIT_GUARDRAIL_CHECK") return runProfitGuardrailCheck(engine, sellerId);
@@ -1311,6 +1401,7 @@ async function runDeterministicPreview(engine: SafeEngineRegistryRow, sellerId: 
   if (engine.ruleTemplate === "INVENTORY_RISK_CHECK") return runInventoryRiskCheck(engine, sellerId);
   if (engine.ruleTemplate === "IMAGE_GAP_CHECK") return runImageGapCheck(engine, sellerId);
   if (engine.ruleTemplate === "CONTENT_GAP_CHECK") return runContentGapCheck(engine, sellerId);
+  if (engine.ruleTemplate === "SEASONAL_OPPORTUNITY_CHECK") return runSeasonalOpportunityCheck(engine, sellerId);
 
   return {
     status: "SKIPPED_TEMPLATE_NOT_IMPLEMENTED",
