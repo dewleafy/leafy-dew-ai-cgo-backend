@@ -19,6 +19,7 @@ import { recordLearningEventSafe } from "../learning-loop/learning-loop.service"
 import { getCostCompletionQueue, listProductEconomics } from "../product-economics/product-economics.service";
 import { CostCompletionQueueRow, SafeProductEconomicsRow } from "../product-economics/product-economics.types";
 import { ProductPassportRow } from "../product-passports/product-passports.types";
+import { AmazonSpListingRow, AmazonSpOrderItemRow, AmazonSpOrderRow } from "../amazon-sp/amazon-sp.types";
 import {
   EnginePreviewDecision,
   EngineRouterActionDraft,
@@ -92,6 +93,11 @@ function cleanText(value: unknown): string | null {
 function toNumber(value: unknown): number {
   const numeric = Number(value ?? 0);
   return Number.isFinite(numeric) ? numeric : 0;
+}
+
+function roundTo(value: number, decimals: number): number {
+  const factor = 10 ** decimals;
+  return Math.round(value * factor) / factor;
 }
 
 function asArray(value: unknown): unknown[] {
@@ -993,6 +999,170 @@ async function runConversionRiskCheck(engine: SafeEngineRegistryRow, sellerId: s
   };
 }
 
+function isCancelledOrderStatus(status: string | null): boolean {
+  const normalized = status?.toLowerCase() ?? "";
+  return normalized.includes("cancelled") || normalized.includes("canceled");
+}
+
+type InventoryVelocityRow = {
+  sku: string;
+  asin: string | null;
+  productName: string | null;
+  quantity: number;
+  unitsSoldInWindow: number;
+  dailyVelocity: number;
+  daysOfCover: number | null;
+};
+
+async function loadInventoryVelocity(sellerId: string, windowDays: number): Promise<InventoryVelocityRow[]> {
+  const { data: listingData, error: listingError } = await supabase
+    .from("amazon_sp_listings")
+    .select("sku, asin, product_name, quantity")
+    .eq("seller_id", sellerId)
+    .limit(2000);
+
+  if (listingError) {
+    logEngineRouterError("Could not load Amazon SP listings for inventory risk engine.", listingError);
+    throw new Error("Could not load Amazon SP listings from Supabase.");
+  }
+
+  const listings = (listingData ?? []) as Array<Pick<AmazonSpListingRow, "sku" | "asin" | "product_name" | "quantity">>;
+
+  if (!listings.length) {
+    return [];
+  }
+
+  const rangeStart = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000).toISOString();
+
+  const { data: orderData, error: orderError } = await supabase
+    .from("amazon_sp_orders")
+    .select("amazon_order_id, purchase_date, order_status")
+    .eq("seller_id", sellerId)
+    .gte("purchase_date", rangeStart)
+    .limit(5000);
+
+  if (orderError) {
+    logEngineRouterError("Could not load Amazon SP orders for inventory risk engine.", orderError);
+    throw new Error("Could not load Amazon SP orders from Supabase.");
+  }
+
+  const orders = (orderData ?? []) as Array<Pick<AmazonSpOrderRow, "amazon_order_id" | "purchase_date" | "order_status">>;
+  const activeOrderIds = orders.filter((order) => !isCancelledOrderStatus(order.order_status)).map((order) => order.amazon_order_id);
+
+  const unitsSoldBySku = new Map<string, number>();
+
+  if (activeOrderIds.length) {
+    const { data: itemData, error: itemError } = await supabase
+      .from("amazon_sp_order_items")
+      .select("sku, quantity_ordered")
+      .eq("seller_id", sellerId)
+      .in("amazon_order_id", activeOrderIds.slice(0, 2000))
+      .limit(10000);
+
+    if (itemError) {
+      logEngineRouterError("Could not load Amazon SP order items for inventory risk engine.", itemError);
+      throw new Error("Could not load Amazon SP order items from Supabase.");
+    }
+
+    for (const item of (itemData ?? []) as Array<Pick<AmazonSpOrderItemRow, "sku" | "quantity_ordered">>) {
+      const sku = cleanText(item.sku);
+      if (!sku) continue;
+      unitsSoldBySku.set(sku, (unitsSoldBySku.get(sku) ?? 0) + toNumber(item.quantity_ordered));
+    }
+  }
+
+  return listings
+    .map((listing): InventoryVelocityRow | null => {
+      const sku = cleanText(listing.sku);
+      if (!sku) return null;
+
+      const unitsSoldInWindow = unitsSoldBySku.get(sku) ?? 0;
+      const dailyVelocity = unitsSoldInWindow / windowDays;
+      const quantity = toNumber(listing.quantity);
+      const daysOfCover = dailyVelocity > 0 ? quantity / dailyVelocity : null;
+
+      return {
+        sku,
+        asin: cleanText(listing.asin),
+        productName: cleanText(listing.product_name),
+        quantity,
+        unitsSoldInWindow,
+        dailyVelocity,
+        daysOfCover
+      };
+    })
+    .filter((row): row is InventoryVelocityRow => row !== null);
+}
+
+async function runInventoryRiskCheck(engine: SafeEngineRegistryRow, sellerId: string): Promise<EnginePreviewDecision> {
+  const windowDays = toNumber(engine.ruleConfig?.lookbackDays) || 14;
+  const rows = await loadInventoryVelocity(sellerId, windowDays);
+
+  if (!rows.length) {
+    return {
+      status: "SKIPPED_NO_DATA",
+      summary: "No Amazon SP listing data found for inventory risk review.",
+      evidence: { engineKey: engine.engineKey, listingCount: 0 }
+    };
+  }
+
+  // Out-of-stock-with-real-demand is always the worst case; otherwise rank by fewest days of cover
+  // among SKUs that are actually selling (a SKU with zero sales in the window has no velocity signal
+  // either way, so it is never flagged here - that is a data-quality gap, not an inventory risk).
+  const outOfStockWithDemand = rows
+    .filter((row) => row.quantity <= 0 && row.dailyVelocity > 0)
+    .sort((a, b) => b.dailyVelocity - a.dailyVelocity)[0];
+
+  const lowCover = rows
+    .filter((row) => row.quantity > 0 && row.daysOfCover !== null && row.daysOfCover < 14)
+    .sort((a, b) => (a.daysOfCover ?? 0) - (b.daysOfCover ?? 0))[0];
+
+  const worst = outOfStockWithDemand ?? lowCover;
+
+  if (!worst) {
+    return {
+      status: "PREVIEW_NO_ACTION",
+      summary: "No stockout or low-cover inventory risk found.",
+      evidence: { engineKey: engine.engineKey, listingsChecked: rows.length, windowDays }
+    };
+  }
+
+  const isOutOfStock = worst.quantity <= 0;
+  const riskLevel = isOutOfStock || (worst.daysOfCover !== null && worst.daysOfCover < 7) ? "HIGH" : "MEDIUM";
+
+  return {
+    status: "PREVIEW_ACTION_CREATED",
+    summary: isOutOfStock
+      ? `${worst.sku} is out of stock with real recent demand (${roundTo(worst.dailyVelocity, 2)} units/day).`
+      : `${worst.sku} has only ${roundTo(worst.daysOfCover ?? 0, 1)} days of stock cover left at current sales velocity.`,
+    actionDraft: {
+      actionType: "INVENTORY_RISK_REVIEW",
+      entityType: worst.asin ? "ASIN" : "SKU",
+      entityId: worst.asin ?? worst.sku,
+      sku: worst.sku,
+      asin: worst.asin,
+      title: isOutOfStock ? `Restock ${worst.sku} (out of stock, still selling)` : `Restock ${worst.sku} soon (${roundTo(worst.daysOfCover ?? 0, 1)} days of cover left)`,
+      summary: `Sold ${worst.unitsSoldInWindow} units in the last ${windowDays} days (${roundTo(worst.dailyVelocity, 2)}/day); current stock is ${worst.quantity} units.`,
+      recommendedAction: "REVIEW_RESTOCK_PLAN",
+      riskLevel,
+      confidenceLabel: worst.unitsSoldInWindow >= 5 ? "HIGH" : "MEDIUM",
+      approvalTier: "TIER_2",
+      evidence: {
+        engineKey: engine.engineKey,
+        sku: worst.sku,
+        asin: worst.asin,
+        productName: worst.productName,
+        quantity: worst.quantity,
+        unitsSoldInWindow: worst.unitsSoldInWindow,
+        dailyVelocity: worst.dailyVelocity,
+        daysOfCover: worst.daysOfCover,
+        windowDays,
+        listingsChecked: rows.length
+      }
+    }
+  };
+}
+
 async function runDeterministicPreview(engine: SafeEngineRegistryRow, sellerId: string): Promise<EnginePreviewDecision> {
   if (engine.ruleTemplate === "MISSING_DATA_CHECK") return runMissingDataCheck(engine, sellerId);
   if (engine.ruleTemplate === "PROFIT_GUARDRAIL_CHECK") return runProfitGuardrailCheck(engine, sellerId);
@@ -1005,6 +1175,7 @@ async function runDeterministicPreview(engine: SafeEngineRegistryRow, sellerId: 
   if (engine.ruleTemplate === "LISTING_SEO_GAP_CHECK") return runListingSeoGapCheck(engine, sellerId);
   if (engine.ruleTemplate === "CONVERSION_RISK_CHECK") return runConversionRiskCheck(engine, sellerId);
   if (engine.ruleTemplate === "PRICING_RISK_CHECK") return runPricingRiskCheck(engine, sellerId);
+  if (engine.ruleTemplate === "INVENTORY_RISK_CHECK") return runInventoryRiskCheck(engine, sellerId);
 
   return {
     status: "SKIPPED_TEMPLATE_NOT_IMPLEMENTED",
