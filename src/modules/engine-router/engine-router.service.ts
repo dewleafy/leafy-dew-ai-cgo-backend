@@ -4,6 +4,7 @@ import { logger } from "../../utils/logger";
 import { ensureActionLedgerAction } from "../action-ledger/action-ledger.service";
 import { getAmazonAdsPpcRecommendations, RecommendationItem } from "../amazon-ads/amazon-ads-ppc-recommendation.service";
 import { getListingReadinessByProductPassportId, getListingReadinessSummary } from "../listing-readiness/listing-readiness.service";
+import { getAplusContentCoverage } from "../aplus-content/aplus-content.service";
 import {
   ActionLedgerActionType,
   ActionLedgerApprovalTier,
@@ -999,6 +1000,138 @@ async function runConversionRiskCheck(engine: SafeEngineRegistryRow, sellerId: s
   };
 }
 
+const IMAGE_GAP_ITEMS = new Set([
+  "at_least_1_image_url",
+  "at_least_3_image_urls",
+  "at_least_5_image_urls",
+  "dimensions_or_package_contents",
+  "material"
+]);
+
+// IMAGE_CREATIVE (15 engines): reuses the same real listing-readiness image scoring
+// (product_passports.image_urls, already synced from real Amazon/founder catalog data)
+// that Listing SEO/Conversion already use. No new data source needed.
+async function runImageGapCheck(engine: SafeEngineRegistryRow, sellerId: string): Promise<EnginePreviewDecision> {
+  const summary = await getListingReadinessSummary(sellerId);
+
+  if (!summary.rows.length) {
+    return {
+      status: "SKIPPED_NO_DATA",
+      summary: "No product passports found for image/creative review.",
+      evidence: { engineKey: engine.engineKey, productCount: 0 }
+    };
+  }
+
+  const candidate = summary.rows.find(
+    (row) => row.readinessStatus !== "READY" && row.topMissingItems.some((item) => IMAGE_GAP_ITEMS.has(item))
+  );
+
+  if (!candidate) {
+    return {
+      status: "PREVIEW_NO_ACTION",
+      summary: "No image/creative gaps found.",
+      evidence: { engineKey: engine.engineKey, productCount: summary.rows.length }
+    };
+  }
+
+  const detail = await getListingReadinessByProductPassportId(candidate.productPassportId);
+  const imageSection = detail?.sections.imageReadiness;
+
+  if (!imageSection || imageSection.score >= 60) {
+    return {
+      status: "PREVIEW_NO_ACTION",
+      summary: "No image/creative gaps confirmed after detail review.",
+      evidence: { engineKey: engine.engineKey, productPassportId: candidate.productPassportId, imageScore: imageSection?.score ?? null }
+    };
+  }
+
+  return {
+    status: "PREVIEW_ACTION_CREATED",
+    summary: `Image/creative gaps found for ${candidate.sku ?? candidate.asin ?? candidate.productName}.`,
+    actionDraft: {
+      actionType: "IMAGE_CREATIVE_REVIEW",
+      entityType: candidate.asin ? "ASIN" : candidate.sku ? "SKU" : "ACCOUNT",
+      entityId: candidate.asin ?? candidate.sku ?? candidate.productPassportId,
+      sku: candidate.sku,
+      asin: candidate.asin,
+      title: `Fix product image gaps for ${candidate.sku ?? candidate.productName ?? candidate.asin ?? "product"}`,
+      summary: `Image readiness score is ${imageSection.score}/100. Missing: ${imageSection.missingItems.join(", ")}.`,
+      recommendedAction: "IMPROVE_PRODUCT_IMAGES",
+      riskLevel: imageSection.score < 30 ? "HIGH" : "MEDIUM",
+      confidenceLabel: "HIGH",
+      approvalTier: "TIER_2",
+      evidence: {
+        engineKey: engine.engineKey,
+        productPassportId: candidate.productPassportId,
+        imageScore: imageSection.score,
+        missingItems: imageSection.missingItems,
+        overallScore: candidate.overallScore
+      }
+    }
+  };
+}
+
+// CONTENT_A_PLUS (15 engines): reuses the real, already-live A+ Content coverage scan
+// (amazon_aplus_content_cache — populated by real Amazon SP-API Content API calls via
+// /api/aplus-content/coverage/scan, same data the founder can already see in-app). Flags
+// the first confirmed NO_CONTENT product. If nothing has been checked yet, this says so
+// plainly rather than guessing.
+async function runContentGapCheck(engine: SafeEngineRegistryRow, sellerId: string): Promise<EnginePreviewDecision> {
+  const coverage = await getAplusContentCoverage(sellerId);
+  const totalProducts = coverage.brands.reduce((sum, brand) => sum + brand.productCount, 0);
+
+  if (!totalProducts) {
+    return {
+      status: "SKIPPED_NO_DATA",
+      summary: "No active products found for A+ Content review.",
+      evidence: { engineKey: engine.engineKey, productCount: 0 }
+    };
+  }
+
+  const candidate = coverage.missingProducts[0];
+
+  if (!candidate) {
+    if (coverage.uncheckedCount > 0) {
+      return {
+        status: "SKIPPED_NO_DATA",
+        summary: `${coverage.uncheckedCount} of ${totalProducts} products have not been checked against Amazon's A+ Content API yet. Run the A+ coverage scan to check them.`,
+        evidence: { engineKey: engine.engineKey, uncheckedCount: coverage.uncheckedCount, totalProducts }
+      };
+    }
+    return {
+      status: "PREVIEW_NO_ACTION",
+      summary: "No A+ Content gaps found — every checked product already has A+ Content.",
+      evidence: { engineKey: engine.engineKey, totalProducts }
+    };
+  }
+
+  return {
+    status: "PREVIEW_ACTION_CREATED",
+    summary: `No A+ Content found for ${candidate.sku ?? candidate.asin ?? candidate.productName} (confirmed live against Amazon).`,
+    actionDraft: {
+      actionType: "A_PLUS_CONTENT_REVIEW",
+      entityType: candidate.asin ? "ASIN" : candidate.sku ? "SKU" : "ACCOUNT",
+      entityId: candidate.asin ?? candidate.sku ?? candidate.productName,
+      sku: candidate.sku,
+      asin: candidate.asin,
+      title: `Build A+ Content for ${candidate.sku ?? candidate.productName ?? candidate.asin ?? "product"}`,
+      summary: `Amazon's A+ Content API confirms this ASIN has no A+ Content live today (brand: ${candidate.brand}).`,
+      recommendedAction: "CREATE_A_PLUS_CONTENT",
+      riskLevel: "LOW",
+      confidenceLabel: "HIGH",
+      approvalTier: "TIER_2",
+      evidence: {
+        engineKey: engine.engineKey,
+        brand: candidate.brand,
+        moduleCount: candidate.moduleCount,
+        lastCheckedAt: candidate.lastCheckedAt,
+        uncheckedCount: coverage.uncheckedCount,
+        totalProducts
+      }
+    }
+  };
+}
+
 function isCancelledOrderStatus(status: string | null): boolean {
   const normalized = status?.toLowerCase() ?? "";
   return normalized.includes("cancelled") || normalized.includes("canceled");
@@ -1176,6 +1309,8 @@ async function runDeterministicPreview(engine: SafeEngineRegistryRow, sellerId: 
   if (engine.ruleTemplate === "CONVERSION_RISK_CHECK") return runConversionRiskCheck(engine, sellerId);
   if (engine.ruleTemplate === "PRICING_RISK_CHECK") return runPricingRiskCheck(engine, sellerId);
   if (engine.ruleTemplate === "INVENTORY_RISK_CHECK") return runInventoryRiskCheck(engine, sellerId);
+  if (engine.ruleTemplate === "IMAGE_GAP_CHECK") return runImageGapCheck(engine, sellerId);
+  if (engine.ruleTemplate === "CONTENT_GAP_CHECK") return runContentGapCheck(engine, sellerId);
 
   return {
     status: "SKIPPED_TEMPLATE_NOT_IMPLEMENTED",
