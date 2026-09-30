@@ -1556,7 +1556,7 @@ export async function getCostCompletionQueue(sellerIdInput: string): Promise<Cos
 // The founder's own stated, observed blended return pattern ("each 4 orders 1 will be
 // returned") - see returnRatePercent's default in product-economics.controller.ts. Used here
 // only as the baseline a product's own assumption is compared against, not as a measurement.
-const FOUNDER_BASELINE_RETURN_RATE_PERCENT = 25;
+export const FOUNDER_BASELINE_RETURN_RATE_PERCENT = 25;
 
 // The real, settlement-confirmed high end of the Easy Ship shipping-fee band from this week's
 // profit/loss audit (this account's orders are ~100% Easy Ship). A shipping fee estimate above
