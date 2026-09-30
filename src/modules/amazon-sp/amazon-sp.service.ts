@@ -52,7 +52,16 @@ const ORDER_REPORT_STOP_STATUSES = new Set(["DONE", "DONE_NO_DATA", "CANCELLED",
 // Verified 2026-09-29 against Amazon's own SP-API report-type catalog (this is the older,
 // still-supported FBA returns report - Amazon's newer ledger-based replacement covers the
 // same data under a different report type/eventType, not used here).
-const RETURNS_REPORT_TYPE = "GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA";
+// Corrected 2026-09-30: the first build of this pipeline used
+// GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA, which only covers Amazon-fulfilled (FBA) returns.
+// Live-tested against this account and it came back "CANCELLED" (Amazon cancels a report that
+// matches zero rows) - a real check of this seller's own order data found 117 of 118 recent
+// orders are fulfillmentChannel "Merchant" (self-ship/MFN), only 1 is "Amazon" (FBA), so that
+// report type could never have real data here. Two independent real sources (a GitHub
+// selling-partner-api-models issue #2292 discussion and an Airbyte connector issue #39502) both
+// describe GET_FLAT_FILE_RETURNS_DATA_BY_RETURN_DATE as the merchant-fulfilled/MFN counterpart
+// report, which is what this account actually needs.
+const RETURNS_REPORT_TYPE = "GET_FLAT_FILE_RETURNS_DATA_BY_RETURN_DATE";
 
 type ListingSyncItem = {
   sku: string;
@@ -2231,12 +2240,17 @@ type ReturnSyncItem = {
 type ReturnsReportParsedResult = {
   returns: ReturnSyncItem[];
   skippedCount: number;
+  // The real column headers Amazon's report actually returned (lowercased, as detected). Exact
+  // TSV column names for GET_FLAT_FILE_RETURNS_DATA_BY_RETURN_DATE could not be confirmed with
+  // full confidence from Amazon's own docs (blocked by the fetch sandbox) or from independent
+  // sources, unlike the report type this pipeline used before 2026-09-30. Every field below is
+  // looked up defensively with multiple plausible candidate names (same style as
+  // parseOrderReportText), and this real detected header list is threaded through to the sync
+  // response so the actual Amazon column names can be confirmed against live data rather than
+  // assumed - if a field comes back null on real rows, this list shows the real header to add.
+  headers: string[];
 };
 
-// Column names verified 2026-09-29 against Amazon's own report documentation plus real seller
-// reports of the exact TSV headers this report type emits. Amazon has been inconsistent about
-// "order-id" vs "amazon-order-id" across report versions, so both are accepted defensively -
-// the same pattern parseOrderReportText already uses for its own order-id lookup.
 function parseReturnsReportText(text: string): ReturnsReportParsedResult {
   const withoutBom = text.replace(/^﻿/, "");
   const lines = withoutBom
@@ -2245,7 +2259,7 @@ function parseReturnsReportText(text: string): ReturnsReportParsedResult {
     .filter((line) => line.trim().length > 0);
 
   if (lines.length === 0) {
-    return { returns: [], skippedCount: 0 };
+    return { returns: [], skippedCount: 0, headers: [] };
   }
 
   const headers = splitTabDelimitedLine(lines[0]).map((header) => header.trim().toLowerCase());
@@ -2265,20 +2279,28 @@ function parseReturnsReportText(text: string): ReturnsReportParsedResult {
       continue;
     }
 
-    const sku = reportValue(row, ["sku"]);
+    const sku = reportValue(row, ["sku", "merchant-sku", "seller-sku"]);
     const amazonOrderId = reportValue(row, ["order-id", "amazon-order-id"]);
-    const returnDate = reportValue(row, ["return-date"]);
+    const orderItemId = reportValue(row, ["order-item-id", "amazon-order-item-id"]);
+    const returnDate = reportValue(row, ["return-date", "return-request-date", "return-delivery-date"]);
     const fulfillmentCenterId = reportValue(row, ["fulfillment-center-id"]);
-    const licensePlateNumber = reportValue(row, ["license-plate-number", "lpn"]);
+    // MFN/self-ship returns have no license-plate-number (that's an FBA-only concept); Amazon's
+    // RMA id is the closest real per-return identifier for this report type, so it's accepted
+    // as an alternate source for the same field.
+    const licensePlateNumber = reportValue(row, ["license-plate-number", "lpn", "amazon-rma-id", "rma-id"]);
 
-    // A real per-unit identifier (license plate number) is the ideal dedupe key; fall back to
-    // a composite of the fields that are actually present so a re-sync of the same report
-    // upserts cleanly instead of creating duplicate rows.
+    // A real per-unit identifier (license plate number or RMA id) is the ideal dedupe key; fall
+    // back to a composite of the fields that are actually present so a re-sync of the same
+    // report upserts cleanly instead of creating duplicate rows.
     const returnLineId =
       licensePlateNumber ??
-      [amazonOrderId ?? "unknown-order", sku ?? "unknown-sku", returnDate ?? "unknown-date", fulfillmentCenterId ?? "unknown-fc", rowIndex].join(
-        "|"
-      );
+      [
+        amazonOrderId ?? "unknown-order",
+        orderItemId ?? "unknown-item",
+        sku ?? "unknown-sku",
+        returnDate ?? "unknown-date",
+        rowIndex
+      ].join("|");
 
     if (!returnLineId) {
       skippedCount += 1;
@@ -2293,20 +2315,20 @@ function parseReturnsReportText(text: string): ReturnsReportParsedResult {
       sku,
       asin: reportValue(row, ["asin"]),
       fnsku: reportValue(row, ["fnsku"]),
-      productName: reportValue(row, ["product-name"]),
-      quantity: toIntegerOrNull(reportValue(row, ["quantity"])),
+      productName: reportValue(row, ["product-name", "item-name"]),
+      quantity: toIntegerOrNull(reportValue(row, ["quantity", "return-quantity"])),
       returnDate,
       fulfillmentCenterId,
-      detailedDisposition: reportValue(row, ["detailed-disposition"]),
-      reason: reportValue(row, ["reason"]),
-      status: reportValue(row, ["status"]),
+      detailedDisposition: reportValue(row, ["detailed-disposition", "disposition", "resolution"]),
+      reason: reportValue(row, ["reason", "return-reason"]),
+      status: reportValue(row, ["status", "return-request-status"]),
       licensePlateNumber,
-      customerComments: reportValue(row, ["customer-comments"]),
+      customerComments: reportValue(row, ["customer-comments", "comments"]),
       rawPayload
     });
   }
 
-  return { returns, skippedCount };
+  return { returns, skippedCount, headers };
 }
 
 async function upsertAmazonSpReturns(input: {
@@ -2444,7 +2466,8 @@ export async function syncAmazonSpReturnsReport(input: { sellerId: string; days:
       reportId,
       days,
       syncedReturns: parsed.returns.length,
-      skippedCount: parsed.skippedCount
+      skippedCount: parsed.skippedCount,
+      detectedHeaders: parsed.headers
     };
   } catch (error) {
     await updateConnectionError(connection.id, safeErrorMessage(error));
