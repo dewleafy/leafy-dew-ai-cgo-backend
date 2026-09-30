@@ -11,13 +11,15 @@ import {
   listAmazonSpReportJobs,
   listAmazonSpListings,
   listAmazonSpOrders,
+  listAmazonSpReturns,
   processAmazonSpReportJobs,
   runAmazonSpDoctor,
   syncAmazonSpListingAttributes,
   syncAmazonSpListings,
   syncAmazonSpOrderReport,
   syncAmazonSpOrderReportChunked,
-  syncAmazonSpOrders
+  syncAmazonSpOrders,
+  syncAmazonSpReturnsReport
 } from "./amazon-sp.service";
 import { safeErrorDetails, safeErrorMessage } from "./amazon-sp-utils";
 
@@ -199,6 +201,34 @@ export async function syncAmazonSpOrderReportController(req: Request, res: Respo
     }));
   } catch (error) {
     sendSafeError(res, "Could not sync Amazon SP-API order report.", error);
+  }
+}
+
+export async function syncAmazonSpReturnsReportController(req: Request, res: Response): Promise<void> {
+  try {
+    res.json(await syncAmazonSpReturnsReport({
+      sellerId: getSellerId(req),
+      days: getDays(req, 30, 90),
+      reportId: getReportId(req)
+    }));
+  } catch (error) {
+    sendSafeError(res, "Could not sync Amazon SP-API returns report.", error);
+  }
+}
+
+export async function listAmazonSpReturnsController(req: Request, res: Response): Promise<void> {
+  try {
+    const days = getDays(req, 30, 365);
+    const rows = await listAmazonSpReturns(getSellerId(req), days);
+    res.json({
+      ok: true,
+      sellerId: getSellerId(req),
+      days,
+      count: rows.length,
+      rows
+    });
+  } catch (error) {
+    sendSafeError(res, "Could not load Amazon SP-API returns.", error);
   }
 }
 
