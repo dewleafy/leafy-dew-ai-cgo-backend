@@ -2251,6 +2251,35 @@ type ReturnsReportParsedResult = {
   headers: string[];
 };
 
+const RETURNS_REPORT_MONTH_ABBREVIATIONS: Record<string, string> = {
+  jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06",
+  jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12"
+};
+
+// Real returns-report date columns for this report type have been documented elsewhere (an
+// Airbyte connector schema-validation issue) as coming back "DD-MMM-YYYY" (e.g. "16-Mar-2024"),
+// not ISO 8601 - a format the amazon_sp_returns.return_date timestamptz column would otherwise
+// either mis-parse or reject outright, silently failing the whole batch upsert. Normalizes that
+// format to a real ISO date when recognized; passes anything already ISO-shaped through
+// unchanged; and returns null (never a guess) for anything else, so a genuinely unrecognized
+// date is dropped from that one field rather than risking a bad insert.
+function normalizeReturnsReportDate(value: string | null): string | null {
+  if (!value) return null;
+
+  if (/^\d{4}-\d{2}-\d{2}/.test(value)) return value;
+
+  const match = /^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/.exec(value.trim());
+  if (match) {
+    const [, day, monthAbbrev, year] = match;
+    const month = RETURNS_REPORT_MONTH_ABBREVIATIONS[monthAbbrev.toLowerCase()];
+    if (month) {
+      return `${year}-${month}-${day.padStart(2, "0")}`;
+    }
+  }
+
+  return null;
+}
+
 function parseReturnsReportText(text: string): ReturnsReportParsedResult {
   const withoutBom = text.replace(/^﻿/, "");
   const lines = withoutBom
@@ -2282,7 +2311,7 @@ function parseReturnsReportText(text: string): ReturnsReportParsedResult {
     const sku = reportValue(row, ["sku", "merchant-sku", "seller-sku"]);
     const amazonOrderId = reportValue(row, ["order-id", "amazon-order-id"]);
     const orderItemId = reportValue(row, ["order-item-id", "amazon-order-item-id"]);
-    const returnDate = reportValue(row, ["return-date", "return-request-date", "return-delivery-date"]);
+    const returnDate = normalizeReturnsReportDate(reportValue(row, ["return-date", "return-request-date", "return-delivery-date"]));
     const fulfillmentCenterId = reportValue(row, ["fulfillment-center-id"]);
     // MFN/self-ship returns have no license-plate-number (that's an FBA-only concept); Amazon's
     // RMA id is the closest real per-return identifier for this report type, so it's accepted
@@ -2366,7 +2395,11 @@ async function upsertAmazonSpReturns(input: {
 
   if (error) {
     logSafeAmazonSpError("Could not upsert Amazon SP-API returns.", error);
-    throw new Error("Could not save Amazon SP-API returns in Supabase.");
+    // Surface the real (sanitized - secrets are stripped by sanitizeAmazonSpValue) Supabase
+    // error instead of a generic message, so a real save failure can be diagnosed from the
+    // sync response/activity log directly rather than guessing at another redeploy.
+    const detail = [error.message, error.details, error.hint].filter(Boolean).map((value) => sanitizeAmazonSpValue(value)).join(" | ");
+    throw new Error(`Could not save Amazon SP-API returns in Supabase.${detail ? ` (${detail})` : ""}`);
   }
 }
 
