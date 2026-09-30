@@ -19,6 +19,7 @@ import { EngineRegistryRow, EngineRunLogRow, SafeEngineRegistryRow, SafeEngineRu
 import { recordLearningEventSafe } from "../learning-loop/learning-loop.service";
 import { FOUNDER_BASELINE_RETURN_RATE_PERCENT, getCostCompletionQueue, listProductEconomics } from "../product-economics/product-economics.service";
 import { listAmazonSpReturns } from "../amazon-sp/amazon-sp.service";
+import { getSocialContentCalendarSummary } from "../social-content-log/social-content-log.service";
 import { CostCompletionQueueRow, SafeProductEconomicsRow } from "../product-economics/product-economics.types";
 import { ProductPassportRow } from "../product-passports/product-passports.types";
 import { AmazonSpListingRow, AmazonSpOrderItemRow, AmazonSpOrderRow } from "../amazon-sp/amazon-sp.types";
@@ -1483,6 +1484,68 @@ async function runReturnReviewRiskCheck(engine: SafeEngineRegistryRow, sellerId:
   };
 }
 
+// SOCIAL_CONTENT (10 engines): real founder-logged posting/planning activity from
+// social_content_log (see social_content_log.sql) - the "real place to record what's already
+// posted/planned" this category needed before a gap check could mean anything, rather than
+// firing every run on invented "content gap" data. Founder confirmed 2026-09-30 that no social
+// content is posted today, so with an empty log this correctly creates one real "nothing posted
+// or planned yet" finding instead of staying silently stubbed out or guessing at a fake gap.
+// Honest note: the registry seed's default outputActionType for this category
+// ("SOCIAL_POST_DRAFT_REVIEW") is not a real ActionLedgerActionType - it was never added to
+// action-ledger.types.ts or the ACTION_LEDGER_ACTION_TYPES runtime allowlist (same class of gap
+// just found and fixed for SEASONAL_ACTION_REVIEW/RETURN_RISK_REVIEW). Rather than repeat that
+// bug a third time, this uses the real, already-valid "SOCIAL_POST" action type below.
+const SOCIAL_CONTENT_GAP_WINDOW_DAYS_DEFAULT = 30;
+
+async function runSocialCalendarCheck(engine: SafeEngineRegistryRow, sellerId: string): Promise<EnginePreviewDecision> {
+  const windowDays = toNumber(engine.ruleConfig?.lookbackDays) || SOCIAL_CONTENT_GAP_WINDOW_DAYS_DEFAULT;
+  const summary = await getSocialContentCalendarSummary(sellerId, windowDays);
+
+  const hasRecentPost = summary.daysSinceLastPost !== null && summary.daysSinceLastPost <= windowDays;
+  const hasUpcomingPlan = summary.nextPlannedDate !== null;
+
+  if (hasRecentPost || hasUpcomingPlan) {
+    const parts: string[] = [];
+    if (hasRecentPost) parts.push(`last posted ${summary.daysSinceLastPost} day(s) ago (${summary.mostRecentPostedDate})`);
+    if (hasUpcomingPlan) parts.push(`next planned in ${summary.daysUntilNextPlanned} day(s) (${summary.nextPlannedDate})`);
+
+    return {
+      status: "PREVIEW_NO_ACTION",
+      summary: `Social content calendar looks active: ${parts.join(", ")}.`,
+      evidence: { engineKey: engine.engineKey, windowDays, ...summary }
+    };
+  }
+
+  const isEmptyLog = summary.totalLoggedEver === 0;
+
+  return {
+    status: "PREVIEW_ACTION_CREATED",
+    summary: isEmptyLog
+      ? "No social content has ever been logged as posted or planned - the calendar is empty."
+      : `Nothing posted in the last ${windowDays} days${summary.mostRecentPostedDate ? ` (last post was ${summary.mostRecentPostedDate})` : ""}, and nothing is currently planned.`,
+    actionDraft: {
+      actionType: "SOCIAL_POST",
+      entityType: "SOCIAL_CHANNEL",
+      entityId: "social-content-calendar",
+      sku: null,
+      asin: null,
+      title: "No active social content calendar",
+      summary: isEmptyLog
+        ? "No posts or plans have been logged yet for Leafy Dew or Ziro kart. Log what you post (or plan to post) in the Social Content Calendar so this check can track real gaps going forward."
+        : `Nothing posted in the last ${windowDays} days and nothing planned next. Log a plan in the Social Content Calendar, or log recent posts if this is out of date.`,
+      recommendedAction: "LOG_SOCIAL_CONTENT_PLAN",
+      riskLevel: "LOW",
+      confidenceLabel: "HIGH",
+      approvalTier: "TIER_2",
+      evidence: {
+        engineKey: engine.engineKey,
+        windowDays,
+        ...summary
+      }
+    }
+  };
+}
+
 async function runDeterministicPreview(engine: SafeEngineRegistryRow, sellerId: string): Promise<EnginePreviewDecision> {
   if (engine.ruleTemplate === "MISSING_DATA_CHECK") return runMissingDataCheck(engine, sellerId);
   if (engine.ruleTemplate === "PROFIT_GUARDRAIL_CHECK") return runProfitGuardrailCheck(engine, sellerId);
@@ -1500,6 +1563,7 @@ async function runDeterministicPreview(engine: SafeEngineRegistryRow, sellerId: 
   if (engine.ruleTemplate === "CONTENT_GAP_CHECK") return runContentGapCheck(engine, sellerId);
   if (engine.ruleTemplate === "SEASONAL_OPPORTUNITY_CHECK") return runSeasonalOpportunityCheck(engine, sellerId);
   if (engine.ruleTemplate === "RETURN_REVIEW_RISK_CHECK") return runReturnReviewRiskCheck(engine, sellerId);
+  if (engine.ruleTemplate === "SOCIAL_CALENDAR_CHECK") return runSocialCalendarCheck(engine, sellerId);
 
   return {
     status: "SKIPPED_TEMPLATE_NOT_IMPLEMENTED",
