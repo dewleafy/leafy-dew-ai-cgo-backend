@@ -2308,15 +2308,35 @@ function parseReturnsReportText(text: string): ReturnsReportParsedResult {
       continue;
     }
 
-    const sku = reportValue(row, ["sku", "merchant-sku", "seller-sku"]);
-    const amazonOrderId = reportValue(row, ["order-id", "amazon-order-id"]);
-    const orderItemId = reportValue(row, ["order-item-id", "amazon-order-item-id"]);
-    const returnDate = normalizeReturnsReportDate(reportValue(row, ["return-date", "return-request-date", "return-delivery-date"]));
-    const fulfillmentCenterId = reportValue(row, ["fulfillment-center-id"]);
+    // Field lookups below carry two spellings per header on purpose: the hyphenated style used
+    // by every other Amazon flat-file report already handled in this file, and the
+    // space-separated style this specific report type was confirmed (2026-09-30, against a real
+    // live sync of this account's actual returns) to actually use - e.g. real detected headers
+    // included "order id", "return request date", "merchant sku", "return quantity", "resolution".
+    const sku = reportValue(row, ["sku", "merchant-sku", "seller-sku", "merchant sku", "seller sku"]);
+    const amazonOrderId = reportValue(row, ["order-id", "amazon-order-id", "order id"]);
+    const orderItemId = reportValue(row, ["order-item-id", "amazon-order-item-id", "order item id"]);
+    const returnDate = normalizeReturnsReportDate(
+      reportValue(row, [
+        "return-date",
+        "return-request-date",
+        "return-delivery-date",
+        "return request date",
+        "return delivery date"
+      ])
+    );
+    const fulfillmentCenterId = reportValue(row, ["fulfillment-center-id", "fulfillment center id"]);
     // MFN/self-ship returns have no license-plate-number (that's an FBA-only concept); Amazon's
     // RMA id is the closest real per-return identifier for this report type, so it's accepted
     // as an alternate source for the same field.
-    const licensePlateNumber = reportValue(row, ["license-plate-number", "lpn", "amazon-rma-id", "rma-id"]);
+    const licensePlateNumber = reportValue(row, [
+      "license-plate-number",
+      "lpn",
+      "amazon-rma-id",
+      "rma-id",
+      "amazon rma id",
+      "merchant rma id"
+    ]);
 
     // A real per-unit identifier (license plate number or RMA id) is the ideal dedupe key; fall
     // back to a composite of the fields that are actually present so a re-sync of the same
@@ -2344,14 +2364,17 @@ function parseReturnsReportText(text: string): ReturnsReportParsedResult {
       sku,
       asin: reportValue(row, ["asin"]),
       fnsku: reportValue(row, ["fnsku"]),
-      productName: reportValue(row, ["product-name", "item-name"]),
-      quantity: toIntegerOrNull(reportValue(row, ["quantity", "return-quantity"])),
+      productName: reportValue(row, ["product-name", "item-name", "item name"]),
+      quantity: toIntegerOrNull(reportValue(row, ["quantity", "return-quantity", "return quantity"])),
       returnDate,
       fulfillmentCenterId,
-      detailedDisposition: reportValue(row, ["detailed-disposition", "disposition", "resolution"]),
-      reason: reportValue(row, ["reason", "return-reason"]),
-      status: reportValue(row, ["status", "return-request-status"]),
+      detailedDisposition: reportValue(row, ["detailed-disposition", "disposition", "resolution", "return type", "return-type"]),
+      reason: reportValue(row, ["reason", "return-reason", "return reason"]),
+      status: reportValue(row, ["status", "return-request-status", "return request status"]),
       licensePlateNumber,
+      // This report type's real detected headers (2026-09-30) have no free-text customer-comment
+      // column at all - unlike the FBA returns report this pipeline used before - so this stays
+      // null for MFN returns rather than being mapped to an unrelated field just to fill it.
       customerComments: reportValue(row, ["customer-comments", "comments"]),
       rawPayload
     });
