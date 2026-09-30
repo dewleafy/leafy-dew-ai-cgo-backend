@@ -27,6 +27,7 @@ import {
   AmazonSpListingRow,
   AmazonSpOrderItemRow,
   AmazonSpOrderRow,
+  AmazonSpReturnRow,
   SafeAmazonSpListing,
   SafeAmazonSpOrder
 } from "./amazon-sp.types";
@@ -48,6 +49,10 @@ const LISTINGS_REPORT_PROCESSING_STATUSES = new Set(["IN_QUEUE", "IN_PROGRESS"])
 const LISTINGS_REPORT_STOP_STATUSES = new Set(["DONE", "DONE_NO_DATA", "CANCELLED", "FATAL"]);
 const ORDER_REPORT_PROCESSING_STATUSES = new Set(["IN_QUEUE", "IN_PROGRESS"]);
 const ORDER_REPORT_STOP_STATUSES = new Set(["DONE", "DONE_NO_DATA", "CANCELLED", "FATAL"]);
+// Verified 2026-09-29 against Amazon's own SP-API report-type catalog (this is the older,
+// still-supported FBA returns report - Amazon's newer ledger-based replacement covers the
+// same data under a different report type/eventType, not used here).
+const RETURNS_REPORT_TYPE = "GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA";
 
 type ListingSyncItem = {
   sku: string;
@@ -2203,6 +2208,275 @@ export async function syncAmazonSpOrderReport(input: { sellerId: string; days: n
     });
     throw error;
   }
+}
+
+type ReturnSyncItem = {
+  returnLineId: string;
+  amazonOrderId: string | null;
+  sku: string | null;
+  asin: string | null;
+  fnsku: string | null;
+  productName: string | null;
+  quantity: number | null;
+  returnDate: string | null;
+  fulfillmentCenterId: string | null;
+  detailedDisposition: string | null;
+  reason: string | null;
+  status: string | null;
+  licensePlateNumber: string | null;
+  customerComments: string | null;
+  rawPayload: Record<string, unknown>;
+};
+
+type ReturnsReportParsedResult = {
+  returns: ReturnSyncItem[];
+  skippedCount: number;
+};
+
+// Column names verified 2026-09-29 against Amazon's own report documentation plus real seller
+// reports of the exact TSV headers this report type emits. Amazon has been inconsistent about
+// "order-id" vs "amazon-order-id" across report versions, so both are accepted defensively -
+// the same pattern parseOrderReportText already uses for its own order-id lookup.
+function parseReturnsReportText(text: string): ReturnsReportParsedResult {
+  const withoutBom = text.replace(/^﻿/, "");
+  const lines = withoutBom
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0);
+
+  if (lines.length === 0) {
+    return { returns: [], skippedCount: 0 };
+  }
+
+  const headers = splitTabDelimitedLine(lines[0]).map((header) => header.trim().toLowerCase());
+  const returns: ReturnSyncItem[] = [];
+  let skippedCount = 0;
+
+  for (const [rowOffset, line] of lines.slice(1).entries()) {
+    const rowIndex = rowOffset + 1;
+    const cells = splitTabDelimitedLine(line);
+    const row: Record<string, string> = {};
+
+    headers.forEach((header, index) => {
+      row[header] = (cells[index] ?? "").trim();
+    });
+
+    if (Object.values(row).every((value) => value.length === 0)) {
+      continue;
+    }
+
+    const sku = reportValue(row, ["sku"]);
+    const amazonOrderId = reportValue(row, ["order-id", "amazon-order-id"]);
+    const returnDate = reportValue(row, ["return-date"]);
+    const fulfillmentCenterId = reportValue(row, ["fulfillment-center-id"]);
+    const licensePlateNumber = reportValue(row, ["license-plate-number", "lpn"]);
+
+    // A real per-unit identifier (license plate number) is the ideal dedupe key; fall back to
+    // a composite of the fields that are actually present so a re-sync of the same report
+    // upserts cleanly instead of creating duplicate rows.
+    const returnLineId =
+      licensePlateNumber ??
+      [amazonOrderId ?? "unknown-order", sku ?? "unknown-sku", returnDate ?? "unknown-date", fulfillmentCenterId ?? "unknown-fc", rowIndex].join(
+        "|"
+      );
+
+    if (!returnLineId) {
+      skippedCount += 1;
+      continue;
+    }
+
+    const rawPayload: Record<string, unknown> = { ...row };
+
+    returns.push({
+      returnLineId,
+      amazonOrderId,
+      sku,
+      asin: reportValue(row, ["asin"]),
+      fnsku: reportValue(row, ["fnsku"]),
+      productName: reportValue(row, ["product-name"]),
+      quantity: toIntegerOrNull(reportValue(row, ["quantity"])),
+      returnDate,
+      fulfillmentCenterId,
+      detailedDisposition: reportValue(row, ["detailed-disposition"]),
+      reason: reportValue(row, ["reason"]),
+      status: reportValue(row, ["status"]),
+      licensePlateNumber,
+      customerComments: reportValue(row, ["customer-comments"]),
+      rawPayload
+    });
+  }
+
+  return { returns, skippedCount };
+}
+
+async function upsertAmazonSpReturns(input: {
+  sellerId: string;
+  marketplaceId: string;
+  returns: ReturnSyncItem[];
+}): Promise<void> {
+  if (input.returns.length === 0) return;
+
+  const now = new Date().toISOString();
+  const { error } = await supabase.from("amazon_sp_returns").upsert(
+    input.returns.map((item) => ({
+      seller_id: input.sellerId,
+      marketplace_id: input.marketplaceId,
+      return_line_id: item.returnLineId,
+      amazon_order_id: item.amazonOrderId,
+      sku: item.sku,
+      asin: item.asin,
+      fnsku: item.fnsku,
+      product_name: item.productName,
+      quantity: item.quantity,
+      return_date: item.returnDate,
+      fulfillment_center_id: item.fulfillmentCenterId,
+      detailed_disposition: item.detailedDisposition,
+      reason: item.reason,
+      status: item.status,
+      license_plate_number: item.licensePlateNumber,
+      customer_comments: item.customerComments,
+      raw_payload: item.rawPayload,
+      last_synced_at: now,
+      updated_at: now
+    })),
+    { onConflict: "seller_id,return_line_id" }
+  );
+
+  if (error) {
+    logSafeAmazonSpError("Could not upsert Amazon SP-API returns.", error);
+    throw new Error("Could not save Amazon SP-API returns in Supabase.");
+  }
+}
+
+export async function syncAmazonSpReturnsReport(input: { sellerId: string; days: number; reportId?: string }) {
+  const sellerId = sellerIdOrDefault(input.sellerId);
+  const days = Math.min(Math.max(Math.floor(input.days), 1), 90);
+  const requestedReportId = cleanText(input.reportId) ?? undefined;
+  const connection = await requireConnectedConnection(sellerId);
+
+  await logSpActivity({
+    sellerId,
+    action: "SYNC_RETURNS_REPORT_STARTED",
+    status: "INFO",
+    message: "Amazon SP-API returns report sync started.",
+    metadata: { source: "REPORTS_API", reportType: RETURNS_REPORT_TYPE, days }
+  });
+
+  try {
+    const accessToken = await getAmazonSpAccessToken(connection.id);
+    const { reportId, report } = await waitForOrderReport({
+      accessToken,
+      region: connection.region,
+      marketplaceId: connection.marketplace_id,
+      days,
+      reportType: RETURNS_REPORT_TYPE,
+      reportId: requestedReportId
+    });
+    const status = report.processingStatus ?? "UNKNOWN";
+
+    if (ORDER_REPORT_PROCESSING_STATUSES.has(status)) {
+      return {
+        ok: true,
+        source: "REPORTS_API",
+        status: "PROCESSING",
+        reportId,
+        reportType: RETURNS_REPORT_TYPE,
+        message: "Amazon returns report is processing. Retry with this reportId in a few minutes."
+      };
+    }
+
+    if (status === "CANCELLED" || status === "FATAL" || status === "DONE_NO_DATA") {
+      await updateConnectionError(connection.id, null);
+      await logSpActivity({
+        sellerId,
+        action: "SYNC_RETURNS_REPORT_COMPLETED",
+        status: status === "DONE_NO_DATA" ? "SUCCESS" : "WARNING",
+        message: `Amazon returns report finished with status ${status}.`,
+        metadata: { source: "REPORTS_API", reportId, reportStatus: status, days }
+      });
+
+      return {
+        ok: true,
+        source: "REPORTS_API",
+        reportType: RETURNS_REPORT_TYPE,
+        reportId,
+        status,
+        days,
+        syncedReturns: 0,
+        skippedCount: 0
+      };
+    }
+
+    if (status !== "DONE" || !report.reportDocumentId) {
+      throw new Error("Amazon returns report did not finish with a downloadable document.");
+    }
+
+    const reportText = await loadAmazonSpReportDocument({
+      accessToken,
+      region: connection.region,
+      reportDocumentId: report.reportDocumentId,
+      stage: "GET_RETURNS_REPORT_DOCUMENT"
+    });
+    const parsed = parseReturnsReportText(reportText);
+
+    await upsertAmazonSpReturns({ sellerId, marketplaceId: connection.marketplace_id, returns: parsed.returns });
+
+    await updateConnectionError(connection.id, null);
+    await logSpActivity({
+      sellerId,
+      action: "SYNC_RETURNS_REPORT_COMPLETED",
+      status: "SUCCESS",
+      message: "Amazon SP-API returns report sync completed.",
+      metadata: {
+        source: "REPORTS_API",
+        reportType: RETURNS_REPORT_TYPE,
+        reportId,
+        days,
+        syncedReturns: parsed.returns.length,
+        skippedCount: parsed.skippedCount
+      }
+    });
+
+    return {
+      ok: true,
+      source: "REPORTS_API",
+      reportType: RETURNS_REPORT_TYPE,
+      reportId,
+      days,
+      syncedReturns: parsed.returns.length,
+      skippedCount: parsed.skippedCount
+    };
+  } catch (error) {
+    await updateConnectionError(connection.id, safeErrorMessage(error));
+    await logSpActivity({
+      sellerId,
+      action: "SYNC_RETURNS_REPORT_FAILED",
+      status: "ERROR",
+      message: safeErrorMessage(error)
+    });
+    throw error;
+  }
+}
+
+export async function listAmazonSpReturns(sellerIdInput: string, daysInput: number): Promise<AmazonSpReturnRow[]> {
+  const sellerId = sellerIdOrDefault(sellerIdInput);
+  const days = Math.min(Math.max(Math.floor(daysInput), 1), 365);
+  const rangeStart = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+
+  const { data, error } = await supabase
+    .from("amazon_sp_returns")
+    .select("*")
+    .eq("seller_id", sellerId)
+    .gte("return_date", rangeStart)
+    .order("return_date", { ascending: false })
+    .limit(5000);
+
+  if (error) {
+    logSafeAmazonSpError("Could not load Amazon SP-API returns.", error);
+    throw new Error("Could not load Amazon SP-API returns from Supabase.");
+  }
+
+  return (data ?? []) as AmazonSpReturnRow[];
 }
 
 export async function syncAmazonSpOrders(sellerIdInput: string, daysInput: number) {
