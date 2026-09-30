@@ -84,6 +84,17 @@ export const ACTION_LEDGER_ACTION_TYPES: ActionLedgerActionType[] = [
   "PASSPORT_TARGET_CUSTOMER_DRAFT_REVIEW",
   "IMAGE_CREATIVE_REVIEW",
   "A_PLUS_CONTENT_REVIEW",
+  // Found 2026-09-30 while wiring up the Social Content engines: these two were added to the
+  // ActionLedgerActionType union (action-ledger.types.ts) when Seasonality (item 0.E) and
+  // Returns (item 0.F) were built, but were missed here - the exact same class of bug the
+  // PASSPORT_PACKAGE_CONTENTS/COMPLIANCE_NOTES comment above already warns about repeating.
+  // Real impact: every Seasonal Action Review and Return Risk Review action - including the
+  // two real return-risk cards verified live earlier today - was being silently downgraded to
+  // "OTHER" by safeEnum() on every API read (title/summary/evidence still showed correctly,
+  // but the actionType badge/filter was wrong). The DB value itself was always correct; fixing
+  // this list is the whole fix, no data migration needed.
+  "SEASONAL_ACTION_REVIEW",
+  "RETURN_RISK_REVIEW",
   "LISTING_UPDATE",
   "IMAGE_UPDATE",
   "A_PLUS_UPDATE",
