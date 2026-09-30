@@ -73,6 +73,30 @@ export type AmazonSpOrderItemRow = {
   updated_at: string;
 };
 
+export type AmazonSpReturnRow = {
+  id: string;
+  seller_id: string;
+  marketplace_id: string;
+  return_line_id: string;
+  amazon_order_id: string | null;
+  sku: string | null;
+  asin: string | null;
+  fnsku: string | null;
+  product_name: string | null;
+  quantity: number | null;
+  return_date: string | null;
+  fulfillment_center_id: string | null;
+  detailed_disposition: string | null;
+  reason: string | null;
+  status: string | null;
+  license_plate_number: string | null;
+  customer_comments: string | null;
+  raw_payload: Record<string, unknown> | null;
+  last_synced_at: string;
+  created_at: string;
+  updated_at: string;
+};
+
 export type AmazonSpTokenResponse = {
   access_token: string;
   refresh_token?: string;
