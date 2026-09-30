@@ -17,7 +17,8 @@ import { safeRecordActivityLog } from "../activity-logs/activity-logs.service";
 import { getDailyCeoReport } from "../ceo-report/ceo-report.service";
 import { EngineRegistryRow, EngineRunLogRow, SafeEngineRegistryRow, SafeEngineRunLogRow } from "../engine-registry/engine-registry.types";
 import { recordLearningEventSafe } from "../learning-loop/learning-loop.service";
-import { getCostCompletionQueue, listProductEconomics } from "../product-economics/product-economics.service";
+import { FOUNDER_BASELINE_RETURN_RATE_PERCENT, getCostCompletionQueue, listProductEconomics } from "../product-economics/product-economics.service";
+import { listAmazonSpReturns } from "../amazon-sp/amazon-sp.service";
 import { CostCompletionQueueRow, SafeProductEconomicsRow } from "../product-economics/product-economics.types";
 import { ProductPassportRow } from "../product-passports/product-passports.types";
 import { AmazonSpListingRow, AmazonSpOrderItemRow, AmazonSpOrderRow } from "../amazon-sp/amazon-sp.types";
@@ -1386,6 +1387,102 @@ async function runSeasonalOpportunityCheck(engine: SafeEngineRegistryRow, seller
   };
 }
 
+// RETURNS_REVIEWS (15 engines): real per-unit Amazon FBA return data (amazon_sp_returns,
+// synced from Amazon's own GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA report) compared against
+// real units sold in the same window, using the exact same founder-stated 25% baseline
+// (FOUNDER_BASELINE_RETURN_RATE_PERCENT) the Cost Reduction Opportunities view already uses -
+// this replaces that view's "assumed input rate" comparison with a real, measured one for any
+// SKU that has actual return data. No review-text checks: Amazon does not give third-party
+// apps read access to customer review content, so REVIEWS half of this category's name stays
+// unbuilt - only RETURNS is real here. Requires the amazon_sp_returns table (see
+// amazon_sp_returns.sql) and at least one successful /api/amazon-sp/sync-returns-report run;
+// until then this correctly reports "no returns data synced yet" rather than guessing.
+async function runReturnReviewRiskCheck(engine: SafeEngineRegistryRow, sellerId: string): Promise<EnginePreviewDecision> {
+  const windowDays = toNumber(engine.ruleConfig?.lookbackDays) || 30;
+
+  const [returns, inventoryRows] = await Promise.all([
+    listAmazonSpReturns(sellerId, windowDays),
+    loadInventoryVelocity(sellerId, windowDays)
+  ]);
+
+  if (!returns.length) {
+    return {
+      status: "SKIPPED_NO_DATA",
+      summary: "No Amazon returns data synced yet for return-rate review. Run the returns report sync first.",
+      evidence: { engineKey: engine.engineKey, windowDays, returnRowCount: 0 }
+    };
+  }
+
+  const returnUnitsBySku = new Map<string, number>();
+  const sampleReasonBySku = new Map<string, string>();
+
+  for (const row of returns) {
+    const sku = cleanText(row.sku);
+    if (!sku) continue;
+    returnUnitsBySku.set(sku, (returnUnitsBySku.get(sku) ?? 0) + (toNumber(row.quantity) || 1));
+    const reason = cleanText(row.reason) ?? cleanText(row.detailed_disposition);
+    if (reason && !sampleReasonBySku.has(sku)) sampleReasonBySku.set(sku, reason);
+  }
+
+  const soldUnitsBySku = new Map<string, number>();
+  for (const row of inventoryRows) {
+    soldUnitsBySku.set(row.sku, row.unitsSoldInWindow);
+  }
+
+  type ReturnRiskRow = { sku: string; returnUnits: number; soldUnits: number; returnRatePercent: number; sampleReason: string | null };
+  const candidates: ReturnRiskRow[] = [];
+
+  for (const [sku, returnUnits] of returnUnitsBySku) {
+    const soldUnits = soldUnitsBySku.get(sku) ?? 0;
+    // A real denominator is required - without real sold-units data for this SKU in the same
+    // window, a rate can't be honestly computed, so it's skipped rather than guessed.
+    if (soldUnits <= 0 || returnUnits < 2) continue;
+    const returnRatePercent = roundTo((returnUnits / soldUnits) * 100, 1);
+    if (returnRatePercent > FOUNDER_BASELINE_RETURN_RATE_PERCENT) {
+      candidates.push({ sku, returnUnits, soldUnits, returnRatePercent, sampleReason: sampleReasonBySku.get(sku) ?? null });
+    }
+  }
+
+  candidates.sort((a, b) => b.returnRatePercent - a.returnRatePercent);
+  const worst = candidates[0];
+
+  if (!worst) {
+    return {
+      status: "PREVIEW_NO_ACTION",
+      summary: `No SKU's measured return rate is above the ${FOUNDER_BASELINE_RETURN_RATE_PERCENT}% baseline over the last ${windowDays} days.`,
+      evidence: { engineKey: engine.engineKey, windowDays, skusWithReturns: returnUnitsBySku.size }
+    };
+  }
+
+  return {
+    status: "PREVIEW_ACTION_CREATED",
+    summary: `${worst.sku} has a real measured return rate of ${worst.returnRatePercent}% over the last ${windowDays} days (${worst.returnUnits} returned of ${worst.soldUnits} sold) - above the ${FOUNDER_BASELINE_RETURN_RATE_PERCENT}% baseline.`,
+    actionDraft: {
+      actionType: "RETURN_RISK_REVIEW",
+      entityType: "SKU",
+      entityId: worst.sku,
+      sku: worst.sku,
+      asin: null,
+      title: `Review why ${worst.sku} is returning above normal`,
+      summary: `${worst.returnUnits} of ${worst.soldUnits} units sold in the last ${windowDays} days came back (${worst.returnRatePercent}%), above your ${FOUNDER_BASELINE_RETURN_RATE_PERCENT}% baseline.${worst.sampleReason ? ` Sample reason from Amazon: "${worst.sampleReason}".` : ""}`,
+      recommendedAction: "REVIEW_RETURN_PATTERN",
+      riskLevel: worst.returnRatePercent > FOUNDER_BASELINE_RETURN_RATE_PERCENT * 2 ? "HIGH" : "MEDIUM",
+      confidenceLabel: worst.soldUnits >= 5 ? "HIGH" : "MEDIUM",
+      approvalTier: "TIER_2",
+      evidence: {
+        engineKey: engine.engineKey,
+        sku: worst.sku,
+        returnUnits: worst.returnUnits,
+        soldUnits: worst.soldUnits,
+        returnRatePercent: worst.returnRatePercent,
+        baselinePercent: FOUNDER_BASELINE_RETURN_RATE_PERCENT,
+        sampleReason: worst.sampleReason,
+        windowDays
+      }
+    }
+  };
+}
+
 async function runDeterministicPreview(engine: SafeEngineRegistryRow, sellerId: string): Promise<EnginePreviewDecision> {
   if (engine.ruleTemplate === "MISSING_DATA_CHECK") return runMissingDataCheck(engine, sellerId);
   if (engine.ruleTemplate === "PROFIT_GUARDRAIL_CHECK") return runProfitGuardrailCheck(engine, sellerId);
@@ -1402,6 +1499,7 @@ async function runDeterministicPreview(engine: SafeEngineRegistryRow, sellerId: 
   if (engine.ruleTemplate === "IMAGE_GAP_CHECK") return runImageGapCheck(engine, sellerId);
   if (engine.ruleTemplate === "CONTENT_GAP_CHECK") return runContentGapCheck(engine, sellerId);
   if (engine.ruleTemplate === "SEASONAL_OPPORTUNITY_CHECK") return runSeasonalOpportunityCheck(engine, sellerId);
+  if (engine.ruleTemplate === "RETURN_REVIEW_RISK_CHECK") return runReturnReviewRiskCheck(engine, sellerId);
 
   return {
     status: "SKIPPED_TEMPLATE_NOT_IMPLEMENTED",
