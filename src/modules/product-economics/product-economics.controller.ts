@@ -9,6 +9,7 @@ import {
   saveProductEconomics
 } from "./product-economics.service";
 import { getMeasuredReturnRates, RETURN_LOOKBACK_DAYS, RETURN_MIN_UNITS, RETURN_RISK_RATE_PCT } from "../returns/measured-return-rate.service";
+import { getReturnRatePreview } from "./return-rate-preview.service";
 
 const nullableTextSchema = z
   .string()
@@ -332,5 +333,16 @@ export async function getProductEconomicsMeasuredReturnRates(req: Request, res: 
     });
   } catch {
     sendProductEconomicsError(res, "Could not load measured return rates from Supabase.");
+  }
+}
+
+export async function getProductEconomicsReturnRatePreview(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+
+  try {
+    const preview = await getReturnRatePreview(sellerId);
+    res.json({ ok: true, readOnly: true, ...preview });
+  } catch {
+    sendProductEconomicsError(res, "Could not build the return-rate preview.");
   }
 }
