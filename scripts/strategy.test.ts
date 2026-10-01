@@ -1,0 +1,12 @@
+import { decideStrategy } from "../src/modules/strategy/strategy.rules";
+let failed = 0;
+const t = (n: string, ok: boolean) => { console.log(`${ok ? "PASS" : "FAIL"} ${n}`); if (!ok) failed++; };
+const base = { profitStatus: "PASS", targetAcos: 25, breakEvenAcos: 40, flags: [] as string[], sessions: 100 };
+t("healthy -> PUSH", decideStrategy(base).verdict === "PUSH");
+t("small room -> HOLD", decideStrategy({ ...base, targetAcos: 5 }).verdict === "HOLD");
+t("negative target -> ORGANIC_ONLY", decideStrategy({ ...base, targetAcos: -3, profitStatus: "BLOCKED" }).verdict === "ORGANIC_ONLY");
+t("negative break-even -> LOSING_MONEY", decideStrategy({ ...base, targetAcos: -20, breakEvenAcos: -1 }).verdict === "LOSING_MONEY");
+t("low conversion -> FIX_LISTING", decideStrategy({ ...base, flags: ["LOW_CONVERSION"] }).verdict === "FIX_LISTING");
+t("sales drop -> INVESTIGATE", decideStrategy({ ...base, flags: ["SALES_DROP"] }).verdict === "INVESTIGATE");
+t("missing costs -> FIX_COSTS", decideStrategy({ ...base, targetAcos: null }).verdict === "FIX_COSTS");
+process.exit(failed ? 1 : 0);
