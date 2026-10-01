@@ -19,6 +19,7 @@ import {
 import { runDailyOrchestrator } from "../daily-orchestrator/daily-orchestrator.service";
 import { generateAlerts } from "../alert-center/alert-center.service";
 import { runDaypartingCheck } from "../amazon-ads/amazon-ads-dayparting.service";
+import { checkDataFreshness } from "../data-freshness/data-freshness.service";
 
 const DEFAULT_SELLER_ID = "default";
 const INTERVAL_MS = 15 * 60 * 1000; // every 15 minutes
@@ -453,6 +454,28 @@ async function runScheduledDaypartingCheck(sellerId: string): Promise<string> {
   }
 }
 
+// The Data Status page ("Data Freshness Guardrails") only updates when somebody clicks
+// "Run Freshness Check", so it had been showing 11-week-old rows (Jul 12) and wrongly looked
+// like every feed was stale. checkDataFreshness() only READS timestamps from our own tables
+// and writes the status rows -- it triggers no Amazon call -- so it is safe on every tick.
+const FRESHNESS_MIN_GAP_MS = 60 * 60 * 1000; // hourly is plenty (each check also writes an activity-log row)
+let lastFreshnessCheckAt = 0;
+
+async function runScheduledFreshnessCheck(sellerId: string): Promise<string> {
+  if (Date.now() - lastFreshnessCheckAt < FRESHNESS_MIN_GAP_MS) {
+    return "Data freshness: checked within the last hour, skipped.";
+  }
+  try {
+    lastFreshnessCheckAt = Date.now();
+    await checkDataFreshness(sellerId);
+    return "Data freshness refreshed.";
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    logger.warn("Scheduled data freshness check failed.", { message });
+    return `Data freshness check skipped this tick (${message}).`;
+  }
+}
+
 async function runBackgroundAmazonSync(sellerId: string = DEFAULT_SELLER_ID): Promise<void> {
   if (isRunning) {
     logger.info("Background Amazon sync already running, skipping this tick.");
@@ -466,8 +489,9 @@ async function runBackgroundAmazonSync(sellerId: string = DEFAULT_SELLER_ID): Pr
     const advertisedProductSummary = await runAdvertisedProductSync(sellerId);
     const dailyOrchestratorSummary = await runScheduledDailyOrchestration(sellerId);
     const daypartingSummary = await runScheduledDaypartingCheck(sellerId);
+    const freshnessSummary = await runScheduledFreshnessCheck(sellerId);
     lastRunAt = new Date().toISOString();
-    lastRunSummary = `${listingsSummary} ${attributesSummary} ${searchTermSummary} ${advertisedProductSummary} ${dailyOrchestratorSummary} ${daypartingSummary}`;
+    lastRunSummary = `${listingsSummary} ${attributesSummary} ${searchTermSummary} ${advertisedProductSummary} ${dailyOrchestratorSummary} ${daypartingSummary} ${freshnessSummary}`;
     logger.info("Background Amazon sync completed.", { summary: lastRunSummary });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
