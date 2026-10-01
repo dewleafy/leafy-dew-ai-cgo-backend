@@ -1,3 +1,4 @@
+import { logger } from "../../utils/logger";
 import axios from "axios";
 import { gunzipSync } from "zlib";
 import { env } from "../../config/env";
@@ -43,6 +44,7 @@ import {
 } from "./amazon-sp-utils";
 
 const LISTINGS_REPORT_TYPE = "GET_MERCHANT_LISTINGS_ALL_DATA";
+const SALES_TRAFFIC_REPORT_TYPE = "GET_SALES_AND_TRAFFIC_REPORT";
 const ORDERS_REPORT_TYPE = "GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL";
 const ORDERS_REPORT_LAST_UPDATE_TYPE = "GET_FLAT_FILE_ALL_ORDERS_DATA_BY_LAST_UPDATE_GENERAL";
 const LISTINGS_REPORT_PROCESSING_STATUSES = new Set(["IN_QUEUE", "IN_PROGRESS"]);
@@ -159,7 +161,7 @@ type OrderItemSaveResult = {
   }>;
 };
 
-type AmazonSpReportJobType = "LISTINGS_IMPORT" | "ORDER_IMPORT";
+type AmazonSpReportJobType = "LISTINGS_IMPORT" | "ORDER_IMPORT" | "SALES_TRAFFIC_IMPORT";
 
 type AmazonSpReportJobRow = {
   id: string;
@@ -2845,12 +2847,49 @@ export async function createDailyAmazonSpSyncJobs(sellerIdInput: string) {
     dataEndTime: orderDataEndTime
   });
 
+  // Sales & Traffic (sessions, page views, buy-box %, conversion per ASIN). Needs the Brand/Analytics
+  // SP-API role, so a refusal here must never break the listings and orders sync above.
+  let salesTrafficCreated = false;
+  try {
+    const trafficEnd = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const trafficStart = new Date(trafficEnd.getTime() - 29 * 24 * 60 * 60 * 1000);
+    const day = (d: Date) => d.toISOString().slice(0, 10);
+    const trafficResponse = await amazonSpPost<AmazonSpReportResponse>({
+      path: "/reports/2021-06-30/reports",
+      accessToken,
+      region: connection.region,
+      stage: "CREATE_SALES_TRAFFIC_REPORT",
+      body: {
+        reportType: SALES_TRAFFIC_REPORT_TYPE,
+        marketplaceIds: [connection.marketplace_id],
+        dataStartTime: `${day(trafficStart)}T00:00:00Z`,
+        dataEndTime: `${day(trafficEnd)}T23:59:59Z`,
+        reportOptions: { dateGranularity: "DAY", asinGranularity: "CHILD" }
+      }
+    });
+    if (trafficResponse.reportId) {
+      await saveAmazonSpReportJob({
+        sellerId,
+        marketplaceId: connection.marketplace_id,
+        reportId: trafficResponse.reportId,
+        reportType: SALES_TRAFFIC_REPORT_TYPE,
+        jobType: "SALES_TRAFFIC_IMPORT",
+        status: "PROCESSING",
+        dataStartTime: `${day(trafficStart)}T00:00:00Z`,
+        dataEndTime: `${day(trafficEnd)}T23:59:59Z`
+      });
+      salesTrafficCreated = true;
+    }
+  } catch (error) {
+    logger.warn("Sales & Traffic report could not be requested (role or access may be missing).", { message: safeErrorMessage(error) });
+  }
+
   await logSpActivity({
     sellerId,
     action: "DAILY_SP_SYNC_JOBS_CREATED",
     status: "SUCCESS",
     message: "Amazon SP-API daily sync jobs created.",
-    metadata: { createdJobs: 2 }
+    metadata: { createdJobs: salesTrafficCreated ? 3 : 2, salesTrafficCreated }
   });
 
   return {
@@ -2873,6 +2912,46 @@ export async function createDailyAmazonSpSyncJobs(sellerIdInput: string) {
   };
 }
 
+async function saveSalesTrafficReport(job: AmazonSpReportJobRow, reportText: string) {
+  const parsed = JSON.parse(reportText) as {
+    reportSpecification?: { dataStartTime?: string; dataEndTime?: string };
+    salesAndTrafficByAsin?: Array<{
+      parentAsin?: string;
+      childAsin?: string;
+      sku?: string;
+      salesByAsin?: { unitsOrdered?: number; orderedProductSales?: { amount?: number } };
+      trafficByAsin?: { sessions?: number; pageViews?: number; buyBoxPercentage?: number; unitSessionPercentage?: number };
+    }>;
+  };
+  const snapshotDate = new Date().toISOString().slice(0, 10);
+  const windowStart = (parsed.reportSpecification?.dataStartTime ?? job.data_start_time ?? "").slice(0, 10) || null;
+  const windowEnd = (parsed.reportSpecification?.dataEndTime ?? job.data_end_time ?? "").slice(0, 10) || null;
+  const rows = (parsed.salesAndTrafficByAsin ?? [])
+    .filter((item) => item.childAsin)
+    .map((item) => ({
+      seller_id: job.seller_id,
+      marketplace_id: job.marketplace_id,
+      snapshot_date: snapshotDate,
+      window_start: windowStart,
+      window_end: windowEnd,
+      child_asin: String(item.childAsin).toUpperCase(),
+      parent_asin: item.parentAsin ?? null,
+      sku: item.sku ?? null,
+      sessions: item.trafficByAsin?.sessions ?? 0,
+      page_views: item.trafficByAsin?.pageViews ?? 0,
+      buy_box_percentage: item.trafficByAsin?.buyBoxPercentage ?? null,
+      unit_session_percentage: item.trafficByAsin?.unitSessionPercentage ?? null,
+      units_ordered: item.salesByAsin?.unitsOrdered ?? 0,
+      ordered_sales: item.salesByAsin?.orderedProductSales?.amount ?? 0
+    }));
+
+  if (rows.length > 0) {
+    const { error } = await supabase.from("amazon_sp_sales_traffic").upsert(rows, { onConflict: "seller_id,snapshot_date,child_asin" });
+    if (error) throw new Error(`Could not save Sales & Traffic rows (${error.message}).`);
+  }
+  return { savedSalesTrafficAsins: rows.length, windowStart, windowEnd };
+}
+
 async function processDoneReportJob(input: {
   job: AmazonSpReportJobRow;
   report: AmazonSpReportResponse;
@@ -2889,6 +2968,10 @@ async function processDoneReportJob(input: {
     reportDocumentId: input.report.reportDocumentId,
     stage: input.job.job_type === "LISTINGS_IMPORT" ? "GET_JOB_LISTINGS_REPORT_DOCUMENT" : "GET_JOB_ORDER_REPORT_DOCUMENT"
   });
+
+  if (input.job.job_type === "SALES_TRAFFIC_IMPORT") {
+    return saveSalesTrafficReport(input.job, reportText);
+  }
 
   if (input.job.job_type === "LISTINGS_IMPORT") {
     const parsed = parseListingReportText(reportText);
