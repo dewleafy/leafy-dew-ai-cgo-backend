@@ -976,6 +976,24 @@ function mapActionLedgerRisk(value: unknown): "LOW" | "MEDIUM" | "HIGH" | "CRITI
   return "MEDIUM";
 }
 
+// A "complete the cost data" card is only worth the founder's attention for a product that is
+// actually selling; thousands of idle listings would otherwise bury the approval queue.
+async function soldInLast90Days(sellerId: string, asin: string | null, sku: string | null): Promise<boolean> {
+  const column = asin ? "asin" : sku ? "sku" : null;
+  const value = asin ?? sku;
+  if (!column || !value) return false;
+  try {
+    const since = new Date(Date.now() - 90 * 86_400_000).toISOString();
+    const { data: items } = await supabase.from("amazon_sp_order_items").select("amazon_order_id").eq(column, value).limit(200);
+    const ids = [...new Set((items ?? []).map((i: { amazon_order_id: string }) => i.amazon_order_id))];
+    if (ids.length === 0) return false;
+    const { count } = await supabase.from("amazon_sp_orders").select("amazon_order_id", { count: "exact", head: true }).eq("seller_id", sellerId).gte("purchase_date", since).in("amazon_order_id", ids);
+    return (count ?? 0) > 0;
+  } catch {
+    return true; // if the check fails, keep the old behaviour (raise the card)
+  }
+}
+
 async function ensureProductEconomicsAlerts(row: SafeProductEconomicsRow): Promise<void> {
   const productKey = row.sku ?? row.asin;
   const baseInput = {
@@ -1024,7 +1042,7 @@ async function ensureProductEconomicsAlerts(row: SafeProductEconomicsRow): Promi
     });
   }
 
-  if (row.profitDataStatus === "MISSING_COST_DATA" || row.profitDataStatus === "INCOMPLETE" || row.requiredProfit <= 0) {
+  if ((row.profitDataStatus === "MISSING_COST_DATA" || row.profitDataStatus === "INCOMPLETE" || row.requiredProfit <= 0) && (await soldInLast90Days(row.sellerId, row.asin ?? null, row.sku ?? null))) {
     await ensureActionLedgerAction({
       ...baseInput,
       sourceId: `product-economics:${normalizeActionSourcePart(productKey)}:missing-cost-data`,
