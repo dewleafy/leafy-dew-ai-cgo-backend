@@ -37,36 +37,59 @@ function item(input: LaunchChecklistItem): LaunchChecklistItem {
 
 async function buildItems(sellerId: string, runGate: boolean): Promise<LaunchChecklistItem[]> {
   const items: LaunchChecklistItem[] = [];
-  const safety = await getSafetyControlSnapshotSafe(sellerId);
-  const live = await getLiveExecutionStatus(sellerId).catch(() => null);
-  const ai = await getAiGatewayStatus(sellerId).catch(() => null);
-  const notification = await getNotificationOutboxSummary(sellerId).catch(() => null);
-  const launchGate = runGate ? await runLaunchGateChecks(sellerId) : await getLaunchGateSummary(sellerId);
+  // Independent checks run together so the checklist loads quickly.
+  const [safety, live, ai, notification, launchGate, actionSummary, health, scheduler, dataFreshness, alerts, counts] = await Promise.all([
+    getSafetyControlSnapshotSafe(sellerId),
+    getLiveExecutionStatus(sellerId).catch(() => null),
+    getAiGatewayStatus(sellerId).catch(() => null),
+    getNotificationOutboxSummary(sellerId).catch(() => null),
+    runGate ? runLaunchGateChecks(sellerId) : getLaunchGateSummary(sellerId),
+    getActionLedgerSummary(sellerId).catch(() => null),
+    getProductionHealthSummary(sellerId).catch(() => null),
+    getSchedulerControlSummary(sellerId).catch(() => null),
+    getDataFreshnessSummary(sellerId).catch(() => null),
+    getAlertSummary(sellerId).catch(() => null),
+    Promise.all([
+      safeCount({ table: "amazon_connections" }),
+      safeCount({ table: "amazon_sp_listings", sellerId }),
+      safeCount({ table: "amazon_ads_campaigns", sellerId }),
+      safeCount({ table: "product_passports", sellerId }),
+      safeCount({ table: "amazon_product_economics", sellerId }),
+      safeCount({ table: "engine_registry" }),
+      safeCount({ table: "engine_run_logs", sellerId }),
+      safeCount({ table: "daily_orchestrator_runs", sellerId }),
+      safeCount({ table: "action_learning_events", sellerId }),
+      safeCount({ table: "execution_attempts", sellerId }),
+      safeCount({ table: "rollback_snapshots", sellerId }),
+      safeCount({ table: "qa_smoke_test_runs", sellerId, filters: [{ column: "run_status", value: "PASS" }] }),
+      safeCount({ table: "maintenance_runs", sellerId }),
+      safeCount({ table: "activity_log_events", sellerId }),
+      safeCount({ table: "live_execution_runs", sellerId, filters: [{ column: "live_status", value: "DRY_RUN_COMPLETED" }] })
+    ])
+  ]);
   const ppcAdapter = getPpcLiveAdapterStatus();
   const listingAdapter = getListingLiveAdapterStatus();
 
   items.push(item({ key: "backend_api", label: "Backend API reachable", status: "PASS", message: "Service layer is reachable.", critical: true }));
-  items.push(item({ key: "supabase", label: "Supabase reachable", status: (await safeCount({ table: "amazon_connections" })) >= 0 ? "PASS" : "FAIL", message: "Supabase checked.", critical: true }));
-  items.push(item({ key: "sp_api_data", label: "SP-API data available", status: (await safeCount({ table: "amazon_sp_listings", sellerId })) > 0 ? "PASS" : "WARN", message: "SP-API listing data checked.", critical: false }));
-  items.push(item({ key: "ads_data", label: "Ads data available", status: (await safeCount({ table: "amazon_ads_campaigns", sellerId })) > 0 ? "PASS" : "WARN", message: "Amazon Ads data checked.", critical: false }));
-  items.push(item({ key: "product_passport", label: "Product Passport ready", status: (await safeCount({ table: "product_passports", sellerId })) > 0 ? "PASS" : "WARN", message: "Product Passport checked.", critical: true }));
-  items.push(item({ key: "product_economics", label: "Product Economics ready", status: (await safeCount({ table: "amazon_product_economics", sellerId })) > 0 ? "PASS" : "WARN", message: "Product Economics checked.", critical: true }));
+  items.push(item({ key: "supabase", label: "Supabase reachable", status: counts[0] >= 0 ? "PASS" : "FAIL", message: "Supabase checked.", critical: true }));
+  items.push(item({ key: "sp_api_data", label: "SP-API data available", status: counts[1] > 0 ? "PASS" : "WARN", message: "SP-API listing data checked.", critical: false }));
+  items.push(item({ key: "ads_data", label: "Ads data available", status: counts[2] > 0 ? "PASS" : "WARN", message: "Amazon Ads data checked.", critical: false }));
+  items.push(item({ key: "product_passport", label: "Product Passport ready", status: counts[3] > 0 ? "PASS" : "WARN", message: "Product Passport checked.", critical: true }));
+  items.push(item({ key: "product_economics", label: "Product Economics ready", status: counts[4] > 0 ? "PASS" : "WARN", message: "Product Economics checked.", critical: true }));
 
-  const actionSummary = await getActionLedgerSummary(sellerId).catch(() => null);
   items.push(item({ key: "action_ledger", label: "Action Ledger ready", status: actionSummary ? "PASS" : "FAIL", message: "Action Ledger checked.", critical: true }));
   items.push(item({ key: "approval_center", label: "Approval Center ready", status: actionSummary ? "PASS" : "FAIL", message: `${actionSummary?.pendingCount ?? 0} pending approvals.`, critical: true }));
-  items.push(item({ key: "engine_registry_300", label: "Engine Registry 300 ready", status: (await safeCount({ table: "engine_registry" })) >= 300 ? "PASS" : "WARN", message: "Engine Registry count checked.", critical: true }));
-  items.push(item({ key: "engine_router", label: "Engine Router ready", status: (await safeCount({ table: "engine_run_logs", sellerId })) >= 0 ? "PASS" : "WARN", message: "Engine Router checked.", critical: true }));
-  items.push(item({ key: "daily_ai_cgo", label: "Daily AI-CGO ready", status: (await safeCount({ table: "daily_orchestrator_runs", sellerId })) >= 0 ? "PASS" : "WARN", message: "Daily Orchestrator checked.", critical: false }));
-  items.push(item({ key: "learning_loop", label: "Learning Loop ready", status: (await safeCount({ table: "action_learning_events", sellerId })) > 0 ? "PASS" : "WARN", message: "Learning Loop checked.", critical: false }));
-  items.push(item({ key: "execution_gateway", label: "Execution Gateway ready", status: (await safeCount({ table: "execution_attempts", sellerId })) >= 0 ? "PASS" : "WARN", message: "Execution Gateway checked.", critical: true }));
-  items.push(item({ key: "rollback", label: "Rollback ready", status: (await safeCount({ table: "rollback_snapshots", sellerId })) > 0 ? "PASS" : "WARN", message: "Rollback snapshots checked.", critical: true }));
+  items.push(item({ key: "engine_registry_300", label: "Engine Registry 300 ready", status: counts[5] >= 300 ? "PASS" : "WARN", message: "Engine Registry count checked.", critical: true }));
+  items.push(item({ key: "engine_router", label: "Engine Router ready", status: counts[6] >= 0 ? "PASS" : "WARN", message: "Engine Router checked.", critical: true }));
+  items.push(item({ key: "daily_ai_cgo", label: "Daily AI-CGO ready", status: counts[7] >= 0 ? "PASS" : "WARN", message: "Daily Orchestrator checked.", critical: false }));
+  items.push(item({ key: "learning_loop", label: "Learning Loop ready", status: counts[8] > 0 ? "PASS" : "WARN", message: "Learning Loop checked.", critical: false }));
+  items.push(item({ key: "execution_gateway", label: "Execution Gateway ready", status: counts[9] >= 0 ? "PASS" : "WARN", message: "Execution Gateway checked.", critical: true }));
+  items.push(item({ key: "rollback", label: "Rollback ready", status: counts[10] > 0 ? "PASS" : "WARN", message: "Rollback snapshots checked.", critical: true }));
 
-  const latestQaPass = (await safeCount({ table: "qa_smoke_test_runs", sellerId, filters: [{ column: "run_status", value: "PASS" }] })) > 0;
+  const latestQaPass = counts[11] > 0;
   items.push(item({ key: "qa_smoke", label: "QA Smoke PASS", status: latestQaPass ? "PASS" : "FAIL", message: "QA Smoke PASS is required.", critical: true }));
-  items.push(item({ key: "maintenance_recent", label: "Maintenance recent", status: (await safeCount({ table: "maintenance_runs", sellerId })) > 0 ? "PASS" : "WARN", message: "Maintenance run checked.", critical: false }));
+  items.push(item({ key: "maintenance_recent", label: "Maintenance recent", status: counts[12] > 0 ? "PASS" : "WARN", message: "Maintenance run checked.", critical: false }));
 
-  const health = await getProductionHealthSummary(sellerId).catch(() => null);
   items.push(item({ key: "production_health", label: "Production Health no blockers", status: health && health.blockers.length === 0 ? "PASS" : "FAIL", message: health ? `${health.blockers.length} blockers.` : "Production Health unavailable.", critical: true }));
   items.push(item({ key: "safety_control", label: "Safety Control initialized", status: safety.settings ? "PASS" : "FAIL", message: "Safety Control checked.", critical: true }));
   items.push(item({ key: "live_execution_off", label: "Live execution OFF by default", status: live?.liveExecutionEnabled ? "WARN" : "PASS", message: live?.liveExecutionEnabled ? "Live flag is enabled intentionally; verify launch gate." : "Live execution is OFF.", critical: true }));
@@ -74,14 +97,11 @@ async function buildItems(sellerId: string, runGate: boolean): Promise<LaunchChe
   items.push(item({ key: "notification_send_off", label: "Notification sending OFF by default", status: notification?.externalNotificationsEnabled ? "WARN" : "PASS", message: notification?.externalNotificationsEnabled ? "External notifications enabled." : "External notifications are OFF.", critical: true }));
   items.push(item({ key: "launch_gate", label: "Launch Gate checked", status: launchGate.overallStatus === "FAIL" ? "FAIL" : launchGate.overallStatus === "WARN" ? "WARN" : "PASS", message: `Launch Gate is ${launchGate.overallStatus}.`, critical: true }));
 
-  const scheduler = await getSchedulerControlSummary(sellerId).catch(() => null);
   items.push(item({ key: "scheduler_jobs", label: "Scheduler jobs seeded", status: (scheduler?.totalJobs ?? 0) >= 9 ? "PASS" : "WARN", message: `${scheduler?.totalJobs ?? 0} scheduler jobs.`, critical: false }));
-  items.push(item({ key: "activity_logs", label: "Activity Logs working", status: (await safeCount({ table: "activity_log_events", sellerId })) >= 0 ? "PASS" : "WARN", message: "Activity Logs checked.", critical: false }));
-  const dataFreshness = await getDataFreshnessSummary(sellerId).catch(() => null);
+  items.push(item({ key: "activity_logs", label: "Activity Logs working", status: counts[13] >= 0 ? "PASS" : "WARN", message: "Activity Logs checked.", critical: false }));
   items.push(item({ key: "data_freshness", label: "Data Freshness checked", status: dataFreshness ? dataFreshness.errorSources > 0 ? "FAIL" : dataFreshness.staleSources > 0 ? "WARN" : "PASS" : "WARN", message: dataFreshness ? `${dataFreshness.freshSources}/${dataFreshness.totalSources} fresh.` : "Data Freshness unavailable.", critical: true }));
-  const alerts = await getAlertSummary(sellerId).catch(() => null);
   items.push(item({ key: "alerts_generated", label: "Alerts generated", status: alerts ? "PASS" : "WARN", message: `${alerts?.openAlerts ?? 0} open alerts.`, critical: false }));
-  items.push(item({ key: "dry_run_tested", label: "Approved action dry-run tested", status: (await safeCount({ table: "live_execution_runs", sellerId, filters: [{ column: "live_status", value: "DRY_RUN_COMPLETED" }] })) > 0 ? "PASS" : "WARN", message: "At least one live-execution dry-run should complete.", critical: true }));
+  items.push(item({ key: "dry_run_tested", label: "Approved action dry-run tested", status: counts[14] > 0 ? "PASS" : "WARN", message: "At least one live-execution dry-run should complete.", critical: true }));
   items.push(item({ key: "ppc_adapter", label: "PPC live adapter configured or explicitly marked not configured", status: ppcAdapter.configured ? "PASS" : "WARN", message: ppcAdapter.reason, critical: false }));
   items.push(item({ key: "listing_adapter", label: "Listing live adapter configured or explicitly marked not configured", status: listingAdapter.configured ? "PASS" : "WARN", message: listingAdapter.reason, critical: false }));
 

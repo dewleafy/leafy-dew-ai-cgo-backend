@@ -96,30 +96,33 @@ export async function getProductionHealthSummary(sellerIdInput: string): Promise
   const sellerId = cleanText(sellerIdInput) ?? "default";
   const modules: ProductionHealthModule[] = [
     moduleResult({ key: "api_server", name: "API server", status: "PASS", message: "API server is responding.", critical: true }),
-    await tableModule({ key: "supabase_connection", name: "Supabase connection", table: "amazon_connections", critical: true }),
-    await tableModule({ key: "action_ledger", name: "Action Ledger", table: "action_ledger", sellerId, critical: true }),
-    await tableModule({ key: "approval_center", name: "Approval Center", table: "action_ledger", sellerId, critical: true }),
-    await tableModule({ key: "product_passport", name: "Product Passport", table: "product_passports", sellerId, critical: true }),
-    await tableModule({ key: "product_economics", name: "Product Economics", table: "amazon_product_economics", sellerId, critical: true }),
-    await tableModule({ key: "amazon_sp_api", name: "Amazon SP-API data availability", table: "amazon_sp_listings", sellerId, critical: true, emptyWarn: true }),
-    await tableModule({ key: "amazon_ads", name: "Amazon Ads data availability", table: "amazon_ads_campaigns", sellerId, critical: false, emptyWarn: true }),
-    await tableModule({ key: "engine_registry", name: "Engine Registry", table: "engine_registry", critical: true }),
-    await tableModule({ key: "engine_router", name: "Engine Router", table: "engine_run_logs", sellerId, critical: true }),
-    await tableModule({ key: "daily_orchestrator", name: "Daily Orchestrator", table: "daily_orchestrator_runs", sellerId, critical: false }),
-    await tableModule({ key: "learning_loop", name: "Learning Loop", table: "action_learning_events", sellerId, critical: false }),
-    await tableModule({ key: "execution_gateway", name: "Execution Gateway", table: "execution_attempts", sellerId, critical: true }),
-    await tableModule({ key: "live_execution", name: "Live Execution", table: "live_execution_runs", sellerId, critical: true }),
-    await tableModule({ key: "launch_gate", name: "Launch Gate", table: "launch_gate_checks", sellerId, critical: false }),
-    await tableModule({ key: "scheduler_control", name: "Scheduler Control", table: "scheduler_jobs", sellerId, critical: false }),
-    await tableModule({ key: "notification_outbox", name: "Notification Outbox", table: "notification_outbox", sellerId, critical: false }),
-    await tableModule({ key: "security_guardrails", name: "Security Guardrails", table: "security_audit_events", sellerId, critical: false }),
-    await tableModule({ key: "listing_drafts", name: "Listing Drafts", table: "listing_optimization_drafts", sellerId, critical: false }),
-    await tableModule({ key: "creative_recommendations", name: "Creative Recommendations", table: "creative_recommendations", sellerId, critical: false }),
-    await tableModule({ key: "activity_logs", name: "Activity Logs", table: "activity_log_events", sellerId, critical: false }),
-    await tableModule({ key: "rollback", name: "Rollback Snapshots", table: "rollback_snapshots", sellerId, critical: false }),
-    await tableModule({ key: "approval_execution", name: "Approval Execution Bridge", table: "action_ledger", sellerId, critical: true }),
-    await tableModule({ key: "maintenance", name: "Maintenance Runner", table: "maintenance_runs", sellerId, critical: false }),
-    await tableModule({ key: "qa_smoke", name: "QA Smoke Tests", table: "qa_smoke_test_runs", sellerId, critical: false })
+    // The table checks are independent, so run them together instead of one after another.
+    ...(await Promise.all([
+      tableModule({ key: "supabase_connection", name: "Supabase connection", table: "amazon_connections", critical: true }),
+      tableModule({ key: "action_ledger", name: "Action Ledger", table: "action_ledger", sellerId, critical: true }),
+      tableModule({ key: "approval_center", name: "Approval Center", table: "action_ledger", sellerId, critical: true }),
+      tableModule({ key: "product_passport", name: "Product Passport", table: "product_passports", sellerId, critical: true }),
+      tableModule({ key: "product_economics", name: "Product Economics", table: "amazon_product_economics", sellerId, critical: true }),
+      tableModule({ key: "amazon_sp_api", name: "Amazon SP-API data availability", table: "amazon_sp_listings", sellerId, critical: true, emptyWarn: true }),
+      tableModule({ key: "amazon_ads", name: "Amazon Ads data availability", table: "amazon_ads_campaigns", sellerId, critical: false, emptyWarn: true }),
+      tableModule({ key: "engine_registry", name: "Engine Registry", table: "engine_registry", critical: true }),
+      tableModule({ key: "engine_router", name: "Engine Router", table: "engine_run_logs", sellerId, critical: true }),
+      tableModule({ key: "daily_orchestrator", name: "Daily Orchestrator", table: "daily_orchestrator_runs", sellerId, critical: false }),
+      tableModule({ key: "learning_loop", name: "Learning Loop", table: "action_learning_events", sellerId, critical: false }),
+      tableModule({ key: "execution_gateway", name: "Execution Gateway", table: "execution_attempts", sellerId, critical: true }),
+      tableModule({ key: "live_execution", name: "Live Execution", table: "live_execution_runs", sellerId, critical: true }),
+      tableModule({ key: "launch_gate", name: "Launch Gate", table: "launch_gate_checks", sellerId, critical: false }),
+      tableModule({ key: "scheduler_control", name: "Scheduler Control", table: "scheduler_jobs", sellerId, critical: false }),
+      tableModule({ key: "notification_outbox", name: "Notification Outbox", table: "notification_outbox", sellerId, critical: false }),
+      tableModule({ key: "security_guardrails", name: "Security Guardrails", table: "security_audit_events", sellerId, critical: false }),
+      tableModule({ key: "listing_drafts", name: "Listing Drafts", table: "listing_optimization_drafts", sellerId, critical: false }),
+      tableModule({ key: "creative_recommendations", name: "Creative Recommendations", table: "creative_recommendations", sellerId, critical: false }),
+      tableModule({ key: "activity_logs", name: "Activity Logs", table: "activity_log_events", sellerId, critical: false }),
+      tableModule({ key: "rollback", name: "Rollback Snapshots", table: "rollback_snapshots", sellerId, critical: false }),
+      tableModule({ key: "approval_execution", name: "Approval Execution Bridge", table: "action_ledger", sellerId, critical: true }),
+      tableModule({ key: "maintenance", name: "Maintenance Runner", table: "maintenance_runs", sellerId, critical: false }),
+      tableModule({ key: "qa_smoke", name: "QA Smoke Tests", table: "qa_smoke_test_runs", sellerId, critical: false })
+    ]))
   ];
 
   const safety = await getSafetyControlSnapshotSafe(sellerId);
