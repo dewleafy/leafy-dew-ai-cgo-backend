@@ -7,6 +7,8 @@ import {
   getProductEconomicsMeasuredReturnRates,
   getProductEconomicsProfitGuardrail,
   getProductEconomicsReturnRatePreview,
+  postProductEconomicsReturnRateApply,
+  postProductEconomicsReturnRateUndo,
   postProductEconomics
 } from "./product-economics.controller";
 
@@ -17,5 +19,7 @@ productEconomicsRouter.get("/cost-completion-queue", asyncHandler(getProductEcon
 productEconomicsRouter.get("/cost-reduction-opportunities", asyncHandler(getProductEconomicsCostReductionOpportunities));
 productEconomicsRouter.get("/measured-return-rates", asyncHandler(getProductEconomicsMeasuredReturnRates));
 productEconomicsRouter.get("/return-rate-preview", asyncHandler(getProductEconomicsReturnRatePreview));
+productEconomicsRouter.post("/return-rate-apply", asyncHandler(postProductEconomicsReturnRateApply));
+productEconomicsRouter.post("/return-rate-undo", asyncHandler(postProductEconomicsReturnRateUndo));
 productEconomicsRouter.get("/", asyncHandler(getProductEconomics));
 productEconomicsRouter.get("/:id/profit-guardrail", asyncHandler(getProductEconomicsProfitGuardrail));

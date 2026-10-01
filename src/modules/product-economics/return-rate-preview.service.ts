@@ -11,6 +11,9 @@ import { getMeasuredReturnRates, RETURN_MIN_UNITS } from "../returns/measured-re
 const ASSUMED_DEFAULT_RATES = [10, 25];
 
 export type ReturnRatePreviewRow = {
+  id: string;
+  newRatePercent: number | null;
+  newReserve: number | null;
   sku: string | null;
   asin: string | null;
   productName: string | null;
@@ -48,6 +51,9 @@ export async function getReturnRatePreview(sellerId: string) {
     const curMax = num(row.max_allowable_ad_spend);
     const curStatus = String(row.profit_status ?? "NEEDS_INPUT");
     const base = {
+      id: String(row.id),
+      newRatePercent: null as number | null,
+      newReserve: null as number | null,
       sku: row.sku ?? null,
       asin: row.asin ?? null,
       productName: row.product_name ?? null,
@@ -78,6 +84,8 @@ export async function getReturnRatePreview(sellerId: string) {
     return {
       ...base,
       decision: "USE_MEASURED",
+      newRatePercent: m.returnRatePercent,
+      newReserve: r2(newReserve),
       newStatus,
       newMaxAdSpend: newMax,
       newTargetAcos: r2((newMax / price) * 100),
@@ -97,4 +105,50 @@ export async function getReturnRatePreview(sellerId: string) {
     },
     rows: out
   };
+}
+
+const BACKUP_TABLE = "product_economics_return_rate_backups";
+
+/** Writes the measured rate into the products the preview marked USE_MEASURED. Old values are saved for undo. */
+export async function applyReturnRateSwitch(sellerId: string) {
+  const preview = await getReturnRatePreview(sellerId);
+  const targets = preview.rows.filter((r) => r.decision === "USE_MEASURED" && r.newRatePercent !== null);
+  const applied: string[] = [];
+  for (const t of targets) {
+    const { data: row, error } = await supabase.from("amazon_product_economics").select("*").eq("id", t.id).single();
+    if (error || !row) throw new Error(error?.message ?? "row missing");
+    const price = num(row.selling_price);
+    const delta = (t.newReserve ?? 0) - num(row.return_reserve_per_unit);
+    const nonAd = r2(num(row.non_ad_cost) + delta);
+    const patch = {
+      return_rate_percent: t.newRatePercent,
+      return_reserve_per_unit: t.newReserve,
+      non_ad_cost: nonAd,
+      max_allowable_ad_spend: t.newMaxAdSpend,
+      target_acos: t.newTargetAcos,
+      break_even_acos: price > 0 ? r2(((price - nonAd) / price) * 100) : row.break_even_acos,
+      profit_status: t.newStatus,
+      updated_at: new Date().toISOString()
+    };
+    const previous: Record<string, unknown> = {};
+    for (const k of Object.keys(patch)) previous[k] = (row as Record<string, unknown>)[k];
+    const { error: bErr } = await supabase.from(BACKUP_TABLE).insert({ seller_id: sellerId, economics_id: t.id, previous_values: previous, new_values: patch });
+    if (bErr) throw new Error(bErr.message);
+    const { error: uErr } = await supabase.from("amazon_product_economics").update(patch).eq("id", t.id);
+    if (uErr) throw new Error(uErr.message);
+    applied.push(t.sku ?? t.asin ?? t.id);
+  }
+  return { applied };
+}
+
+/** Restores every product changed by the switch (that has not been reverted yet). */
+export async function undoReturnRateSwitch(sellerId: string) {
+  const { data, error } = await supabase.from(BACKUP_TABLE).select("*").eq("seller_id", sellerId).is("reverted_at", null).order("applied_at", { ascending: false });
+  if (error) throw new Error(error.message);
+  for (const b of data ?? []) {
+    const { error: uErr } = await supabase.from("amazon_product_economics").update(b.previous_values).eq("id", b.economics_id);
+    if (uErr) throw new Error(uErr.message);
+    await supabase.from(BACKUP_TABLE).update({ reverted_at: new Date().toISOString() }).eq("id", b.id);
+  }
+  return { reverted: (data ?? []).length };
 }

@@ -9,7 +9,7 @@ import {
   saveProductEconomics
 } from "./product-economics.service";
 import { getMeasuredReturnRates, RETURN_LOOKBACK_DAYS, RETURN_MIN_UNITS, RETURN_RISK_RATE_PCT } from "../returns/measured-return-rate.service";
-import { getReturnRatePreview } from "./return-rate-preview.service";
+import { applyReturnRateSwitch, getReturnRatePreview, undoReturnRateSwitch } from "./return-rate-preview.service";
 
 const nullableTextSchema = z
   .string()
@@ -344,5 +344,21 @@ export async function getProductEconomicsReturnRatePreview(req: Request, res: Re
     res.json({ ok: true, readOnly: true, ...preview });
   } catch {
     sendProductEconomicsError(res, "Could not build the return-rate preview.");
+  }
+}
+
+export async function postProductEconomicsReturnRateApply(req: Request, res: Response): Promise<void> {
+  try {
+    res.json({ ok: true, ...(await applyReturnRateSwitch(getSellerIdFromQuery(req))) });
+  } catch {
+    sendProductEconomicsError(res, "Could not apply the measured return rate.");
+  }
+}
+
+export async function postProductEconomicsReturnRateUndo(req: Request, res: Response): Promise<void> {
+  try {
+    res.json({ ok: true, ...(await undoReturnRateSwitch(getSellerIdFromQuery(req))) });
+  } catch {
+    sendProductEconomicsError(res, "Could not undo the measured return rate.");
   }
 }
