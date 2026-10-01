@@ -4,6 +4,9 @@ import { env } from "./config/env";
 import { supabase } from "./db/supabase";
 import { actionLedgerRoutes } from "./modules/action-ledger/action-ledger.routes";
 import { activityLogRoutes } from "./modules/activity-logs/activity-logs.routes";
+import { authRouter } from "./modules/auth/auth.routes";
+import { requireAuth } from "./modules/auth/auth.middleware";
+import { isAuthEnabled } from "./modules/auth/auth.service";
 import { approvalExecutionRouter } from "./modules/approval-execution/approval-execution.routes";
 import { aiGatewayRouter } from "./modules/ai-gateway/ai-gateway.routes";
 import { alertCenterRouter } from "./modules/alert-center/alert-center.routes";
@@ -89,6 +92,11 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 });
 
 app.use(express.json());
+
+// Founder login. /api/auth/* stays open; everything else under /api needs a token once
+// APP_PASSWORD is set (see modules/auth). /health stays open for Railway.
+app.use("/api/auth", authRouter);
+app.use("/api", requireAuth);
 
 function getSupabaseKeyPrefix(key: string | undefined): "sb_secret" | "sb_publishable" | "jwt" | "other" | "missing" {
   if (!key) {
@@ -271,5 +279,10 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
 
 app.listen(port, () => {
   logger.info(`Leafy Dew AI-CGO backend running on port ${port}`);
+  if (isAuthEnabled()) {
+    logger.info("API login is ON.");
+  } else {
+    logger.warn("API login is OFF: set APP_PASSWORD to require sign-in. Anyone with the URL can call the API.");
+  }
   startBackgroundAmazonSyncScheduler();
 });

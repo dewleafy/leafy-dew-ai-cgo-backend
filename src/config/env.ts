@@ -34,6 +34,10 @@ const envSchema = z.object({
   SP_API_AWS_SECRET_ACCESS_KEY: z.string().optional(),
   SP_API_AWS_SESSION_TOKEN: z.string().optional(),
   CRON_SECRET: z.string().optional(),
+  // Founder login. Login stays OFF until APP_PASSWORD is set. AUTH_SECRET is an optional extra
+  // random string mixed into the token signing key.
+  APP_PASSWORD: z.string().optional(),
+  AUTH_SECRET: z.string().optional(),
   // AI Gateway: only used when a seller explicitly enables AI calls in settings (default OFF).
   // Provider: OpenAI (Chat Completions API). If OpenAI ever rejects OPENAI_MODEL with
   // "model not found," check the exact current model id at platform.openai.com and update this.
