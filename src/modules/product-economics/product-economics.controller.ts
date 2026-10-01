@@ -8,6 +8,7 @@ import {
   listProductEconomics,
   saveProductEconomics
 } from "./product-economics.service";
+import { getMeasuredReturnRates, RETURN_LOOKBACK_DAYS, RETURN_MIN_UNITS, RETURN_RISK_RATE_PCT } from "../returns/measured-return-rate.service";
 
 const nullableTextSchema = z
   .string()
@@ -314,5 +315,22 @@ export async function getProductEconomicsProfitGuardrail(req: Request, res: Resp
     });
   } catch {
     sendProductEconomicsError(res, "Could not load product profit guardrail from Supabase.");
+  }
+}
+
+export async function getProductEconomicsMeasuredReturnRates(req: Request, res: Response): Promise<void> {
+  const sellerId = getSellerIdFromQuery(req);
+
+  try {
+    const products = await getMeasuredReturnRates(sellerId);
+    res.json({
+      ok: true,
+      lookbackDays: RETURN_LOOKBACK_DAYS,
+      minUnitsForVerdict: RETURN_MIN_UNITS,
+      riskThresholdPercent: RETURN_RISK_RATE_PCT,
+      products
+    });
+  } catch {
+    sendProductEconomicsError(res, "Could not load measured return rates from Supabase.");
   }
 }
