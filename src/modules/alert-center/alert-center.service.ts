@@ -258,9 +258,31 @@ export async function generateAlerts(sellerIdInput: string): Promise<{
   for (const candidate of candidates) {
     if (await openAlertDuplicateExists(candidate, sellerId)) {
       skippedCount += 1;
+      // Keep the open alert's numbers current instead of leaving the figure from the day it was raised.
+      await supabase
+        .from("alert_events")
+        .update({ message: candidate.message, metadata: candidate.metadata ?? {} })
+        .eq("seller_id", sellerId)
+        .eq("rule_key", candidate.ruleKey)
+        .eq("status", "OPEN")
+        .is("entity_id", null);
       continue;
     }
     rows.push(await insertAlertEvent(candidate, sellerId));
+  }
+
+  // Auto-resolve open system alerts whose condition no longer holds (no candidate this run).
+  const stillRaised = new Set(candidates.filter((c) => !cleanText(c.entityId)).map((c) => c.ruleKey));
+  const { data: openAlerts } = await supabase
+    .from("alert_events")
+    .select("id, rule_key")
+    .eq("seller_id", sellerId)
+    .eq("status", "OPEN")
+    .eq("source", "ALERT_CENTER")
+    .is("entity_id", null);
+  const clearedIds = (openAlerts ?? []).filter((a: { rule_key: string }) => !stillRaised.has(a.rule_key)).map((a: { id: string }) => a.id);
+  if (clearedIds.length > 0) {
+    await supabase.from("alert_events").update({ status: "RESOLVED", resolved_at: new Date().toISOString() }).in("id", clearedIds);
   }
 
   await safeRecordActivityLog({
