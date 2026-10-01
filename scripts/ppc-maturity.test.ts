@@ -1,6 +1,9 @@
 // Dummy values so env validation passes; no real network or database is touched.
 for (const [k, v] of Object.entries({ SUPABASE_URL: "https://example.supabase.co", SUPABASE_SERVICE_ROLE_KEY: "x", APP_BASE_URL: "http://x", ENCRYPTION_KEY: "x", AMAZON_LWA_CLIENT_ID: "x", AMAZON_LWA_CLIENT_SECRET: "x", AMAZON_APP_ID: "x" })) process.env[k] ??= v;
-let ECON: any = null; let ROWS: any[] = [];
+let ECONS: Record<string, any> = {}; let ROWS: any[] = [];
+const ASIN_A = "B0AAAAAAAA";
+let ADV: any[] = [{ campaign_id: "C1", ad_group_id: "G1", advertised_asin: ASIN_A, advertised_sku: "SKU-A", cost: 100 }];
+const setEcon = (status: string) => { ECONS = { [ASIN_A]: econ(status, ASIN_A) }; };
 // Fake PostgREST over fetch: the REAL supabase-js client talks to this, so real query code runs.
 (globalThis as any).fetch = async (url: any, init: any = {}) => {
   const u = new URL(String(url)); const table = u.pathname.split("/").pop();
@@ -8,15 +11,19 @@ let ECON: any = null; let ROWS: any[] = [];
   const single = accept.includes("vnd.pgrst.object");
   let body: any = [];
   if (table === "amazon_ads_search_term_daily_metrics") body = ROWS;
-  else if (table === "amazon_product_economics") body = single ? ECON : (ECON ? [ECON] : []);
+  else if (table === "amazon_ads_advertised_product_daily_metrics") body = ADV;
+  else if (table === "amazon_product_economics") {
+    const wanted = (u.searchParams.get("asin") ?? "").replace(/^in\.\(|\)$/g, "").split(",").map((s) => s.replace(/"/g, "").trim()).filter(Boolean);
+    body = Object.values(ECONS).filter((r: any) => wanted.includes(r.asin)).sort((a: any, b: any) => String(b.created_at).localeCompare(String(a.created_at)));
+  }
   return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
 };
 let getAmazonAdsPpcRecommendations: any;
 
-const econ = (status: string) => ({ selling_price: 500, landed_cost: 200, amazon_fee_estimate: 80, shipping_fee_estimate: 40, non_ad_cost: 320, target_profit: 60, max_allowable_ad_spend: 60, target_acos: 20, break_even_acos: 30, profit_status: status, created_at: "2026-09-30" });
+const econ = (status: string, asin = ASIN_A, createdAt = "2026-09-30") => ({ asin, selling_price: 500, landed_cost: 200, amazon_fee_estimate: 80, shipping_fee_estimate: 40, non_ad_cost: 320, target_profit: 60, max_allowable_ad_spend: 60, target_acos: 20, break_even_acos: 30, profit_status: status, created_at: createdAt });
 // build per-day rows for a term: days = list of day offsets (1..), totals split evenly
-function term(name: string, days: number[], t: { imp: number; clk: number; cost: number; sales: number; orders: number }) {
-  return days.map((d) => ({ report_date: `2026-09-${String(30 - d).padStart(2, "0")}`, campaign_id: "C1", campaign_name: "Camp", ad_group_id: "G1", ad_group_name: "Grp", search_term: name,
+function term(name: string, days: number[], t: { imp: number; clk: number; cost: number; sales: number; orders: number }, camp = "C1", grp = "G1") {
+  return days.map((d) => ({ report_date: `2026-09-${String(30 - d).padStart(2, "0")}`, campaign_id: camp, campaign_name: "Camp", ad_group_id: grp, ad_group_name: "Grp", search_term: name,
     impressions: t.imp / days.length, clicks: t.clk / days.length, cost: t.cost / days.length, sales: t.sales / days.length, orders: t.orders / days.length }));
 }
 let pass = 0, fail = 0;
@@ -26,7 +33,7 @@ const where = (r: any, term: string) => { for (const k of Object.keys(r)) if (Ar
 (async () => {
   ({ getAmazonAdsPpcRecommendations } = await import("../src/modules/amazon-ads/amazon-ads-ppc-recommendation.service"));
   // ---------- Scenario 1: live situation — latest economics row is FAIL (as in your 515 cards)
-  ECON = econ("FAIL");
+  setEcon("FAIL");
   ROWS = [
     ...term("B0C1C84839", [3], { imp: 1, clk: 1, cost: 4, sales: 0, orders: 0 }),                 // the real 1-click example
     ...term("thin two clicks", [2], { imp: 30, clk: 2, cost: 8, sales: 0, orders: 0 }),
@@ -42,7 +49,7 @@ const where = (r: any, term: string) => { for (const k of Object.keys(r)) if (Ar
   check("summary reports held-back count", (r.summary.heldBackForImmatureData ?? 0) === 2, String(r.summary.heldBackForImmatureData));
 
   // ---------- Scenario 2: economics PASS — negatives / bid-down / harvesting rules
-  ECON = econ("PASS");
+  setEcon("PASS");
   ROWS = [
     ...term("neg too new", [1,2], { imp: 400, clk: 12, cost: 90, sales: 0, orders: 0 }),                      // 12 clicks but 2 days
     ...term("neg mature", [1,3,5,8,9], { imp: 500, clk: 12, cost: 90, sales: 0, orders: 0 }),                // 12 clicks, 9-day span
@@ -61,12 +68,45 @@ const where = (r: any, term: string) => { for (const k of Object.keys(r)) if (Ar
   check("exact-match harvest allowed after 9-day span", where(r, "harvest mature") === "exactMatchOpportunities", where(r, "harvest mature"));
 
   // ---------- Scenario 3: scale only when profit rules PASS
-  ECON = econ("RISK");
+  setEcon("RISK");
   r = await getAmazonAdsPpcRecommendations({ sellerId: "default", days: 14, targetAcos: 35 });
   console.log("\n[Scenario 3] economics = RISK (not PASS)");
   check("no scaling (exact match) unless profit rules pass", where(r, "harvest mature") === "monitorOnlyTerms", where(r, "harvest mature"));
   const item = r.monitorOnlyTerms.find((i) => i.searchTerm === "harvest mature");
   check("held-back item carries explanation + dataMaturity", !!item && item.dataMaturity.status === "HELD_BACK" && /profit rules/.test(item.reason), item?.reason.slice(0, 110));
+  // ---------- Scenario 5: several products in one account — each term judged on ITS OWN product
+  const ASIN_B = "B0BBBBBBBB", ASIN_C = "B0CCCCCCCC";
+  ECONS = { [ASIN_A]: econ("PASS", ASIN_A, "2026-09-01"), [ASIN_B]: econ("FAIL", ASIN_B, "2026-09-30") }; // B's row is NEWER: the old "latest row" bug would apply FAIL to everything
+  ADV = [
+    { campaign_id: "C1", ad_group_id: "G1", advertised_asin: ASIN_A, cost: 100 },   // passing product
+    { campaign_id: "C2", ad_group_id: "G2", advertised_asin: ASIN_B, cost: 100 },   // failing product
+    { campaign_id: "C4", ad_group_id: "G4", advertised_asin: ASIN_C, cost: 100 },   // product with no economics row
+    { campaign_id: "C5", ad_group_id: "G5", advertised_asin: ASIN_A, cost: 300 },   // two products: A (more spend, PASS) ...
+    { campaign_id: "C5", ad_group_id: "G5", advertised_asin: ASIN_B, cost: 50 }     // ... and B (FAIL)
+    // C3/G3 intentionally absent from this list => unmapped ad group
+  ];
+  const good = { imp: 300, clk: 8, cost: 40, sales: 600, orders: 3 };
+  ROWS = [
+    ...term("t-passing", [1,3,5,8,9], good, "C1", "G1"),
+    ...term("t-failing", [1,3,5,8,9], good, "C2", "G2"),
+    ...term("t-unmapped", [1,3,5,8,9], good, "C3", "G3"),
+    ...term("t-no-econ", [1,3,5,8,9], good, "C4", "G4"),
+    ...term("t-mixed", [1,3,5,8,9], good, "C5", "G5")
+  ];
+  r = await getAmazonAdsPpcRecommendations({ sellerId: "default", days: 14, targetAcos: 35 });
+  console.log("\n[Scenario 5] five products/ad groups in one account");
+  check("passing product's term is a normal exact-match opportunity (not poisoned by another product's FAIL)", where(r, "t-passing") === "exactMatchOpportunities", where(r, "t-passing"));
+  check("failing product's term is a profit-risk warning", where(r, "t-failing") === "profitRiskWarnings", where(r, "t-failing"));
+  check("unmapped ad group is blocked (cost data missing), never given another product's numbers", where(r, "t-unmapped") === "profitRiskWarnings", where(r, "t-unmapped"));
+  check("product with no economics row is blocked", where(r, "t-no-econ") === "profitRiskWarnings", where(r, "t-no-econ"));
+  check("ad group mixing a passing and a failing product cannot scale", where(r, "t-mixed") === "monitorOnlyTerms", where(r, "t-mixed"));
+  const pe = (name: string) => r.exactMatchOpportunities.concat(r.profitRiskWarnings, r.monitorOnlyTerms).find((i: any) => i.searchTerm === name)?.profitEvidence;
+  check("evidence names the product used", pe("t-passing")?.economicsAsin === ASIN_A && pe("t-passing")?.economicsSource === "AD_GROUP_ASIN", JSON.stringify({ a: pe("t-passing")?.economicsAsin, s: pe("t-passing")?.economicsSource }));
+  check("evidence marks unmapped ad group", pe("t-unmapped")?.economicsSource === "UNMAPPED");
+  check("evidence marks missing economics row", pe("t-no-econ")?.economicsSource === "NO_ECONOMICS_ROW");
+  check("account summary counts terms lacking product economics (2: unmapped + no cost row; the FAIL product does have cost data)", r.summary.termsWithoutProductEconomics === 2, String(r.summary.termsWithoutProductEconomics));
+  check("warning explains it", r.warnings.length === 1 && /no usable product cost data/.test(r.warnings[0]));
+
   // ---------- Scenario 4: previously SAVED recommendations re-entering the approval queue
   const { savedRecommendationMaturity } = await import("../src/modules/amazon-ads/ppc-data-maturity");
   console.log("\n[Scenario 4] saved ai_recommendations rows (ledger bridge filter)");

@@ -73,6 +73,12 @@ type ProfitEvidence = {
   targetAcos: number | null;
   breakEvenAcos: number | null;
   profitStatus: ProductProfitStatus | null;
+  /** Which product's economics these numbers came from (the ad group's top-spend advertised ASIN). */
+  economicsAsin?: string | null;
+  /** Every ASIN this ad group advertises (an ad group can advertise several). */
+  mappedAsins?: string[];
+  /** AD_GROUP_ASIN = matched by ASIN; NO_ECONOMICS_ROW = ASIN known but no cost row; UNMAPPED = ad group not linked to any ASIN yet. */
+  economicsSource?: "AD_GROUP_ASIN" | "NO_ECONOMICS_ROW" | "UNMAPPED";
 };
 
 export type RecommendationItem = {
@@ -190,9 +196,12 @@ function createEvidence(accumulator: MetricAccumulator): Evidence {
   };
 }
 
-function createProfitEvidence(productEconomics: ProductEconomicsRow | null): ProfitEvidence {
+function createProfitEvidence(productEconomics: ProductEconomicsRow | null, context: AdGroupEconomics = UNMAPPED_AD_GROUP): ProfitEvidence {
+  const source = { economicsAsin: context.asin, mappedAsins: context.mappedAsins, economicsSource: context.source };
+
   if (!productEconomics) {
     return {
+      ...source,
       profitDataStatus: "MISSING_COST_DATA",
       targetProfit: null,
       maxAllowableAdSpend: null,
@@ -204,6 +213,7 @@ function createProfitEvidence(productEconomics: ProductEconomicsRow | null): Pro
 
   if (hasMissingCostData(productEconomics)) {
     return {
+      ...source,
       profitDataStatus: "MISSING_COST_DATA",
       targetProfit: roundTwo(toNumber(productEconomics.target_profit)),
       maxAllowableAdSpend: null,
@@ -214,6 +224,7 @@ function createProfitEvidence(productEconomics: ProductEconomicsRow | null): Pro
   }
 
   return {
+    ...source,
     profitDataStatus: "AVAILABLE",
     targetProfit: roundTwo(toNumber(productEconomics.target_profit)),
     maxAllowableAdSpend: roundTwo(toNumber(productEconomics.max_allowable_ad_spend)),
@@ -443,21 +454,108 @@ function getRiskLevel(category: RecommendationCategory): RecommendationItem["ris
   return "LOW";
 }
 
-async function getLatestProductEconomics(sellerId: string): Promise<ProductEconomicsRow | null> {
-  const { data, error } = await supabase
-    .from("amazon_product_economics")
-    .select("selling_price, landed_cost, amazon_fee_estimate, shipping_fee_estimate, non_ad_cost, target_profit, max_allowable_ad_spend, target_acos, break_even_acos, profit_status, created_at")
-    .eq("seller_id", sellerId)
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle<ProductEconomicsRow>();
+type AdGroupEconomics = {
+  economics: ProductEconomicsRow | null;
+  /** Worst profit status across every ASIN in the ad group (scale-ups need ALL to pass). */
+  gateProfitStatus: string | null;
+  asin: string | null;
+  mappedAsins: string[];
+  source: "AD_GROUP_ASIN" | "NO_ECONOMICS_ROW" | "UNMAPPED";
+};
 
-  if (error) {
-    logSafeAmazonAdsSupabaseError("Could not load product economics for PPC recommendations.", error);
-    throw new Error("Could not load product economics from Supabase.");
+const UNMAPPED_AD_GROUP: AdGroupEconomics = { economics: null, gateProfitStatus: null, asin: null, mappedAsins: [], source: "UNMAPPED" };
+
+// Higher = worse. A scale-up needs "PASS" (0); anything else blocks it.
+const PROFIT_STATUS_SEVERITY: Record<string, number> = { PASS: 0, RISK: 1, UNKNOWN: 2, NEEDS_INPUT: 3, NEEDS_COST_DATA: 4, FAIL: 5, BLOCKED: 6 };
+
+function worstProfitStatus(statuses: string[]): string | null {
+  if (statuses.length === 0) return null;
+  return statuses.reduce((worst, status) => ((PROFIT_STATUS_SEVERITY[status] ?? 2) > (PROFIT_STATUS_SEVERITY[worst] ?? 2) ? status : worst));
+}
+
+const ECONOMICS_COLUMNS =
+  "asin, sku, selling_price, landed_cost, amazon_fee_estimate, shipping_fee_estimate, non_ad_cost, target_profit, max_allowable_ad_spend, target_acos, break_even_acos, profit_status, created_at";
+
+/**
+ * Links every ad group to the product(s) it advertises, and each product to ITS OWN latest
+ * economics row. (Before this, one seller-wide "latest row" was applied to every search term, so
+ * one failing product made every term in the account look like a profit risk.)
+ */
+async function loadAdGroupEconomics(input: {
+  sellerId: string;
+  startDate: string;
+  endDate: string;
+}): Promise<Map<string, AdGroupEconomics>> {
+  const result = new Map<string, AdGroupEconomics>();
+
+  const { data: advertised, error: advertisedError } = await supabase
+    .from("amazon_ads_advertised_product_daily_metrics")
+    .select("campaign_id, ad_group_id, advertised_asin, advertised_sku, cost")
+    .eq("seller_id", input.sellerId)
+    .gte("report_date", input.startDate)
+    .lte("report_date", input.endDate)
+    .limit(10000);
+
+  if (advertisedError) {
+    logSafeAmazonAdsSupabaseError("Could not load advertised products for PPC economics matching.", advertisedError);
+    throw new Error("Could not load advertised products from Supabase.");
   }
 
-  return data;
+  type AdvertisedRow = { campaign_id: string | null; ad_group_id: string | null; advertised_asin: string | null; advertised_sku: string | null; cost: number | string | null };
+  const perGroup = new Map<string, Map<string, { cost: number; sku: string | null }>>();
+
+  for (const row of (advertised ?? []) as AdvertisedRow[]) {
+    const asin = String(row.advertised_asin ?? "").trim().toUpperCase();
+    if (!row.campaign_id || !row.ad_group_id || !asin) continue;
+    const key = `${row.campaign_id}::${row.ad_group_id}`;
+    const asins = perGroup.get(key) ?? new Map<string, { cost: number; sku: string | null }>();
+    const current = asins.get(asin) ?? { cost: 0, sku: null };
+    current.cost += toNumber(row.cost);
+    current.sku = current.sku ?? (row.advertised_sku ? String(row.advertised_sku) : null);
+    asins.set(asin, current);
+    perGroup.set(key, asins);
+  }
+
+  const allAsins = [...new Set([...perGroup.values()].flatMap((asins) => [...asins.keys()]))];
+  const economicsByAsin = new Map<string, ProductEconomicsRow>();
+
+  if (allAsins.length > 0) {
+    const { data: economicsRows, error: economicsError } = await supabase
+      .from("amazon_product_economics")
+      .select(ECONOMICS_COLUMNS)
+      .eq("seller_id", input.sellerId)
+      .in("asin", allAsins)
+      .order("created_at", { ascending: false })
+      .limit(5000);
+
+    if (economicsError) {
+      logSafeAmazonAdsSupabaseError("Could not load product economics for PPC recommendations.", economicsError);
+      throw new Error("Could not load product economics from Supabase.");
+    }
+
+    // Rows arrive newest first, so the first one seen per ASIN is its latest.
+    for (const row of (economicsRows ?? []) as unknown as ProductEconomicsRow[]) {
+      const asin = String(row.asin ?? "").trim().toUpperCase();
+      if (asin && !economicsByAsin.has(asin)) economicsByAsin.set(asin, row);
+    }
+  }
+
+  for (const [key, asins] of perGroup.entries()) {
+    const ranked = [...asins.entries()].sort((a, b) => b[1].cost - a[1].cost).map(([asin]) => asin);
+    const primary = ranked[0] ?? null;
+    const primaryEconomics = primary ? economicsByAsin.get(primary) ?? null : null;
+    const statuses = ranked.map((asin) => economicsByAsin.get(asin)?.profit_status ?? "NEEDS_COST_DATA");
+
+    result.set(key, {
+      economics: primaryEconomics,
+      gateProfitStatus: worstProfitStatus(statuses),
+      asin: primary,
+      mappedAsins: ranked,
+      source: primaryEconomics ? "AD_GROUP_ASIN" : "NO_ECONOMICS_ROW"
+    });
+  }
+
+  return result;
 }
 
 async function listSearchTermMetrics(input: {
@@ -487,29 +585,18 @@ export async function getAmazonAdsPpcRecommendations(input: {
   targetAcos: number;
 }): Promise<PpcRecommendationResponse> {
   const { startDate, endDate } = getAmazonAdsPpcRecommendationDateRange(input.days);
-  const [productEconomics, metricRows] = await Promise.all([
-    getLatestProductEconomics(input.sellerId),
+  const [adGroupEconomics, metricRows] = await Promise.all([
+    loadAdGroupEconomics({
+      sellerId: input.sellerId,
+      startDate,
+      endDate
+    }),
     listSearchTermMetrics({
       sellerId: input.sellerId,
       startDate,
       endDate
     })
   ]);
-  const productTargetAcos = toNumber(productEconomics?.target_acos);
-  const costDataMissing = !productEconomics || hasMissingCostData(productEconomics);
-  const effectiveTargetAcos = roundTwo(
-    costDataMissing
-      ? Math.min(input.targetAcos, 20)
-      : productEconomics && productTargetAcos > 0
-      ? Math.min(productTargetAcos, input.targetAcos)
-      : input.targetAcos
-  );
-  const profitDataStatus = costDataMissing ? "MISSING_COST_DATA" : "AVAILABLE";
-  const warnings = productEconomics
-    ? costDataMissing
-      ? ["Product cost data is missing. Profit-safe PPC decisions are blocked until landed cost is added."]
-      : []
-    : ["Product cost data is missing. Profit-safe PPC decisions are blocked until landed cost is added."];
   const categories: Record<RecommendationCategory, RecommendationItem[]> = {
     exactMatchOpportunities: [],
     productTargetingOpportunities: [],
@@ -523,6 +610,7 @@ export async function getAmazonAdsPpcRecommendations(input: {
   };
   const grouped = new Map<string, MetricAccumulator>();
   const heldBackTerms: HeldBackTerm[] = [];
+  let termsWithoutEconomics = 0;
 
   for (const row of metricRows) {
     const searchTerm = row.search_term ?? "";
@@ -566,6 +654,19 @@ export async function getAmazonAdsPpcRecommendations(input: {
   for (const accumulator of grouped.values()) {
     const evidence = createEvidence(accumulator);
     const isAsinLike = isAsinLikeSearchTerm(accumulator.searchTerm);
+    // Each term is judged against the economics of the product its OWN ad group advertises.
+    const economicsContext = adGroupEconomics.get(`${accumulator.campaignId}::${accumulator.adGroupId}`) ?? UNMAPPED_AD_GROUP;
+    const productEconomics = economicsContext.economics;
+    const costDataMissing = !productEconomics || hasMissingCostData(productEconomics);
+    const productTargetAcos = toNumber(productEconomics?.target_acos);
+    const effectiveTargetAcos = roundTwo(
+      costDataMissing
+        ? Math.min(input.targetAcos, 20)
+        : productTargetAcos > 0
+        ? Math.min(productTargetAcos, input.targetAcos)
+        : input.targetAcos
+    );
+    termsWithoutEconomics += costDataMissing ? 1 : 0;
     const rawDetails = getRecommendationDetails({
       evidence,
       isAsinLike,
@@ -580,7 +681,8 @@ export async function getAmazonAdsPpcRecommendations(input: {
       clicks: evidence.clicks,
       observedDays: sortedDates.length,
       spanDays: sortedDates.length > 0 ? inclusiveSpanDays(sortedDates[0], sortedDates[sortedDates.length - 1]) : null,
-      profitStatus: productEconomics?.profit_status ?? null
+      // Scale-ups need EVERY product in the ad group to pass, not just the top-spend one.
+      profitStatus: economicsContext.gateProfitStatus
     });
     let details: { category: RecommendationCategory; recommendedAction: RecommendationAction; reason: string } = rawDetails;
 
@@ -630,7 +732,7 @@ export async function getAmazonAdsPpcRecommendations(input: {
       riskLevel: getRiskLevel(details.category),
       reason: details.reason,
       evidence,
-      profitEvidence: createProfitEvidence(productEconomics),
+      profitEvidence: createProfitEvidence(productEconomics, economicsContext),
       ruleVersion: "profit_ppc_v1",
       strategyVersion: "ai_cgo_v2_2_shadow_mode",
       dataMaturity
@@ -642,6 +744,17 @@ export async function getAmazonAdsPpcRecommendations(input: {
   for (const category of Object.keys(categories) as RecommendationCategory[]) {
     categories[category].sort((a, b) => b.priorityScore - a.priorityScore);
   }
+
+  // Account-level summary. Each recommendation above already used its OWN product's economics;
+  // effectiveTargetAcos here is just the ceiling the caller asked for.
+  const effectiveTargetAcos = roundTwo(input.targetAcos);
+  const profitDataStatus: PpcRecommendationResponse["profitDataStatus"] = termsWithoutEconomics > 0 ? "MISSING_COST_DATA" : "AVAILABLE";
+  const warnings =
+    termsWithoutEconomics > 0
+      ? [
+          `${termsWithoutEconomics} of ${grouped.size} search terms belong to ad groups with no usable product cost data (or not yet linked to a product). Profit-safe actions are blocked for those terms until landed cost and fees are added.`
+        ]
+      : [];
 
   return {
     ok: true,
@@ -661,7 +774,8 @@ export async function getAmazonAdsPpcRecommendations(input: {
       productPageCheckWarnings: categories.productPageCheckWarnings.length,
       profitRiskWarnings: categories.profitRiskWarnings.length,
       monitorOnlyTerms: categories.monitorOnlyTerms.length,
-      heldBackForImmatureData: heldBackTerms.length
+      heldBackForImmatureData: heldBackTerms.length,
+      termsWithoutProductEconomics: termsWithoutEconomics
     },
     profitDataStatus,
     ...categories,
