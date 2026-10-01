@@ -1,6 +1,7 @@
 import { supabase } from "../../db/supabase";
 import { getActionLedgerSummary } from "../action-ledger/action-ledger.service";
 import { safeRecordActivityLog } from "../activity-logs/activity-logs.service";
+import { getSalesTrafficSummary } from "../sales-traffic/sales-traffic.service";
 import { AlertCandidate, AlertEventRow, AlertRuleRow, SafeAlertEvent, SafeAlertRule } from "./alert-center.types";
 
 const DEFAULT_ALERT_RULES: Array<Omit<AlertRuleRow, "id" | "created_at" | "updated_at">> = [
@@ -14,7 +15,9 @@ const DEFAULT_ALERT_RULES: Array<Omit<AlertRuleRow, "id" | "created_at" | "updat
   { seller_id: "default", rule_key: "HIGH_RISK_ACTION_PENDING", rule_name: "High risk action pending", category: "APPROVALS", severity: "HIGH", enabled: true, condition_config: {}, cooldown_hours: 12 },
   { seller_id: "default", rule_key: "LEARNING_ENGINE_WEAK", rule_name: "Learning engine weak", category: "LEARNING", severity: "MEDIUM", enabled: true, condition_config: { usefulnessBelow: 35 }, cooldown_hours: 24 },
   { seller_id: "default", rule_key: "LISTING_DRAFTS_WAITING", rule_name: "Listing drafts waiting", category: "LISTING", severity: "MEDIUM", enabled: true, condition_config: {}, cooldown_hours: 24 },
-  { seller_id: "default", rule_key: "CREATIVE_RECOMMENDATIONS_WAITING", rule_name: "Creative recommendations waiting", category: "CREATIVE", severity: "MEDIUM", enabled: true, condition_config: {}, cooldown_hours: 24 }
+  { seller_id: "default", rule_key: "CREATIVE_RECOMMENDATIONS_WAITING", rule_name: "Creative recommendations waiting", category: "CREATIVE", severity: "MEDIUM", enabled: true, condition_config: {}, cooldown_hours: 24 },
+  { seller_id: "default", rule_key: "SALES_TRAFFIC_SALES_DROP", rule_name: "Product sales dropped", category: "SALES", severity: "HIGH", enabled: true, condition_config: { dropPct: 30 }, cooldown_hours: 24 },
+  { seller_id: "default", rule_key: "SALES_TRAFFIC_LOW_CONVERSION", rule_name: "Visitors not buying", category: "SALES", severity: "MEDIUM", enabled: true, condition_config: { belowPct: 3 }, cooldown_hours: 24 }
 ];
 
 function cleanText(value: unknown): string | null {
@@ -236,6 +239,20 @@ async function buildAlertCandidates(sellerId: string, enabledRules: SafeAlertRul
   const creativeWaiting = await safeCount({ table: "creative_recommendations", sellerId, filters: [{ column: "status", value: "DRAFTED" }] });
   if (isRuleEnabled(enabledRules, "CREATIVE_RECOMMENDATIONS_WAITING") && creativeWaiting > 0) {
     candidates.push({ ruleKey: "CREATIVE_RECOMMENDATIONS_WAITING", category: "CREATIVE", severity: "MEDIUM", title: "Creative recommendations are waiting", message: `${creativeWaiting} image or A+ recommendations are waiting for review.`, metadata: { creativeWaiting } });
+  }
+
+  try {
+    const traffic = await getSalesTrafficSummary(sellerId, 7);
+    const dropped = traffic.products.filter((p) => p.flags.includes("SALES_DROP"));
+    if (isRuleEnabled(enabledRules, "SALES_TRAFFIC_SALES_DROP") && dropped.length > 0) {
+      candidates.push({ ruleKey: "SALES_TRAFFIC_SALES_DROP", category: "SALES", severity: "HIGH", title: "Sales dropped on some products", message: `${dropped.length} product(s) sold at least 30% fewer units than the week before: ${dropped.slice(0, 3).map((p) => p.sku ?? p.asin).join(", ")}.`, metadata: { asins: dropped.map((p) => p.asin) } });
+    }
+    const notBuying = traffic.products.filter((p) => p.flags.includes("LOW_CONVERSION"));
+    if (isRuleEnabled(enabledRules, "SALES_TRAFFIC_LOW_CONVERSION") && notBuying.length > 0) {
+      candidates.push({ ruleKey: "SALES_TRAFFIC_LOW_CONVERSION", category: "SALES", severity: "MEDIUM", title: "Visitors are not buying some products", message: `${notBuying.length} product(s) get visits but convert below 3%: ${notBuying.slice(0, 3).map((p) => p.sku ?? p.asin).join(", ")}. Check price, images and reviews.`, metadata: { asins: notBuying.map((p) => p.asin) } });
+    }
+  } catch {
+    // Sales & Traffic data not available yet; skip these rules.
   }
 
   return candidates;
