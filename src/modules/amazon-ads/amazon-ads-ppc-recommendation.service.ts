@@ -1,3 +1,4 @@
+import { logger } from "../../utils/logger";
 import { supabase } from "../../db/supabase";
 import { ProductEconomicsRow, ProductProfitStatus } from "../product-economics/product-economics.types";
 import { logSafeAmazonAdsSupabaseError } from "./amazon-ads-client.service";
@@ -466,7 +467,7 @@ type AdGroupEconomics = {
 const UNMAPPED_AD_GROUP: AdGroupEconomics = { economics: null, gateProfitStatus: null, asin: null, mappedAsins: [], source: "UNMAPPED" };
 
 // Higher = worse. A scale-up needs "PASS" (0); anything else blocks it.
-const PROFIT_STATUS_SEVERITY: Record<string, number> = { PASS: 0, RISK: 1, UNKNOWN: 2, NEEDS_INPUT: 3, NEEDS_COST_DATA: 4, FAIL: 5, BLOCKED: 6 };
+const PROFIT_STATUS_SEVERITY: Record<string, number> = { PASS: 0, RISK: 1, RETURN_RISK: 1, UNKNOWN: 2, NEEDS_INPUT: 3, NEEDS_COST_DATA: 4, FAIL: 5, BLOCKED: 6 };
 
 function worstProfitStatus(statuses: string[]): string | null {
   if (statuses.length === 0) return null;
@@ -475,6 +476,70 @@ function worstProfitStatus(statuses: string[]): string | null {
 
 const ECONOMICS_COLUMNS =
   "asin, sku, selling_price, landed_cost, amazon_fee_estimate, shipping_fee_estimate, non_ad_cost, target_profit, max_allowable_ad_spend, target_acos, break_even_acos, profit_status, created_at";
+
+// Returns eat margin that the cost sheet does not show. A product that customers send back
+// often should not get a "scale this up" suggestion even if its unit economics look fine.
+const RETURN_RISK_MIN_UNITS = 8; // below this the rate is noise
+const RETURN_RISK_RATE_PCT = 15;
+const RETURN_LOOKBACK_DAYS = 90;
+
+/** ASIN -> return rate over the last 90 days, only for ASINs with enough sales to judge. */
+async function loadHighReturnAsins(sellerId: string, asins: string[]): Promise<Map<string, { sold: number; returned: number; ratePct: number }>> {
+  const flagged = new Map<string, { sold: number; returned: number; ratePct: number }>();
+  if (asins.length === 0) return flagged;
+
+  try {
+    const since = new Date(Date.now() - RETURN_LOOKBACK_DAYS * 86_400_000).toISOString();
+    const { data: orders, error: ordersError } = await supabase
+      .from("amazon_sp_orders")
+      .select("amazon_order_id")
+      .eq("seller_id", sellerId)
+      .gte("purchase_date", since)
+      .limit(5000);
+    if (ordersError) throw ordersError;
+
+    const orderIds = ((orders ?? []) as { amazon_order_id: string | null }[]).map((row) => row.amazon_order_id).filter((id): id is string => Boolean(id));
+    const sold = new Map<string, number>();
+    for (let i = 0; i < orderIds.length; i += 100) {
+      const { data: items, error: itemsError } = await supabase
+        .from("amazon_sp_order_items")
+        .select("asin, quantity_ordered")
+        .in("amazon_order_id", orderIds.slice(i, i + 100))
+        .in("asin", asins);
+      if (itemsError) throw itemsError;
+      for (const item of (items ?? []) as { asin: string | null; quantity_ordered: number | string | null }[]) {
+        const asin = String(item.asin ?? "").trim().toUpperCase();
+        if (asin) sold.set(asin, (sold.get(asin) ?? 0) + toNumber(item.quantity_ordered));
+      }
+    }
+
+    const { data: returns, error: returnsError } = await supabase
+      .from("amazon_sp_returns")
+      .select("asin, quantity")
+      .eq("seller_id", sellerId)
+      .gte("return_date", since)
+      .in("asin", asins)
+      .limit(5000);
+    if (returnsError) throw returnsError;
+    const returned = new Map<string, number>();
+    for (const row of (returns ?? []) as { asin: string | null; quantity: number | string | null }[]) {
+      const asin = String(row.asin ?? "").trim().toUpperCase();
+      if (asin) returned.set(asin, (returned.get(asin) ?? 0) + (toNumber(row.quantity) || 1));
+    }
+
+    for (const [asin, units] of sold.entries()) {
+      const ret = returned.get(asin) ?? 0;
+      const ratePct = units > 0 ? (ret / units) * 100 : 0;
+      if (units >= RETURN_RISK_MIN_UNITS && ratePct >= RETURN_RISK_RATE_PCT) {
+        flagged.set(asin, { sold: units, returned: ret, ratePct: roundTwo(ratePct) });
+      }
+    }
+  } catch (error) {
+    // Never block recommendations because the returns lookup failed; the other gates still apply.
+    logger.warn("Could not check return rates for PPC recommendations.", { message: error instanceof Error ? error.message : String(error) });
+  }
+  return flagged;
+}
 
 /**
  * Links every ad group to the product(s) it advertises, and each product to ITS OWN latest
@@ -540,11 +605,15 @@ async function loadAdGroupEconomics(input: {
     }
   }
 
+  const highReturnAsins = await loadHighReturnAsins(input.sellerId, allAsins);
+
   for (const [key, asins] of perGroup.entries()) {
     const ranked = [...asins.entries()].sort((a, b) => b[1].cost - a[1].cost).map(([asin]) => asin);
     const primary = ranked[0] ?? null;
     const primaryEconomics = primary ? economicsByAsin.get(primary) ?? null : null;
-    const statuses = ranked.map((asin) => economicsByAsin.get(asin)?.profit_status ?? "NEEDS_COST_DATA");
+    const statuses: string[] = ranked.map((asin) => economicsByAsin.get(asin)?.profit_status ?? "NEEDS_COST_DATA");
+    // A high return rate on any advertised product keeps the group out of "scale up" (needs PASS).
+    if (ranked.some((asin) => highReturnAsins.has(asin))) statuses.push("RETURN_RISK");
 
     result.set(key, {
       economics: primaryEconomics,

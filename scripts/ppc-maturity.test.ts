@@ -16,8 +16,12 @@ const setEcon = (status: string) => { ECONS = { [ASIN_A]: econ(status, ASIN_A) }
     const wanted = (u.searchParams.get("asin") ?? "").replace(/^in\.\(|\)$/g, "").split(",").map((s) => s.replace(/"/g, "").trim()).filter(Boolean);
     body = Object.values(ECONS).filter((r: any) => wanted.includes(r.asin)).sort((a: any, b: any) => String(b.created_at).localeCompare(String(a.created_at)));
   }
+  else if (table === "amazon_sp_orders") body = SOLD > 0 ? [{ amazon_order_id: "O1" }] : [];
+  else if (table === "amazon_sp_order_items") body = SOLD > 0 ? [{ asin: ASIN_A, quantity_ordered: SOLD }] : [];
+  else if (table === "amazon_sp_returns") body = RETURNED > 0 ? [{ asin: ASIN_A, quantity: RETURNED }] : [];
   return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
 };
+let SOLD = 0, RETURNED = 0; // units sold / returned for ASIN_A over the last 90 days (fake)
 let getAmazonAdsPpcRecommendations: any;
 
 const econ = (status: string, asin = ASIN_A, createdAt = "2026-09-30") => ({ asin, selling_price: 500, landed_cost: 200, amazon_fee_estimate: 80, shipping_fee_estimate: 40, non_ad_cost: 320, target_profit: 60, max_allowable_ad_spend: 60, target_acos: 20, break_even_acos: 30, profit_status: status, created_at: createdAt });
@@ -106,6 +110,24 @@ const where = (r: any, term: string) => { for (const k of Object.keys(r)) if (Ar
   check("evidence marks missing economics row", pe("t-no-econ")?.economicsSource === "NO_ECONOMICS_ROW");
   check("account summary counts terms lacking product economics (2: unmapped + no cost row; the FAIL product does have cost data)", r.summary.termsWithoutProductEconomics === 2, String(r.summary.termsWithoutProductEconomics));
   check("warning explains it", r.warnings.length === 1 && /no usable product cost data/.test(r.warnings[0]));
+
+  // ---------- Scenario 6: high return rate blocks scale-ups even when unit economics PASS
+  ECONS = { [ASIN_A]: econ("PASS", ASIN_A) };
+  ADV = [{ campaign_id: "C1", ad_group_id: "G1", advertised_asin: ASIN_A, cost: 100 }];
+  ROWS = [...term("harvest mature", [1,3,5,8,9], good, "C1", "G1")];
+  SOLD = 20; RETURNED = 5; // 25% returned
+  r = await getAmazonAdsPpcRecommendations({ sellerId: "default", days: 14, targetAcos: 35 });
+  console.log("\n[Scenario 6] economics PASS but 25% of units come back");
+  check("high-return product is not scaled", where(r, "harvest mature") === "monitorOnlyTerms", where(r, "harvest mature"));
+  const rr = r.monitorOnlyTerms.find((i: any) => i.searchTerm === "harvest mature");
+  check("reason names the return risk", !!rr && /RETURN_RISK/.test(rr.reason), rr?.reason.slice(0, 120));
+  SOLD = 20; RETURNED = 1; // 5% returned
+  r = await getAmazonAdsPpcRecommendations({ sellerId: "default", days: 14, targetAcos: 35 });
+  check("normal return rate (5%) can still scale", where(r, "harvest mature") === "exactMatchOpportunities", where(r, "harvest mature"));
+  SOLD = 4; RETURNED = 3; // tiny sample: 75% but only 4 units -> ignored as noise
+  r = await getAmazonAdsPpcRecommendations({ sellerId: "default", days: 14, targetAcos: 35 });
+  check("tiny sample (4 units) is ignored, not treated as a return problem", where(r, "harvest mature") === "exactMatchOpportunities", where(r, "harvest mature"));
+  SOLD = 0; RETURNED = 0;
 
   // ---------- Scenario 4: previously SAVED recommendations re-entering the approval queue
   const { savedRecommendationMaturity } = await import("../src/modules/amazon-ads/ppc-data-maturity");
