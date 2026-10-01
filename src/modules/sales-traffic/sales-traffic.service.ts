@@ -13,6 +13,10 @@ export type SalesTrafficRow = {
   prevUnitsOrdered: number;
   sessionsChangePct: number | null;
   unitsChangePct: number | null;
+  adSpend: number;
+  adSales: number;
+  organicSalesEstimate: number;
+  tacosPct: number | null;
   flags: string[];
 };
 
@@ -58,6 +62,22 @@ export async function getSalesTrafficSummary(sellerId: string, daysInput = 14): 
   if (error) throw new Error(error.message);
 
   const rows = (data ?? []) as RawRow[];
+
+  // Ad spend and ad-attributed sales for the same window, per ASIN.
+  const adByAsin = new Map<string, { spend: number; sales: number }>();
+  const { data: adData } = await supabase
+    .from("amazon_ads_advertised_product_daily_metrics")
+    .select("advertised_asin, cost, sales")
+    .eq("seller_id", sellerId)
+    .gte("report_date", splitDate)
+    .limit(20000);
+  for (const r of (adData ?? []) as Array<{ advertised_asin: string | null; cost: number | null; sales: number | null }>) {
+    if (!r.advertised_asin) continue;
+    const e = adByAsin.get(r.advertised_asin) ?? { spend: 0, sales: 0 };
+    e.spend += num(r.cost);
+    e.sales += num(r.sales);
+    adByAsin.set(r.advertised_asin, e);
+  }
   const byAsin = new Map<string, { cur: RawRow[]; prev: RawRow[]; sku: string | null }>();
   let lastDate: string | null = null;
   for (const r of rows) {
@@ -88,7 +108,13 @@ export async function getSalesTrafficSummary(sellerId: string, daysInput = 14): 
     if (prevSessions >= MIN_SESSIONS_FOR_FLAGS && sessionsChange !== null && sessionsChange <= DROP_PCT) flags.push("TRAFFIC_DROP");
     if (sessions >= MIN_SESSIONS_FOR_FLAGS && avgBuyBox !== null && avgBuyBox < LOW_BUY_BOX_PCT) flags.push("LOW_BUY_BOX");
 
+    const orderedSales = Math.round(sum(e.cur, "ordered_sales") * 100) / 100;
+    const ad = adByAsin.get(asin) ?? { spend: 0, sales: 0 };
     products.push({
+      adSpend: Math.round(ad.spend * 100) / 100,
+      adSales: Math.round(ad.sales * 100) / 100,
+      organicSalesEstimate: Math.round(Math.max(orderedSales - ad.sales, 0) * 100) / 100,
+      tacosPct: pct(ad.spend, orderedSales),
       asin, sku: e.sku, sessions, pageViews: sum(e.cur, "page_views"), unitsOrdered: units,
       orderedSales: Math.round(sum(e.cur, "ordered_sales") * 100) / 100, conversionPct: conversion, avgBuyBoxPct: avgBuyBox,
       prevSessions, prevUnitsOrdered: prevUnits, sessionsChangePct: sessionsChange, unitsChangePct: unitsChange, flags
