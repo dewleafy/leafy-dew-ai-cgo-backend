@@ -6,7 +6,7 @@ import {
   RecommendationCategory,
   RecommendationItem
 } from "../amazon-ads/amazon-ads-ppc-recommendation.service";
-import { savedRecommendationMaturity } from "../amazon-ads/ppc-data-maturity";
+import { savedRecommendationAllowed } from "../amazon-ads/ppc-data-maturity";
 import { getDailyCeoReport } from "../ceo-report/ceo-report.service";
 import {
   getCostCompletionQueue,
@@ -432,9 +432,7 @@ async function buildPpcCandidates(sellerId: string): Promise<SyncCandidate[]> {
   const generatedItems = PPC_RECOMMENDATION_CATEGORIES.flatMap((category) => generatedRecommendations[category]);
   // Saved recommendations created before the maturity gate existed may rest on a handful of clicks.
   // Do not let those re-enter the approval queue (the saved row itself is left untouched).
-  const matureSavedRecommendations = savedRecommendations.filter(
-    (row) => savedRecommendationMaturity(row)?.status !== "HELD_BACK"
-  );
+  const matureSavedRecommendations = savedRecommendations.filter((row) => savedRecommendationAllowed(row));
   const heldBackSavedCount = savedRecommendations.length - matureSavedRecommendations.length;
   if (heldBackSavedCount > 0 || generatedRecommendations.heldBackTerms.length > 0) {
     logger.info("PPC data-maturity gate held back thin-data recommendations from the approval queue.", {

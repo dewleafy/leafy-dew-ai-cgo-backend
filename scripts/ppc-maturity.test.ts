@@ -111,6 +111,12 @@ const where = (r: any, term: string) => { for (const k of Object.keys(r)) if (Ar
   const { savedRecommendationMaturity } = await import("../src/modules/amazon-ads/ppc-data-maturity");
   console.log("\n[Scenario 4] saved ai_recommendations rows (ledger bridge filter)");
   const saved = (type: string, clicks: number, profitStatus = "PASS") => savedRecommendationMaturity({ recommendationType: type, evidence: { clicks }, profitEvidence: { profitStatus } });
+  const { savedRecommendationAllowed } = await import("../src/modules/amazon-ads/ppc-data-maturity");
+  const allowed = (type: string, evidence: Record<string, unknown>) => savedRecommendationAllowed({ recommendationType: type, evidence, profitEvidence: { profitStatus: "PASS" } });
+  check("legacy saved negative candidate (40 clicks, no maturity stamp) is held back", allowed("NEGATIVE_KEYWORD_CANDIDATES", { clicks: 40 }) === false);
+  check("saved negative candidate stamped MATURE is allowed", allowed("NEGATIVE_KEYWORD_CANDIDATES", { clicks: 40, dataMaturity: { status: "MATURE" } }) === true);
+  check("saved negative candidate stamped HELD_BACK stays out", allowed("NEGATIVE_KEYWORD_CANDIDATES", { clicks: 40, dataMaturity: { status: "HELD_BACK" } }) === false);
+  check("legacy saved watchlist row is still allowed", allowed("WATCHLIST_WASTE_TERMS", { clicks: 3 }) === true);
   check("saved PROFIT_RISK row with 1 click is held back", saved("PROFIT_RISK_WARNINGS", 1)?.status === "HELD_BACK");
   check("saved PROFIT_RISK row with 40 clicks passes", saved("PROFIT_RISK_WARNINGS", 40)?.status === "MATURE");
   check("saved scale row (exact match) without profit PASS is held back", saved("EXACT_MATCH_OPPORTUNITIES", 20, "RISK")?.status === "HELD_BACK");

@@ -190,6 +190,29 @@ export function ppcCategoryFromRecommendationType(type: string | null | undefine
  * may still flow into the approval queue. Saved rows do not store how many days of data they
  * rested on, so only the click floor and (for scale suggestions) the profit status can be checked.
  */
+/**
+ * May this saved row enter the approval queue? Rows saved before the gate existed carry no
+ * `dataMaturity` result in their evidence, so nobody ever checked how many days of data they
+ * rest on: for gated categories they are held back until the next generate-and-save re-judges
+ * them (which stamps the result). Rows stamped HELD_BACK stay out; stamped MATURE rows still
+ * have to pass the click/profit check.
+ */
+export function savedRecommendationAllowed(row: {
+  recommendationType: string | null | undefined;
+  evidence: Record<string, unknown> | null | undefined;
+  profitEvidence: Record<string, unknown> | null | undefined;
+}): boolean {
+  const category = ppcCategoryFromRecommendationType(row.recommendationType);
+  if (!category || !PPC_MATURITY_RULES[category]) return true;
+
+  const stamped = (row.evidence as Record<string, unknown> | null | undefined)?.dataMaturity as
+    | { status?: string }
+    | undefined;
+  if (stamped?.status !== "MATURE") return false;
+
+  return savedRecommendationMaturity(row)?.status !== "HELD_BACK";
+}
+
 export function savedRecommendationMaturity(row: {
   recommendationType: string | null | undefined;
   evidence: Record<string, unknown> | null | undefined;
