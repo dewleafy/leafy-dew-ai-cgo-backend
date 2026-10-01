@@ -14,6 +14,8 @@ type SourceConfig = {
   timestampColumn: string;
   staleAfterMinutes: number;
   critical: boolean;
+  /** Optional equality filters, e.g. only successful report jobs. */
+  where?: Record<string, string>;
 };
 
 export const DATA_FRESHNESS_SOURCES: DataFreshnessSource[] = [
@@ -33,7 +35,10 @@ export const DATA_FRESHNESS_SOURCES: DataFreshnessSource[] = [
 
 const SOURCE_CONFIGS: SourceConfig[] = [
   { dataSource: "AMAZON_SP_API_LISTINGS", table: "amazon_sp_listings", timestampColumn: "last_synced_at", staleAfterMinutes: 1440, critical: true },
-  { dataSource: "AMAZON_SP_API_ORDERS", table: "amazon_sp_orders", timestampColumn: "last_synced_at", staleAfterMinutes: 1440, critical: true },
+  // The daily order report only rewrites order rows that changed, so with no new orders the rows'
+  // own timestamp stays old even though the sync is healthy. Judge freshness by the last successful
+  // order-report job instead.
+  { dataSource: "AMAZON_SP_API_ORDERS", table: "amazon_sp_report_jobs", timestampColumn: "updated_at", staleAfterMinutes: 1440, critical: true, where: { report_type: "GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL", status: "DONE" } },
   { dataSource: "AMAZON_ADS", table: "amazon_ads_campaigns", timestampColumn: "last_synced_at", staleAfterMinutes: 1440, critical: true },
   { dataSource: "PRODUCT_PASSPORT", table: "product_passports", timestampColumn: "updated_at", staleAfterMinutes: 10080, critical: true },
   { dataSource: "PRODUCT_ECONOMICS", table: "amazon_product_economics", timestampColumn: "updated_at", staleAfterMinutes: 1440, critical: true },
@@ -90,12 +95,9 @@ function toSafeStatus(row: DataFreshnessStatusRow): SafeDataFreshnessStatus {
 }
 
 async function deriveSourceStatus(sellerId: string, config: SourceConfig): Promise<DataFreshnessMarkInput> {
-  const { data, error } = await supabase
-    .from(config.table)
-    .select(config.timestampColumn)
-    .eq("seller_id", sellerId)
-    .order(config.timestampColumn, { ascending: false })
-    .limit(1);
+  let query = supabase.from(config.table).select(config.timestampColumn).eq("seller_id", sellerId);
+  for (const [column, value] of Object.entries(config.where ?? {})) query = query.eq(column, value);
+  const { data, error } = await query.order(config.timestampColumn, { ascending: false }).limit(1);
 
   if (error) {
     return {
