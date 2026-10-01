@@ -19,6 +19,9 @@ import {
 import { runDailyOrchestrator } from "../daily-orchestrator/daily-orchestrator.service";
 import { generateAlerts } from "../alert-center/alert-center.service";
 import { runDaypartingCheck } from "../amazon-ads/amazon-ads-dayparting.service";
+import { runMaintenance } from "../maintenance/maintenance.service";
+import { runQaSmokeTest } from "../qa-smoke/qa-smoke.service";
+import { runLaunchGateChecks } from "../launch-gate/launch-gate.service";
 import { checkDataFreshness } from "../data-freshness/data-freshness.service";
 
 const DEFAULT_SELLER_ID = "default";
@@ -476,6 +479,30 @@ async function runScheduledFreshnessCheck(sellerId: string): Promise<string> {
   }
 }
 
+// Daily self-check: maintenance, QA smoke test, then the launch gate (which reads their results).
+// All three are shadow-mode: they inspect and record, they never send anything to Amazon.
+const HEALTH_MIN_GAP_MS = 20 * 60 * 60 * 1000;
+let lastHealthRunAt = 0;
+
+async function runScheduledHealthChecks(sellerId: string): Promise<string> {
+  if (Date.now() - lastHealthRunAt < HEALTH_MIN_GAP_MS) return "Health checks: ran recently, skipped.";
+  lastHealthRunAt = Date.now();
+  const done: string[] = [];
+  for (const [name, run] of [
+    ["maintenance", () => runMaintenance({ sellerId, runType: "SCHEDULED" })],
+    ["QA smoke", () => runQaSmokeTest(sellerId)],
+    ["launch gate", () => runLaunchGateChecks(sellerId)]
+  ] as const) {
+    try {
+      await run();
+      done.push(name);
+    } catch (error) {
+      logger.warn(`Scheduled ${name} failed.`, { message: error instanceof Error ? error.message : "Unknown error" });
+    }
+  }
+  return `Health checks done: ${done.join(", ") || "none"}.`;
+}
+
 async function runBackgroundAmazonSync(sellerId: string = DEFAULT_SELLER_ID): Promise<void> {
   if (isRunning) {
     logger.info("Background Amazon sync already running, skipping this tick.");
@@ -490,8 +517,9 @@ async function runBackgroundAmazonSync(sellerId: string = DEFAULT_SELLER_ID): Pr
     const dailyOrchestratorSummary = await runScheduledDailyOrchestration(sellerId);
     const daypartingSummary = await runScheduledDaypartingCheck(sellerId);
     const freshnessSummary = await runScheduledFreshnessCheck(sellerId);
+    const healthSummary = await runScheduledHealthChecks(sellerId);
     lastRunAt = new Date().toISOString();
-    lastRunSummary = `${listingsSummary} ${attributesSummary} ${searchTermSummary} ${advertisedProductSummary} ${dailyOrchestratorSummary} ${daypartingSummary} ${freshnessSummary}`;
+    lastRunSummary = `${listingsSummary} ${attributesSummary} ${searchTermSummary} ${advertisedProductSummary} ${dailyOrchestratorSummary} ${daypartingSummary} ${freshnessSummary} ${healthSummary}`;
     logger.info("Background Amazon sync completed.", { summary: lastRunSummary });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
