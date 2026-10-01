@@ -1,6 +1,7 @@
 import { supabase } from "../../db/supabase";
 import { ProductEconomicsRow, ProductProfitStatus } from "../product-economics/product-economics.types";
 import { logSafeAmazonAdsSupabaseError } from "./amazon-ads-client.service";
+import { evaluatePpcDataMaturity, inclusiveSpanDays, PpcDataMaturity } from "./ppc-data-maturity";
 
 export type RecommendationCategory =
   | "exactMatchOpportunities"
@@ -24,6 +25,7 @@ export type RecommendationAction =
   | "MONITOR";
 
 type SearchTermMetricRow = {
+  report_date: string | null;
   campaign_id: string;
   campaign_name: string | null;
   ad_group_id: string;
@@ -37,6 +39,8 @@ type SearchTermMetricRow = {
 };
 
 type MetricAccumulator = {
+  /** Distinct report days (YYYY-MM-DD) on which this term had data. */
+  dates: Set<string>;
   searchTerm: string;
   campaignId: string;
   campaignName: string | null;
@@ -91,6 +95,18 @@ export type RecommendationItem = {
   profitEvidence: ProfitEvidence;
   ruleVersion: "profit_ppc_v1";
   strategyVersion: "ai_cgo_v2_2_shadow_mode";
+  /** Blueprint §12 data-maturity check result for this recommendation. */
+  dataMaturity: PpcDataMaturity;
+};
+
+export type HeldBackTerm = {
+  searchTerm: string;
+  campaignId: string;
+  adGroupId: string;
+  originalCategory: RecommendationCategory;
+  originalAction: RecommendationAction;
+  reasons: string[];
+  blueprintRule: string | null;
 };
 
 export type PpcRecommendationResponse = {
@@ -111,6 +127,8 @@ export type PpcRecommendationResponse = {
   productPageCheckWarnings: RecommendationItem[];
   profitRiskWarnings: RecommendationItem[];
   monitorOnlyTerms: RecommendationItem[];
+  /** Suggestions that were NOT turned into actions because the data was too thin (first 200). */
+  heldBackTerms: HeldBackTerm[];
   warnings: string[];
   savedCount?: number;
   skippedDuplicateCount?: number;
@@ -449,7 +467,7 @@ async function listSearchTermMetrics(input: {
 }): Promise<SearchTermMetricRow[]> {
   const { data, error } = await supabase
     .from("amazon_ads_search_term_daily_metrics")
-    .select("campaign_id, campaign_name, ad_group_id, ad_group_name, search_term, impressions, clicks, cost, sales, orders")
+    .select("report_date, campaign_id, campaign_name, ad_group_id, ad_group_name, search_term, impressions, clicks, cost, sales, orders")
     .eq("seller_id", input.sellerId)
     .gte("report_date", input.startDate)
     .lte("report_date", input.endDate)
@@ -504,6 +522,7 @@ export async function getAmazonAdsPpcRecommendations(input: {
     monitorOnlyTerms: []
   };
   const grouped = new Map<string, MetricAccumulator>();
+  const heldBackTerms: HeldBackTerm[] = [];
 
   for (const row of metricRows) {
     const searchTerm = row.search_term ?? "";
@@ -518,6 +537,7 @@ export async function getAmazonAdsPpcRecommendations(input: {
     const accumulator =
       grouped.get(key) ??
       {
+        dates: new Set<string>(),
         searchTerm,
         campaignId,
         campaignName: row.campaign_name,
@@ -535,6 +555,9 @@ export async function getAmazonAdsPpcRecommendations(input: {
     accumulator.cost += toNumber(row.cost);
     accumulator.sales += toNumber(row.sales);
     accumulator.orders += toNumber(row.orders);
+    if (row.report_date && (toNumber(row.impressions) > 0 || toNumber(row.clicks) > 0)) {
+      accumulator.dates.add(String(row.report_date).slice(0, 10));
+    }
     accumulator.campaignName = accumulator.campaignName ?? row.campaign_name;
     accumulator.adGroupName = accumulator.adGroupName ?? row.ad_group_name;
     grouped.set(key, accumulator);
@@ -543,13 +566,40 @@ export async function getAmazonAdsPpcRecommendations(input: {
   for (const accumulator of grouped.values()) {
     const evidence = createEvidence(accumulator);
     const isAsinLike = isAsinLikeSearchTerm(accumulator.searchTerm);
-    const details = getRecommendationDetails({
+    const rawDetails = getRecommendationDetails({
       evidence,
       isAsinLike,
       effectiveTargetAcos,
       productEconomics,
       costDataMissing
     });
+    // Blueprint §12 data-maturity gate: thin data never becomes an approval-worthy action.
+    const sortedDates = [...accumulator.dates].sort();
+    const dataMaturity = evaluatePpcDataMaturity({
+      category: rawDetails.category,
+      clicks: evidence.clicks,
+      observedDays: sortedDates.length,
+      spanDays: sortedDates.length > 0 ? inclusiveSpanDays(sortedDates[0], sortedDates[sortedDates.length - 1]) : null,
+      profitStatus: productEconomics?.profit_status ?? null
+    });
+    let details: { category: RecommendationCategory; recommendedAction: RecommendationAction; reason: string } = rawDetails;
+
+    if (dataMaturity.status === "HELD_BACK" && dataMaturity.downgradeTo) {
+      details = {
+        category: dataMaturity.downgradeTo,
+        recommendedAction: dataMaturity.downgradeTo === "watchlistWasteTerms" ? "MONITOR_DO_NOT_NEGATIVE_YET" : "MONITOR",
+        reason: `Held back, not enough mature data yet (${dataMaturity.reasons.join("; ")}). Original suggestion: ${rawDetails.recommendedAction}.`
+      };
+      heldBackTerms.push({
+        searchTerm: accumulator.searchTerm,
+        campaignId: accumulator.campaignId,
+        adGroupId: accumulator.adGroupId,
+        originalCategory: rawDetails.category,
+        originalAction: rawDetails.recommendedAction,
+        reasons: dataMaturity.reasons,
+        blueprintRule: dataMaturity.blueprintRule
+      });
+    }
     const isScaleRecommendation = ["exactMatchOpportunities", "productTargetingOpportunities"].includes(details.category);
     const priorityScore = getPriorityScore({
       category: details.category,
@@ -582,7 +632,8 @@ export async function getAmazonAdsPpcRecommendations(input: {
       evidence,
       profitEvidence: createProfitEvidence(productEconomics),
       ruleVersion: "profit_ppc_v1",
-      strategyVersion: "ai_cgo_v2_2_shadow_mode"
+      strategyVersion: "ai_cgo_v2_2_shadow_mode",
+      dataMaturity
     };
 
     categories[details.category].push(item);
@@ -609,10 +660,12 @@ export async function getAmazonAdsPpcRecommendations(input: {
       bidDownCandidates: categories.bidDownCandidates.length,
       productPageCheckWarnings: categories.productPageCheckWarnings.length,
       profitRiskWarnings: categories.profitRiskWarnings.length,
-      monitorOnlyTerms: categories.monitorOnlyTerms.length
+      monitorOnlyTerms: categories.monitorOnlyTerms.length,
+      heldBackForImmatureData: heldBackTerms.length
     },
     profitDataStatus,
     ...categories,
+    heldBackTerms: heldBackTerms.slice(0, 200),
     warnings
   };
 }
@@ -696,7 +749,7 @@ export async function saveAmazonAdsPpcRecommendations(input: {
         risk_level: item.riskLevel,
         expected_profit_impact: null,
         reason: item.reason,
-        evidence: item.evidence,
+        evidence: { ...item.evidence, dataMaturity: item.dataMaturity },
         profit_evidence: item.profitEvidence,
         status: "NEW",
         rule_version: item.ruleVersion,
