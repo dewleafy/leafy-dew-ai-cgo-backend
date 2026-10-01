@@ -121,6 +121,8 @@ function toSafeDraft(row: ListingOptimizationDraftRow): SafeListingOptimizationD
 // Attaches a real product photo URL to each draft (by SKU, falling back to ASIN) so the Listing
 // Drafts page can show what the product actually looks like instead of a generic icon. Built as a
 // single bulk lookup per list call rather than one query per row.
+import { checkListingCompliance, hasComplianceBlocker, summarizeCompliance } from "../listing-compliance/listing-compliance.rules";
+
 async function attachProductImages(rows: SafeListingOptimizationDraft[], sellerId: string): Promise<SafeListingOptimizationDraft[]> {
   if (!rows.length) return rows;
 
@@ -686,6 +688,14 @@ export async function createActionForListingDraft(draftId: string): Promise<{ ro
     return { row: draft, actionCreated: false, actionId: draft.actionId };
   }
 
+  const complianceFindings = checkListingCompliance({
+    draftType: draft.draftType,
+    text: draft.proposedValue,
+    knownFacts: draft.currentValue
+  });
+  const complianceBlocked = hasComplianceBlocker(complianceFindings);
+  const complianceNote = summarizeCompliance(complianceFindings);
+
   const ensured = await ensureActionLedgerAction({
     sellerId: draft.sellerId,
     source: "LISTING_DRAFT_SYSTEM",
@@ -696,9 +706,9 @@ export async function createActionForListingDraft(draftId: string): Promise<{ ro
     sku: draft.sku,
     asin: draft.asin,
     title: `Review ${draft.draftType.toLowerCase().replace(/_/g, " ")} draft${draft.productName ? ` for ${draft.productName}` : ""}`,
-    summary: draft.reason,
+    summary: complianceFindings.length ? `${complianceNote} ${draft.reason ?? ""}`.trim() : draft.reason,
     recommendedAction: "REVIEW_LISTING_DRAFT",
-    riskLevel: draft.riskLevel as "LOW" | "MEDIUM" | "HIGH" | "CRITICAL",
+    riskLevel: (complianceBlocked ? "HIGH" : draft.riskLevel) as "LOW" | "MEDIUM" | "HIGH" | "CRITICAL",
     confidenceLabel: draft.confidenceLabel as "LOW" | "MEDIUM" | "HIGH",
     approvalTier: "TIER_2",
     requiresApproval: true,
@@ -709,6 +719,8 @@ export async function createActionForListingDraft(draftId: string): Promise<{ ro
       draftType: draft.draftType,
       currentValue: draft.currentValue,
       proposedValue: draft.proposedValue,
+      complianceFindings,
+      complianceBlocked,
       shadowMode: true,
       externalExecution: false
     },
