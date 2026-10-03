@@ -1,0 +1,13 @@
+import assert from "node:assert";
+import { assessStrategicAction, upcomingFestivals } from "../src/modules/strategy/strategic-layer.rules";
+const a = assessStrategicAction({ verdict: "LOSING_MONEY", targetAcos: -5, breakEvenAcos: -2, flags: [], sessions: 100 });
+assert(a.doNot.some((x) => /ads or discounts/.test(x)));
+const b = assessStrategicAction({ verdict: "PUSH", targetAcos: 30, breakEvenAcos: 45, flags: [], sessions: 200 });
+assert.equal(b.positioning, "DIFFERENTIATE");
+assert(b.score !== null && b.score > 0);
+const c = assessStrategicAction({ verdict: "FIX_COSTS", targetAcos: null, breakEvenAcos: null, flags: [], sessions: 0 });
+assert.equal(c.score, null);
+const f = upcomingFestivals(new Date("2026-10-03T00:00:00Z"), 3);
+assert.equal(f[0].name, "Navratri");
+assert(f.find((x) => x.name === "Diwali")!.daysAway === 36);
+console.log("strategic-layer tests passed");

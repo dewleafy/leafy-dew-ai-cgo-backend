@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "test:ppc-maturity": "tsx scripts/ppc-maturity.test.ts",
     "test:listing-compliance": "tsx scripts/listing-compliance.test.ts",
-    "test:strategy": "tsx scripts/strategy.test.ts"
+    "test:strategy": "tsx scripts/strategy.test.ts",
+    "test:strategic-layer": "tsx scripts/strategic-layer.test.ts"
   },
   "keywords": [
     "amazon-sp-api",
