@@ -1546,6 +1546,15 @@ async function runSocialCalendarCheck(engine: SafeEngineRegistryRow, sellerId: s
   };
 }
 
+function runWaitingForDataSource(engine: SafeEngineRegistryRow, needed: string, reason: string): EnginePreviewDecision {
+  return {
+    status: "SKIPPED_NO_DATA",
+    summary: `${reason} This engine needs ${needed} before it can produce recommendations.`,
+    skippedReason: "DATA_SOURCE_NOT_CONNECTED",
+    evidence: { engineKey: engine.engineKey, ruleTemplate: engine.ruleTemplate, neededData: needed }
+  };
+}
+
 async function runDeterministicPreview(engine: SafeEngineRegistryRow, sellerId: string): Promise<EnginePreviewDecision> {
   if (engine.ruleTemplate === "MISSING_DATA_CHECK") return runMissingDataCheck(engine, sellerId);
   if (engine.ruleTemplate === "PROFIT_GUARDRAIL_CHECK") return runProfitGuardrailCheck(engine, sellerId);
@@ -1564,6 +1573,8 @@ async function runDeterministicPreview(engine: SafeEngineRegistryRow, sellerId: 
   if (engine.ruleTemplate === "SEASONAL_OPPORTUNITY_CHECK") return runSeasonalOpportunityCheck(engine, sellerId);
   if (engine.ruleTemplate === "RETURN_REVIEW_RISK_CHECK") return runReturnReviewRiskCheck(engine, sellerId);
   if (engine.ruleTemplate === "SOCIAL_CALENDAR_CHECK") return runSocialCalendarCheck(engine, sellerId);
+  if (engine.ruleTemplate === "COMPETITOR_GAP_CHECK") return runWaitingForDataSource(engine, "competitor price, offer and review data", "No competitor data feed is connected yet (Amazon SP-API does not expose competitor data).");
+  if (engine.ruleTemplate === "BRAND_STORE_GAP_CHECK") return runWaitingForDataSource(engine, "Brand Store page and navigation data", "No Brand Store snapshot source is connected yet.");
 
   return {
     status: "SKIPPED_TEMPLATE_NOT_IMPLEMENTED",
