@@ -2849,36 +2849,57 @@ export async function createDailyAmazonSpSyncJobs(sellerIdInput: string) {
 
   // Sales & Traffic (sessions, page views, buy-box %, conversion per ASIN). Needs the Brand/Analytics
   // SP-API role, so a refusal here must never break the listings and orders sync above.
+  // One report per calendar day so every row is a true per-day, per-ASIN figure. Each sync requests
+  // yesterday plus a few missing earlier days (up to 14 back), so history fills in gradually.
   let salesTrafficCreated = false;
   try {
-    const trafficEnd = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const trafficStart = new Date(trafficEnd.getTime() - 29 * 24 * 60 * 60 * 1000);
     const day = (d: Date) => d.toISOString().slice(0, 10);
-    const trafficResponse = await amazonSpPost<AmazonSpReportResponse>({
-      path: "/reports/2021-06-30/reports",
-      accessToken,
-      region: connection.region,
-      stage: "CREATE_SALES_TRAFFIC_REPORT",
-      body: {
-        reportType: SALES_TRAFFIC_REPORT_TYPE,
-        marketplaceIds: [connection.marketplace_id],
-        dataStartTime: `${day(trafficStart)}T00:00:00Z`,
-        dataEndTime: `${day(trafficEnd)}T23:59:59Z`,
-        reportOptions: { dateGranularity: "DAY", asinGranularity: "CHILD" }
-      }
-    });
-    if (trafficResponse.reportId) {
-      await saveAmazonSpReportJob({
-        sellerId,
-        marketplaceId: connection.marketplace_id,
-        reportId: trafficResponse.reportId,
-        reportType: SALES_TRAFFIC_REPORT_TYPE,
-        jobType: "SALES_TRAFFIC_IMPORT",
-        status: "PROCESSING",
-        dataStartTime: `${day(trafficStart)}T00:00:00Z`,
-        dataEndTime: `${day(trafficEnd)}T23:59:59Z`
+    const wanted: string[] = [];
+    for (let back = 1; back <= 14; back += 1) wanted.push(day(new Date(Date.now() - back * 24 * 60 * 60 * 1000)));
+    const { data: haveRows } = await supabase
+      .from("amazon_sp_sales_traffic")
+      .select("snapshot_date")
+      .eq("seller_id", sellerId)
+      .in("snapshot_date", wanted);
+    const { data: openJobs } = await supabase
+      .from("amazon_sp_report_jobs")
+      .select("data_end_time, status")
+      .eq("seller_id", sellerId)
+      .eq("job_type", "SALES_TRAFFIC_IMPORT")
+      .in("status", ["PROCESSING", "DONE"])
+      .gte("created_at", new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString());
+    const covered = new Set<string>([
+      ...(haveRows ?? []).map((r) => String((r as { snapshot_date: string }).snapshot_date)),
+      ...(openJobs ?? []).map((r) => String((r as { data_end_time: string | null }).data_end_time ?? "").slice(0, 10))
+    ]);
+    const missing = wanted.filter((d) => !covered.has(d)).slice(0, 4);
+    for (const targetDay of missing) {
+      const trafficResponse = await amazonSpPost<AmazonSpReportResponse>({
+        path: "/reports/2021-06-30/reports",
+        accessToken,
+        region: connection.region,
+        stage: "CREATE_SALES_TRAFFIC_REPORT",
+        body: {
+          reportType: SALES_TRAFFIC_REPORT_TYPE,
+          marketplaceIds: [connection.marketplace_id],
+          dataStartTime: `${targetDay}T00:00:00Z`,
+          dataEndTime: `${targetDay}T23:59:59Z`,
+          reportOptions: { dateGranularity: "DAY", asinGranularity: "CHILD" }
+        }
       });
-      salesTrafficCreated = true;
+      if (trafficResponse.reportId) {
+        await saveAmazonSpReportJob({
+          sellerId,
+          marketplaceId: connection.marketplace_id,
+          reportId: trafficResponse.reportId,
+          reportType: SALES_TRAFFIC_REPORT_TYPE,
+          jobType: "SALES_TRAFFIC_IMPORT",
+          status: "PROCESSING",
+          dataStartTime: `${targetDay}T00:00:00Z`,
+          dataEndTime: `${targetDay}T23:59:59Z`
+        });
+        salesTrafficCreated = true;
+      }
     }
   } catch (error) {
     logger.warn("Sales & Traffic report could not be requested (role or access may be missing).", { message: safeErrorMessage(error) });
@@ -2923,10 +2944,10 @@ async function saveSalesTrafficReport(job: AmazonSpReportJobRow, reportText: str
       trafficByAsin?: { sessions?: number; pageViews?: number; buyBoxPercentage?: number; unitSessionPercentage?: number };
     }>;
   };
-  const snapshotDate = new Date().toISOString().slice(0, 10);
   const windowStart = (parsed.reportSpecification?.dataStartTime ?? job.data_start_time ?? "").slice(0, 10) || null;
   const windowEnd = (parsed.reportSpecification?.dataEndTime ?? job.data_end_time ?? "").slice(0, 10) || null;
-  const rows = (parsed.salesAndTrafficByAsin ?? [])
+  const snapshotDate = windowEnd ?? new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const rawRows = (parsed.salesAndTrafficByAsin ?? [])
     .filter((item) => item.childAsin)
     .map((item) => ({
       seller_id: job.seller_id,
@@ -2944,6 +2965,28 @@ async function saveSalesTrafficReport(job: AmazonSpReportJobRow, reportText: str
       units_ordered: item.salesByAsin?.unitsOrdered ?? 0,
       ordered_sales: item.salesByAsin?.orderedProductSales?.amount ?? 0
     }));
+
+  // The same child ASIN can appear more than once (for example once per SKU); merge them so a single
+  // upsert never touches the same row twice.
+  const merged = new Map<string, (typeof rawRows)[number]>();
+  for (const row of rawRows) {
+    const existing = merged.get(row.child_asin);
+    if (!existing) {
+      merged.set(row.child_asin, { ...row });
+      continue;
+    }
+    const sessionsBefore = existing.sessions;
+    existing.sessions += row.sessions;
+    existing.page_views += row.page_views;
+    existing.units_ordered += row.units_ordered;
+    existing.ordered_sales += row.ordered_sales;
+    const total = sessionsBefore + row.sessions;
+    if (total > 0 && existing.buy_box_percentage !== null && row.buy_box_percentage !== null) {
+      existing.buy_box_percentage = (existing.buy_box_percentage * sessionsBefore + row.buy_box_percentage * row.sessions) / total;
+    }
+    existing.unit_session_percentage = total > 0 ? Math.round((existing.units_ordered / total) * 10000) / 100 : existing.unit_session_percentage;
+  }
+  const rows = [...merged.values()];
 
   if (rows.length > 0) {
     const { error } = await supabase.from("amazon_sp_sales_traffic").upsert(rows, { onConflict: "seller_id,snapshot_date,child_asin" });
