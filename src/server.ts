@@ -40,6 +40,7 @@ import { notificationOutboxRouter } from "./modules/notification-outbox/notifica
 import { strategyRouter } from "./modules/strategy/strategy.routes";
 import { salesTrafficRouter } from "./modules/sales-traffic/sales-traffic.routes";
 import { blueprintEnginesRouter } from "./modules/blueprint-engines/blueprint-engines.routes";
+import { playbooksRouter } from "./modules/playbooks/playbooks.routes";
 import { orderEconomicsRouter } from "./modules/order-economics/order-economics.routes";
 import { ppcExecutionRoutes } from "./modules/ppc-execution/ppc-execution.routes";
 import { productEconomicsRouter } from "./modules/product-economics/product-economics.routes";
@@ -237,6 +238,7 @@ app.use("/api/notification-outbox", notificationOutboxRouter);
 app.use("/api/order-economics", orderEconomicsRouter);
 app.use("/api/sales-traffic", salesTrafficRouter);
 app.use("/api/blueprint-engines", blueprintEnginesRouter);
+app.use("/api/playbooks", playbooksRouter);
 app.use("/api/strategy", strategyRouter);
 app.use("/api/ppc-execution", ppcExecutionRoutes);
 app.use("/api/product-economics", productEconomicsRouter);
