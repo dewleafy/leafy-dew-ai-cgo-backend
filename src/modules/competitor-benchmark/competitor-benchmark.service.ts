@@ -1,4 +1,5 @@
 import { supabase } from "../../db/supabase";
+import { env } from "../../config/env";
 import { amazonSpGet } from "../amazon-sp/amazon-sp-client.service";
 import { requireConnectedConnection } from "../amazon-sp/amazon-sp.service";
 import { getAmazonSpAccessToken } from "../amazon-sp/amazon-sp-token.service";
@@ -22,10 +23,33 @@ import {
   SafeCompetitorBenchmarkSkuGroup
 } from "./competitor-benchmark.types";
 
+// This is a batch limit on how many of YOUR OWN products can be benchmarked in a single run
+// (kept low to keep each run fast and inside Amazon's rate limits) -- it is NOT a limit on how
+// many competitors get analyzed per product. Competitors per product are governed separately by
+// MAX_DISCOVERY_SUGGESTIONS_PER_SKU below (auto-discovered) and are additionally uncapped for any
+// competitor ASIN added manually on the confirmation screen.
 export const MAX_OWN_SKUS = 20;
-const MAX_DISCOVERY_SUGGESTIONS_PER_SKU = 8;
+// Raised from 8 -> 15 (2026-10-04) in response to founder feedback asking for more competitors
+// per own SKU. Each extra suggestion costs one more real SP-API catalog-item call per compare
+// run, so this is deliberately not unlimited -- add more manually on the confirmation screen if
+// 15 auto-suggestions still isn't enough for a given SKU.
+const MAX_DISCOVERY_SUGGESTIONS_PER_SKU = 15;
 const PRICING_BATCH_SIZE = 20;
 const CATALOG_INCLUDED_DATA = ["summaries", "images", "attributes", "salesRanks"];
+// Amazon's standard seller-facing listing image limit (1 main + up to 8 alternate/PT01-PT08
+// slots) across most categories on this marketplace. A handful of categories allow more, but
+// absent a confirmed per-category override we never recommend adding past this, so the written
+// checklist can't tell you to do something Amazon's own listing editor will reject.
+const MAX_LISTING_IMAGES = 9;
+
+// Generic English filler words excluded from the "words competitors use that you don't" listing-copy
+// comparison below -- keeps that list to real descriptive/product terms instead of noise like "with"/"and".
+const COPY_STOPWORDS = new Set([
+  "the", "and", "for", "with", "from", "this", "that", "your", "you", "are", "was", "but", "not",
+  "all", "can", "has", "have", "will", "our", "its", "into", "than", "then", "them", "they",
+  "his", "her", "out", "use", "used", "using", "new", "set", "pack", "piece", "pcs", "item",
+  "products", "product", "high", "quality", "best", "free", "easy", "size", "color", "colour"
+]);
 
 export class CompetitorBenchmarkError extends Error {
   status: number;
@@ -83,11 +107,27 @@ function marketplaceEntries(payload: Record<string, unknown>, key: string, marke
   return matching.length > 0 ? matching : entries;
 }
 
+// Confirmed against real pulled data on 2026-10-04: Amazon's Catalog/Listings `images` field
+// lists one entry PER SIZE RENDITION of every real photo, not one entry per photo -- a hi-res
+// file, a ~500px file, and a 75x75 thumbnail (filename suffix "._SLnn_") all share the same
+// `variant` slot (MAIN, PT01, PT02, ... PT08). A real listing with 9 live gallery images came
+// back as 27 raw array entries (9 variants x 3 renditions each). Counting raw array length was
+// the direct cause of both "3 images" showing for a 9-image listing (undercount on a sparse
+// payload) and "recommending 24 more images" (27 raw entries read as the competitor's real
+// count, when the real count was 9). Count DISTINCT variant slots instead.
 function countCatalogImages(payload: Record<string, unknown>, marketplaceId: string): number | null {
   const entries = marketplaceEntries(payload, "images", marketplaceId);
   if (entries.length === 0) return null;
   const images = entries[0]?.images;
-  return Array.isArray(images) ? images.length : null;
+  if (!Array.isArray(images)) return null;
+
+  const variants = new Set<string>();
+  for (const image of images) {
+    if (!image || typeof image !== "object") continue;
+    const variant = (image as Record<string, unknown>).variant;
+    if (typeof variant === "string" && variant.trim()) variants.add(variant.trim());
+  }
+  return variants.size > 0 ? variants.size : null;
 }
 
 function readAttribute(payload: Record<string, unknown>, attributeName: string): unknown[] | null {
@@ -105,6 +145,41 @@ function readSummary(payload: Record<string, unknown>, marketplaceId: string): R
 function extractBulletCount(payload: Record<string, unknown>): number | null {
   const bullets = readAttribute(payload, "bullet_point");
   return bullets ? bullets.length : null;
+}
+
+// Real bullet TEXT (not just the count) -- pulled from the same already-fetched "attributes"
+// includedData as extractBulletCount above, so this needs no extra Amazon API call. Used only
+// for the honest "words competitors use that you don't" listing-copy comparison below; never
+// written anywhere near the live listing.
+function extractBulletText(payload: Record<string, unknown>): string[] {
+  const bullets = readAttribute(payload, "bullet_point");
+  if (!bullets) return [];
+  const texts: string[] = [];
+  for (const entry of bullets) {
+    if (!entry || typeof entry !== "object") continue;
+    const value = (entry as Record<string, unknown>).value;
+    if (typeof value === "string" && value.trim()) texts.push(value.trim());
+  }
+  return texts;
+}
+
+// Tokenizes real pulled title + bullet text into lowercase words for a plain word-overlap
+// comparison. Deliberately NOT a keyword/SEO/search-volume tool -- Amazon's SP-API gives sellers
+// no access to backend search terms or live keyword rank data for any ASIN (confirmed against
+// amzn/selling-partner-api-models#3083), so this only ever compares the literal, real,
+// already-pulled listing copy words -- nothing inferred, nothing scraped.
+function tokenizeListingCopy(texts: string[]): Set<string> {
+  const words = new Set<string>();
+  for (const text of texts) {
+    for (const raw of text.toLowerCase().split(/[^a-z0-9]+/)) {
+      const word = raw.trim();
+      if (word.length < 3) continue;
+      if (/^\d+$/.test(word)) continue;
+      if (COPY_STOPWORDS.has(word)) continue;
+      words.add(word);
+    }
+  }
+  return words;
 }
 
 function extractTitleLength(payload: Record<string, unknown>, marketplaceId: string): number | null {
@@ -227,6 +302,12 @@ export async function createCompetitorBenchmarkRun(input: { sellerId: string; sk
   const amazon = await getAmazonConnectionOrNull(sellerId);
   const discoveryErrors: string[] = [];
 
+  // Every own ASIN across the WHOLE run, not just the current row's -- a multi-SKU run must
+  // never suggest one of the founder's own other products as a "competitor" for a different own
+  // SKU. (Each row previously only excluded its own ASIN, so SKU A's discovered list could
+  // include SKU B's own ASIN if Amazon's catalog search for A's keywords happened to surface it.)
+  const allOwnAsins = new Set(resolved.map((r) => r.passport.asin as string));
+
   // Own-baseline candidate rows first -- every real SP-API pull for these own ASINs runs
   // through the exact same compare-step code path as a competitor, so "own" and "competitor"
   // numbers are never mixed from two different sources.
@@ -304,7 +385,7 @@ export async function createCompetitorBenchmarkRun(input: { sellerId: string; sk
         for (const item of items) {
           if (!item || typeof item !== "object") continue;
           const asin = normalizeAsin(String((item as Record<string, unknown>).asin ?? ""));
-          if (!asin || asin === r.passport.asin) continue;
+          if (!asin || allOwnAsins.has(asin)) continue;
           if (candidateRows.length >= MAX_DISCOVERY_SUGGESTIONS_PER_SKU) break;
 
           const title = extractTitle(item as Record<string, unknown>, amazon.connection.marketplace_id);
@@ -441,7 +522,13 @@ async function assembleRun(run: CompetitorBenchmarkRunRow, sellerId: string): Pr
           gapSummary: f.gap_summary
         })),
       imageBrief: brief
-        ? { ownSku: brief.own_sku, recommendedChanges: brief.recommended_changes, basedOnAsins: brief.based_on_asins, updatedAt: brief.updated_at }
+        ? {
+            ownSku: brief.own_sku,
+            recommendedChanges: brief.recommended_changes,
+            basedOnAsins: brief.based_on_asins,
+            contentGapNotes: brief.content_gap_notes ?? [],
+            updatedAt: brief.updated_at
+          }
         : null,
       imageMockups: mockups
         .filter((m) => m.own_sku === ownSku)
@@ -701,6 +788,21 @@ export async function runCompetitorBenchmarkComparison(input: { runId: string; s
     }
   }
 
+  // For the founder's OWN SKUs, the Listings Items API (/listings/2021-08-01/items/{sellerId}/{sku})
+  // reads the seller's own live listing content directly -- it's the same real, read-only GET
+  // endpoint this app already uses elsewhere (listing-execution, the Amazon attribute sync) and
+  // never writes anything. Catalog Items is a shared, cross-seller catalog snapshot keyed by ASIN
+  // and can lag behind what's actually live on a specific listing (confirmed 2026-10-04: one own
+  // ASIN's Catalog Items snapshot had only its MAIN image slot populated -- no PT01-PT08 at all --
+  // while every competitor ASIN checked the same day had a full, fresh set). Falls back to Catalog
+  // Items automatically if Listings Items fails or this seller's Amazon ID isn't on file.
+  const amazonSellerId = cleanText(amazon.connection.amazon_seller_id) ?? cleanText(env.SP_API_AMAZON_SELLER_ID ?? null);
+
+  // Real title + bullet TEXT per candidate, kept only in memory for this compare pass -- used
+  // below to build the honest "words competitors use that you don't" listing-copy comparison.
+  // Never written to Amazon; never persisted beyond this run's own benchmark tables.
+  const copyTextByCandidateId = new Map<string, { title: string | null; bullets: string[] }>();
+
   for (const candidate of candidates) {
     let fetchStatus: "FETCHED" | "FAILED" = "FETCHED";
     let fetchError: string | null = null;
@@ -709,23 +811,54 @@ export async function runCompetitorBenchmarkComparison(input: { runId: string; s
     let bulletCount: number | null = null;
     let titleLength: number | null = null;
     let salesRank: { rank: number | null; title: string | null } = { rank: null, title: null };
+    let usedListingsItemsApi = false;
+
+    if (candidate.source === "OWN_BASELINE" && amazonSellerId) {
+      try {
+        catalogPayload = await amazonSpGet<Record<string, unknown>>({
+          path: `/listings/2021-08-01/items/${encodeURIComponent(amazonSellerId)}/${encodeURIComponent(candidate.own_sku)}`,
+          accessToken: amazon.accessToken,
+          region: amazon.connection.region,
+          stage: "GET_LISTINGS_ITEM_FOR_COMPETITOR_BENCHMARK",
+          query: {
+            marketplaceIds: [amazon.connection.marketplace_id],
+            includedData: ["summaries", "attributes", "images"]
+          }
+        });
+        usedListingsItemsApi = true;
+      } catch (error) {
+        // Quietly fall through to the Catalog Items pull below -- logged, not fatal.
+        logError(`Listings Items lookup failed for own SKU ${candidate.own_sku}; falling back to Catalog Items.`, error);
+        catalogPayload = null;
+      }
+    }
 
     try {
-      catalogPayload = await amazonSpGet<Record<string, unknown>>({
-        path: `/catalog/2022-04-01/items/${encodeURIComponent(candidate.asin)}`,
-        accessToken: amazon.accessToken,
-        region: amazon.connection.region,
-        stage: "GET_CATALOG_ITEM_COMPETITOR_BENCHMARK",
-        query: {
-          marketplaceIds: [amazon.connection.marketplace_id],
-          includedData: CATALOG_INCLUDED_DATA
-        }
-      });
+      if (!catalogPayload) {
+        catalogPayload = await amazonSpGet<Record<string, unknown>>({
+          path: `/catalog/2022-04-01/items/${encodeURIComponent(candidate.asin)}`,
+          accessToken: amazon.accessToken,
+          region: amazon.connection.region,
+          stage: "GET_CATALOG_ITEM_COMPETITOR_BENCHMARK",
+          query: {
+            marketplaceIds: [amazon.connection.marketplace_id],
+            includedData: CATALOG_INCLUDED_DATA
+          }
+        });
+      }
 
       imageCount = countCatalogImages(catalogPayload, amazon.connection.marketplace_id);
       bulletCount = extractBulletCount(catalogPayload);
       titleLength = extractTitleLength(catalogPayload, amazon.connection.marketplace_id);
-      salesRank = extractSalesRank(catalogPayload, amazon.connection.marketplace_id);
+      // Listings Items doesn't carry salesRanks (that's catalog-only, cross-seller data) -- own
+      // SKUs simply won't have a sales-rank finding when fetched this way, which is fine: we'd
+      // rather have an accurate own image/bullet/title count than a sales rank.
+      salesRank = usedListingsItemsApi ? { rank: null, title: null } : extractSalesRank(catalogPayload, amazon.connection.marketplace_id);
+
+      copyTextByCandidateId.set(candidate.id, {
+        title: extractTitle(catalogPayload, amazon.connection.marketplace_id),
+        bullets: extractBulletText(catalogPayload)
+      });
     } catch (error) {
       fetchStatus = "FAILED";
       fetchError = safeErrorMessage(error);
@@ -825,7 +958,16 @@ export async function runCompetitorBenchmarkComparison(input: { runId: string; s
       if (gapFavorsCompetitor && (plan.dimension === "IMAGE_COUNT" || plan.dimension === "BULLET_COUNT" || plan.dimension === "TITLE_LENGTH")) {
         basedOnAsins.add(best.asin);
         if (plan.dimension === "IMAGE_COUNT") {
-          imageGapChanges.push(`Add ${best.value - ownValue} more listing image(s) -- the strongest confirmed competitor (${best.asin}) has ${best.value}, you have ${ownValue}.`);
+          // Never recommend exceeding Amazon's own listing image limit, no matter how many a
+          // competitor's catalog data shows (see MAX_LISTING_IMAGES above -- this is exactly the
+          // fix for the "recommending 24 more images, but a listing can only hold 9" report).
+          const target = Math.min(best.value, MAX_LISTING_IMAGES);
+          const toAdd = target - ownValue;
+          if (toAdd > 0) {
+            imageGapChanges.push(`Add ${toAdd} more listing image(s), up to Amazon's standard ${MAX_LISTING_IMAGES}-image-per-listing limit -- the strongest confirmed competitor (${best.asin}) shows ${best.value} image slot(s) in Amazon's catalog data, you show ${ownValue}.`);
+          } else {
+            imageGapChanges.push(`You're already at Amazon's standard ${MAX_LISTING_IMAGES}-image-per-listing limit (${ownValue}); the competitor's catalog data (${best.asin}, ${best.value}) can't be matched by adding more images -- if ${best.asin} genuinely shows more than ${MAX_LISTING_IMAGES}, that's a wider allowance for their specific category, not something your listing can also do.`);
+          }
         } else if (plan.dimension === "BULLET_COUNT") {
           imageGapChanges.push(`Add ${best.value - ownValue} more bullet point(s) -- the strongest confirmed competitor (${best.asin}) has ${best.value}, you have ${ownValue}.`);
         } else if (plan.dimension === "TITLE_LENGTH") {
@@ -843,6 +985,50 @@ export async function runCompetitorBenchmarkComparison(input: { runId: string; s
       ? imageGapChanges
       : ["No clear image or listing-completeness gap was found versus your confirmed competitors on this pass."];
 
+    // ---- Listing-copy comparison: real words pulled from confirmed competitors' own title +
+    // bullet text, that don't appear in yours. NOT keyword/search/rank data -- SP-API gives
+    // sellers no access to backend search terms or live keyword rank for any ASIN. This is a
+    // literal text diff of real, already-pulled listing copy, built to directly answer "pull
+    // data from competitors to help maximize sales," without pretending to be SEO data it isn't.
+    const ownCopy = ownCandidate ? copyTextByCandidateId.get(ownCandidate.id) : undefined;
+    const competitorCopies = competitorCandidates
+      .map((c) => ({ asin: c.asin, copy: copyTextByCandidateId.get(c.id) }))
+      .filter((entry): entry is { asin: string; copy: { title: string | null; bullets: string[] } } =>
+        Boolean(entry.copy && (entry.copy.title || entry.copy.bullets.length > 0)));
+
+    const contentGapNotes: string[] = [];
+    if (!ownCopy || (!ownCopy.title && ownCopy.bullets.length === 0)) {
+      contentGapNotes.push("Couldn't read your own title/bullet text from Amazon this run, so no listing-copy comparison could be built.");
+    } else if (competitorCopies.length === 0) {
+      contentGapNotes.push("None of your confirmed competitors returned readable title/bullet text this run, so no listing-copy comparison could be built.");
+    } else {
+      const ownWords = tokenizeListingCopy([ownCopy.title ?? "", ...ownCopy.bullets]);
+      const wordCompetitorCount = new Map<string, number>();
+      for (const entry of competitorCopies) {
+        const words = tokenizeListingCopy([entry.copy.title ?? "", ...entry.copy.bullets]);
+        for (const word of words) {
+          wordCompetitorCount.set(word, (wordCompetitorCount.get(word) ?? 0) + 1);
+        }
+      }
+
+      const minCompetitors = competitorCopies.length >= 2 ? 2 : 1;
+      const missingWords = Array.from(wordCompetitorCount.entries())
+        .filter(([word, count]) => count >= minCompetitors && !ownWords.has(word))
+        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+        .slice(0, 15);
+
+      if (missingWords.length === 0) {
+        contentGapNotes.push(`Your listing copy already covers the same real words your ${competitorCopies.length} confirmed competitor(s) use in their titles/bullets -- no gap found this pass.`);
+      } else {
+        contentGapNotes.push(
+          `Words/phrases used in ${competitorCopies.length} confirmed competitor(s)' real title/bullet text that don't appear in yours: ${missingWords.map(([word, count]) => `"${word}" (${count}/${competitorCopies.length})`).join(", ")}.`
+        );
+        contentGapNotes.push(
+          "This is a plain text comparison of real, already-pulled listing copy -- not Amazon search-volume or backend keyword data (SP-API doesn't expose that to sellers). Before adding any of these to your title or bullets, check each one is factually true for your product."
+        );
+      }
+    }
+
     const { error: briefError } = await supabase
       .from("competitor_benchmark_image_briefs")
       .upsert({
@@ -850,6 +1036,7 @@ export async function runCompetitorBenchmarkComparison(input: { runId: string; s
         own_sku: ownSku,
         recommended_changes: recommendedChanges,
         based_on_asins: Array.from(basedOnAsins),
+        content_gap_notes: contentGapNotes,
         updated_at: new Date().toISOString()
       }, { onConflict: "run_id,own_sku" });
 
