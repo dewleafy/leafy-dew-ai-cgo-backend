@@ -13,6 +13,7 @@ import {
   parseAmazonSpState
 } from "./amazon-sp-auth.service";
 import { amazonSpGet, amazonSpPost } from "./amazon-sp-client.service";
+import { extractListingDetails, scoreListingCompleteness, ListingApiResponse } from "../listing-details/listing-details.rules";
 import {
   AMAZON_SP_ENV_CONNECTION_ID,
   encryptAmazonSpRefreshToken,
@@ -3574,4 +3575,75 @@ export async function getAmazonSpSalesSummary(sellerIdInput: string, daysInput: 
       .sort((left, right) => right.confirmedSales - left.confirmedSales),
     statusNote
   };
+}
+
+
+// Full listing pull: title, bullets, description, backend search terms, all images, attributes,
+// Amazon issues, price and parent link for every SKU, stored in amazon_listing_details with a
+// completeness score. Read-only against Amazon. Oldest/never-fetched SKUs first, a batch per call.
+export async function syncAmazonSpListingDetails(input: { sellerId: string; limit?: number }) {
+  const sellerId = sellerIdOrDefault(input.sellerId);
+  const limit = Math.min(Math.max(toIntegerOrNull(input.limit ?? undefined) ?? 40, 1), 60);
+  const connection = await requireConnectedConnection(sellerId);
+  const accessToken = await getAmazonSpAccessToken(connection.id);
+  const amazonSellerId = connection.amazon_seller_id;
+  if (!amazonSellerId) throw new Error("Amazon seller ID is not available on this connection yet. Run the status/doctor check first.");
+
+  const { data: listings, error: listingsError } = await supabase.from("amazon_sp_listings").select("sku").eq("seller_id", sellerId).limit(2000);
+  if (listingsError) throw new Error(safeErrorMessage(listingsError));
+  const { data: fetched } = await supabase.from("amazon_listing_details").select("sku, last_fetched_at").eq("seller_id", sellerId).limit(2000);
+  const lastBySku = new Map((fetched ?? []).map((r) => [r.sku as string, r.last_fetched_at as string]));
+  const skus = [...new Set((listings ?? []).map((l) => l.sku as string | null).filter((x): x is string => !!x))];
+  skus.sort((a, b) => (lastBySku.get(a) ?? "").localeCompare(lastBySku.get(b) ?? ""));
+  const batch = skus.slice(0, limit);
+
+  let saved = 0;
+  const failed: Array<{ sku: string; reason: string }> = [];
+  for (const sku of batch) {
+    try {
+      const response = await amazonSpGet<ListingApiResponse>({
+        path: `/listings/2021-08-01/items/${amazonSellerId}/${encodeURIComponent(sku)}`,
+        query: {
+          marketplaceIds: [connection.marketplace_id],
+          includedData: ["summaries", "attributes", "issues", "offers", "fulfillmentAvailability", "relationships"]
+        },
+        accessToken,
+        region: connection.region,
+        stage: "GET_LISTINGS_ITEM"
+      });
+      const d = extractListingDetails(response ?? {});
+      const c = scoreListingCompleteness(d);
+      const { error } = await supabase.from("amazon_listing_details").upsert({
+        seller_id: sellerId,
+        sku,
+        asin: d.asin,
+        title: d.title,
+        brand: d.brand,
+        product_type: d.productType,
+        listing_status: d.listingStatus,
+        bullets: d.bullets,
+        description: d.description,
+        generic_keywords: d.genericKeywords,
+        image_urls: d.imageUrls,
+        image_count: d.imageUrls.length,
+        attributes: response?.attributes ?? null,
+        issues: d.issues,
+        issue_count: d.issues.length,
+        error_issue_count: d.errorIssueCount,
+        price: d.price,
+        quantity: d.quantity,
+        parent_asin: d.parentAsin,
+        completeness_score: c.score,
+        missing_fields: c.missing,
+        last_fetched_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      }, { onConflict: "seller_id,sku" });
+      if (error) failed.push({ sku, reason: "Could not save" });
+      else saved += 1;
+    } catch (error) {
+      failed.push({ sku, reason: error instanceof Error ? error.message.slice(0, 120) : "Unknown error" });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return { ok: true, sellerId, totalListings: skus.length, attempted: batch.length, saved, failedCount: failed.length, failed: failed.slice(0, 10) };
 }

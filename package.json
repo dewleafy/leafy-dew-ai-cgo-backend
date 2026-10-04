@@ -13,7 +13,8 @@
     "test:strategy": "tsx scripts/strategy.test.ts",
     "test:strategic-layer": "tsx scripts/strategic-layer.test.ts",
     "test:playbooks": "tsx scripts/playbooks.test.ts",
-    "test:brand-health": "tsx scripts/brand-health.test.ts"
+    "test:brand-health": "tsx scripts/brand-health.test.ts",
+    "test:listing-details": "tsx scripts/listing-details.test.ts"
   },
   "keywords": [
     "amazon-sp-api",
