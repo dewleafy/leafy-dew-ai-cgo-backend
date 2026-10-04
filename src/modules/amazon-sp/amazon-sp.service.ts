@@ -3635,13 +3635,23 @@ export async function syncAmazonSpListingDetails(input: { sellerId: string; limi
         parent_asin: d.parentAsin,
         completeness_score: c.score,
         missing_fields: c.missing,
+        fetch_error: null,
         last_fetched_at: new Date().toISOString(),
         updated_at: new Date().toISOString()
       }, { onConflict: "seller_id,sku" });
       if (error) failed.push({ sku, reason: "Could not save" });
       else saved += 1;
     } catch (error) {
-      failed.push({ sku, reason: error instanceof Error ? error.message.slice(0, 120) : "Unknown error" });
+      const reason = error instanceof Error ? error.message.slice(0, 120) : "Unknown error";
+      failed.push({ sku, reason });
+      // Record the failed try so this SKU rotates to the back of the queue instead of blocking it.
+      await supabase.from("amazon_listing_details").upsert({
+        seller_id: sellerId,
+        sku,
+        fetch_error: /404/.test(reason) ? "Not found on Amazon (listing may be deleted or never published)" : reason,
+        last_fetched_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      }, { onConflict: "seller_id,sku" });
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
