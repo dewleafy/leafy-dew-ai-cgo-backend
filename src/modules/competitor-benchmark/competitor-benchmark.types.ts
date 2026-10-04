@@ -84,6 +84,7 @@ export type CompetitorBenchmarkImageBriefRow = {
   own_sku: string;
   recommended_changes: string[];
   based_on_asins: string[];
+  content_gap_notes: string[] | null;
   created_at: string;
   updated_at: string;
 };
@@ -146,6 +147,7 @@ export type SafeCompetitorBenchmarkImageBrief = {
   ownSku: string;
   recommendedChanges: string[];
   basedOnAsins: string[];
+  contentGapNotes: string[];
   updatedAt: string;
 } | null;
 
