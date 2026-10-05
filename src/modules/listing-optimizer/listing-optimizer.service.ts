@@ -617,7 +617,16 @@ async function judgeOwnListingImagesWithVision(input: {
       purpose: "listing_optimizer_image_vision",
       prompt: buildVisionPrompt(),
       imageUrls: input.imageUrls.slice(0, MAX_IMAGES_FOR_VISION_JUDGING),
-      maxOutputTokens: 200,
+      // Found via live testing on 2026-10-05: a second live run of the same SKU came back with
+      // output_tokens exactly at the 200 cap and an EMPTY output string (confirmed in
+      // ai_cost_ledger -- outputPreview was ""), while two earlier successful calls on this same
+      // model finished at 135-141 tokens. This is max_completion_tokens being shared with the
+      // model's internal reasoning tokens on a reasoning-capable model (the same gotcha already
+      // called out in ai-gateway.service.ts's comment on max_completion_tokens): 200 was too
+      // tight a budget and the model spent all of it reasoning before emitting any visible JSON,
+      // so the run silently fell back to "missing" instead of using a real judgement. Raised with
+      // headroom so a closer call doesn't repeat this.
+      maxOutputTokens: 600,
       requestId: `listing-optimizer-vision:${input.listingLabel}`,
       // Same reasoning as judgeListingWithRubric: only ever triggered from a founder-initiated
       // "Run analysis" click, never a background job.
