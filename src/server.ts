@@ -29,6 +29,7 @@ import { learningSummaryRoutes } from "./modules/learning-summary/learning-summa
 import { launchChecklistRouter } from "./modules/launch-checklist/launch-checklist.routes";
 import { launchGateRouter } from "./modules/launch-gate/launch-gate.routes";
 import { listingDraftsRouter } from "./modules/listing-drafts/listing-drafts.routes";
+import { listingOptimizerRouter } from "./modules/listing-optimizer/listing-optimizer.routes";
 import { listingExecutionRoutes } from "./modules/listing-execution/listing-execution.routes";
 import { listingSchemaRouter } from "./modules/listing-schema/listing-schema.routes";
 import { passportDraftExecutionRoutes } from "./modules/passport-draft-execution/passport-draft-execution.routes";
@@ -231,6 +232,7 @@ app.use("/api/learning-summary", learningSummaryRoutes);
 app.use("/api/launch-checklist", launchChecklistRouter);
 app.use("/api/launch-gate", launchGateRouter);
 app.use("/api/listing-drafts", listingDraftsRouter);
+app.use("/api/listing-optimizer", listingOptimizerRouter);
 app.use("/api/listing-schema", listingSchemaRouter);
 app.use("/api/background-sync", backgroundSyncRouter);
 app.use("/api/aplus-content", aplusContentRouter);
