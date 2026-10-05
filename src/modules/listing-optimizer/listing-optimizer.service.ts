@@ -2,7 +2,12 @@ import { supabase } from "../../db/supabase";
 import { generateAiResponse } from "../ai-gateway/ai-gateway.service";
 import { requireConnectedConnection } from "../amazon-sp/amazon-sp.service";
 import { safeErrorMessage, toNumberOrNull } from "../amazon-sp/amazon-sp-utils";
-import { extractTitleAndBulletsFromCatalogPayload } from "../competitor-benchmark/competitor-benchmark.service";
+import {
+  confirmCompetitorBenchmarkCandidates,
+  createCompetitorBenchmarkRun,
+  extractTitleAndBulletsFromCatalogPayload,
+  runCompetitorBenchmarkComparison
+} from "../competitor-benchmark/competitor-benchmark.service";
 import {
   CompetitorBenchmarkCandidateRow,
   CompetitorBenchmarkDataRow,
@@ -709,6 +714,100 @@ async function findBenchmarkRun(sellerId: string, ownSku: string, benchmarkRunId
   return ((data ?? [])[0] as CompetitorBenchmarkRunRow | undefined) ?? null;
 }
 
+async function findAnyBenchmarkRunForSku(sellerId: string, ownSku: string): Promise<CompetitorBenchmarkRunRow | null> {
+  const { data } = await supabase
+    .from("competitor_benchmark_runs")
+    .select("*")
+    .eq("seller_id", sellerId)
+    .contains("own_skus", [ownSku])
+    .order("created_at", { ascending: false })
+    .limit(1);
+
+  return ((data ?? [])[0] as CompetitorBenchmarkRunRow | undefined) ?? null;
+}
+
+// Added 2026-10-05: before this, running an analysis for a SKU that had no Competitor Benchmark
+// Tool history at all just failed with "go run that tool first" -- a separate page, a separate
+// manual "Confirm" pass per candidate, a separate manual "Run comparison" click. Per the founder's
+// explicit instruction ("all part/task should work automatically, not manually feeding inputs"),
+// a single "Run analysis" click now drives the whole pipeline itself: create the benchmark run if
+// none exists yet, auto-confirm every candidate Amazon's own catalog search already suggested
+// (unless a real person already rejected it in the Competitor Benchmark Tool -- that decision is
+// never overridden), and pull the real comparison data, all before scoring. The Competitor
+// Benchmark Tool page itself is untouched and still useful for manually reviewing/rejecting
+// specific competitor ASINs, but it is no longer a required manual step.
+async function ensureAutomaticCompetitorData(input: {
+  sellerId: string;
+  ownSku: string;
+}): Promise<{ run: CompetitorBenchmarkRunRow | null; autoActions: string[]; blockedReason: string | null }> {
+  const autoActions: string[] = [];
+
+  let run = await findAnyBenchmarkRunForSku(input.sellerId, input.ownSku);
+
+  if (!run) {
+    autoActions.push(`No Competitor Benchmark history existed yet for ${input.ownSku} -- ran competitor discovery automatically instead of asking you to do it on a separate page.`);
+    const created = await createCompetitorBenchmarkRun({ sellerId: input.sellerId, skus: [input.ownSku] });
+    const skipped = created.skippedSkus.find((s) => s.sku === input.ownSku);
+    if (skipped) {
+      return { run: null, autoActions, blockedReason: skipped.reason };
+    }
+    run = await findAnyBenchmarkRunForSku(input.sellerId, input.ownSku);
+    if (!run) {
+      return { run: null, autoActions, blockedReason: "Could not create a Competitor Benchmark run for this SKU." };
+    }
+  }
+
+  const { data: candidateRows } = await supabase
+    .from("competitor_benchmark_candidates")
+    .select("id, asin, confirmed, source")
+    .eq("run_id", run.id)
+    .eq("own_sku", input.ownSku);
+
+  const candidates = (candidateRows ?? []) as { id: string; asin: string; confirmed: boolean | null; source: string }[];
+  const competitorCandidates = candidates.filter((c) => c.source !== "OWN_BASELINE");
+
+  // Auto-confirm anything not already explicitly rejected (confirmed === false) by a real person.
+  // Most candidates already default to confirmed = true at discovery time; this only catches the
+  // ones still sitting at "needs review" (confirmed === null) so an automatic run never stalls
+  // on a manual review step the founder didn't ask to do.
+  const needsAutoConfirm = competitorCandidates.filter((c) => c.confirmed === null).map((c) => c.asin);
+  if (needsAutoConfirm.length > 0) {
+    autoActions.push(`Auto-confirmed ${needsAutoConfirm.length} Amazon-suggested competitor ASIN(s) for ${input.ownSku} that hadn't been reviewed yet (none had been rejected).`);
+    await confirmCompetitorBenchmarkCandidates({
+      runId: run.id,
+      sellerId: input.sellerId,
+      ownSku: input.ownSku,
+      confirmedAsins: needsAutoConfirm,
+      removedAsins: [],
+      addedAsins: []
+    });
+  }
+
+  const confirmedCompetitorCount = competitorCandidates.filter((c) => c.confirmed !== false).length;
+  const candidateIds = candidates.map((c) => c.id);
+
+  const { data: dataRows } = await supabase
+    .from("competitor_benchmark_data")
+    .select("candidate_id, fetch_status")
+    .in("candidate_id", candidateIds.length > 0 ? candidateIds : [""]);
+
+  const fetchStatusByCandidateId = new Map(((dataRows ?? []) as { candidate_id: string; fetch_status: string }[]).map((r) => [r.candidate_id, r.fetch_status]));
+
+  const ownCandidate = candidates.find((c) => c.source === "OWN_BASELINE") ?? null;
+  const ownFetched = ownCandidate ? fetchStatusByCandidateId.get(ownCandidate.id) === "FETCHED" : false;
+  const hasFetchedConfirmedCompetitor = competitorCandidates.some((c) => c.confirmed !== false && fetchStatusByCandidateId.get(c.id) === "FETCHED");
+
+  const needsCompare = !ownFetched || needsAutoConfirm.length > 0 || (confirmedCompetitorCount > 0 && !hasFetchedConfirmedCompetitor);
+
+  if (needsCompare) {
+    autoActions.push(`Pulled real Amazon price/image/bullet/title data automatically for ${input.ownSku} and its confirmed competitors.`);
+    await runCompetitorBenchmarkComparison({ runId: run.id, sellerId: input.sellerId });
+    run = await findAnyBenchmarkRunForSku(input.sellerId, input.ownSku);
+  }
+
+  return { run, autoActions, blockedReason: null };
+}
+
 async function loadAplusStatus(sellerId: string, asin: string | null): Promise<boolean | null> {
   if (!asin) return null;
   const { data } = await supabase
@@ -735,26 +834,54 @@ export async function runListingOptimizerAnalysis(input: RunAnalysisInput): Prom
   const ownAsin = passport?.asin ?? null;
   const brand = resolveBrandName({ sku: ownSku, product_name: passport?.productName ?? null });
 
-  const run = await findBenchmarkRun(sellerId, ownSku, input.benchmarkRunId ?? null);
-  if (!run) {
-    return persistAndReturn({
-      sellerId,
-      ownSku,
-      ownAsin,
-      brand,
-      input,
-      benchmarkRunId: null,
-      subScores: {},
-      overallScore: null,
-      grade: null,
-      gaps: [],
-      competitorSummary: [],
-      status: "FAILED",
-      errorMessage: null,
-      warnings: [
-        `No Competitor Benchmark Tool run was found for SKU ${ownSku}. Go run (or re-run) the Competitor Benchmark Tool for this SKU first -- this feature reuses that data and never pulls from Amazon itself.`
-      ]
-    });
+  // A specific benchmarkRunId means the caller deliberately pinned this analysis to a past run
+  // (not currently used by the frontend, but kept for API callers that want that control) -- the
+  // automatic pipeline below only kicks in for the normal case, where none was given.
+  let run: CompetitorBenchmarkRunRow | null;
+  if (input.benchmarkRunId) {
+    run = await findBenchmarkRun(sellerId, ownSku, input.benchmarkRunId);
+    if (!run) {
+      return persistAndReturn({
+        sellerId,
+        ownSku,
+        ownAsin,
+        brand,
+        input,
+        benchmarkRunId: null,
+        subScores: {},
+        overallScore: null,
+        grade: null,
+        gaps: [],
+        competitorSummary: [],
+        status: "FAILED",
+        errorMessage: null,
+        warnings: [`No Competitor Benchmark run with id ${input.benchmarkRunId} was found for SKU ${ownSku}.`]
+      });
+    }
+  } else {
+    const ensured = await ensureAutomaticCompetitorData({ sellerId, ownSku });
+    warnings.push(...ensured.autoActions);
+    run = ensured.run;
+    if (!run) {
+      return persistAndReturn({
+        sellerId,
+        ownSku,
+        ownAsin,
+        brand,
+        input,
+        benchmarkRunId: null,
+        subScores: {},
+        overallScore: null,
+        grade: null,
+        gaps: [],
+        competitorSummary: [],
+        status: "FAILED",
+        errorMessage: null,
+        warnings: [
+          ensured.blockedReason ?? `Could not automatically gather competitor data for SKU ${ownSku}.`
+        ]
+      });
+    }
   }
 
   const { data: candidateRows } = await supabase
@@ -778,7 +905,7 @@ export async function runListingOptimizerAnalysis(input: RunAnalysisInput): Prom
 
   if (!ownCandidate || !ownData || ownData.fetch_status !== "FETCHED") {
     warnings.push(
-      `This SKU's own listing data hasn't been fetched successfully in run ${run.id} yet (${ownData?.fetch_error ?? "no data on file"}). Go to the Competitor Benchmark Tool, run the comparison for this SKU, then re-run this analysis.`
+      `The automatic fetch of this SKU's own Amazon listing data did not succeed in run ${run.id} (${ownData?.fetch_error ?? "no data on file"}). This is usually a temporary Amazon API issue -- try "Run analysis" again in a moment; no manual step on the Competitor Benchmark Tool page is needed.`
     );
     return persistAndReturn({
       sellerId,
