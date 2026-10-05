@@ -200,6 +200,22 @@ function extractTitle(payload: Record<string, unknown>, marketplaceId: string): 
   return typeof itemName === "string" && itemName.trim() ? itemName.trim() : null;
 }
 
+// Added 2026-10-05 for the Listing Optimizer module (src/modules/listing-optimizer/), which scores
+// listings from the REAL title/bullet text this module already fetched and persisted in
+// competitor_benchmark_data.raw_catalog_payload -- never a new Amazon API call, never rebuilt
+// extraction logic. Thin public wrapper around the private extractTitle/extractBulletText helpers
+// above so the Listing Optimizer never duplicates (and risks drifting from) this parsing logic.
+export function extractTitleAndBulletsFromCatalogPayload(
+  payload: Record<string, unknown> | null,
+  marketplaceId: string
+): { title: string | null; bullets: string[] } {
+  if (!payload) return { title: null, bullets: [] };
+  return {
+    title: extractTitle(payload, marketplaceId),
+    bullets: extractBulletText(payload)
+  };
+}
+
 function extractSalesRank(payload: Record<string, unknown>, marketplaceId: string): { rank: number | null; title: string | null } {
   const entries = marketplaceEntries(payload, "salesRanks", marketplaceId);
   const entry = entries[0];
