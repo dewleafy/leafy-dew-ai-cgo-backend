@@ -1588,6 +1588,97 @@ export async function getSearchTermSummary(input: {
   };
 }
 
+// Added 2026-10-05 for the Listing Optimizer's Keyword Score: when the founder hasn't typed a
+// high-volume keyword list by hand for a SKU, this derives a real one from that ASIN's own
+// Amazon Ads data instead of leaving the field manual-only. This is official Ads Reporting API
+// data already synced into this app (no scrape, no guess) -- but it has a real limit worth
+// being honest about: Sponsored Products reports have no single row that carries both "this
+// search term" AND "this ASIN" together, so this joins two report types on (campaign_id,
+// ad_group_id) as a proxy for "this ad group advertises this ASIN." That's a safe assumption
+// only when each ad group advertises one product, which is the common/recommended Sponsored
+// Products setup but not something Amazon enforces -- if an ad group ever advertises more than
+// one ASIN, a search term converting for a *different* product in that same ad group could be
+// misattributed here. Only search terms that drove at least one real order (orders > 0) are
+// returned, never just a click.
+export async function listConvertingKeywordsForAsin(input: {
+  sellerId: string;
+  asin: string;
+  days: number;
+  limit: number;
+}): Promise<Array<{ keyword: string; cost: number; sales: number; orders: number; clicks: number }>> {
+  const endDate = new Date().toISOString().slice(0, 10);
+  const startDate = new Date(Date.now() - (Math.max(input.days, 1) - 1) * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10);
+
+  const { data: advertisedRows, error: advertisedError } = await supabase
+    .from("amazon_ads_advertised_product_daily_metrics")
+    .select("campaign_id, ad_group_id")
+    .eq("seller_id", input.sellerId)
+    .eq("advertised_asin", input.asin)
+    .gte("report_date", startDate)
+    .lte("report_date", endDate);
+
+  if (advertisedError) {
+    logSafeAmazonAdsSupabaseError("Could not load advertised product metrics for keyword derivation.", advertisedError);
+    return [];
+  }
+
+  const adGroupKeys = new Set(
+    ((advertisedRows ?? []) as Array<{ campaign_id: string; ad_group_id: string }>).map(
+      (row) => `${row.campaign_id}::${row.ad_group_id}`
+    )
+  );
+
+  if (adGroupKeys.size === 0) {
+    return [];
+  }
+
+  const { data: searchTermRows, error: searchTermError } = await supabase
+    .from("amazon_ads_search_term_daily_metrics")
+    .select("campaign_id, ad_group_id, search_term, cost, sales, orders, clicks")
+    .eq("seller_id", input.sellerId)
+    .gte("report_date", startDate)
+    .lte("report_date", endDate);
+
+  if (searchTermError) {
+    logSafeAmazonAdsSupabaseError("Could not load search term metrics for keyword derivation.", searchTermError);
+    return [];
+  }
+
+  const aggregated = new Map<string, { keyword: string; cost: number; sales: number; orders: number; clicks: number }>();
+
+  for (const row of (searchTermRows ?? []) as Array<{
+    campaign_id: string;
+    ad_group_id: string;
+    search_term: string | null;
+    cost: number | string | null;
+    sales: number | string | null;
+    orders: number | string | null;
+    clicks: number | string | null;
+  }>) {
+    const key = `${row.campaign_id}::${row.ad_group_id}`;
+    if (!adGroupKeys.has(key)) continue;
+
+    const orders = toNumber(row.orders);
+    if (orders <= 0) continue; // converting, not just clicked
+
+    const keyword = typeof row.search_term === "string" ? row.search_term.trim() : "";
+    if (!keyword) continue;
+
+    const existing = aggregated.get(keyword) ?? { keyword, cost: 0, sales: 0, orders: 0, clicks: 0 };
+    existing.cost = roundTwo(existing.cost + toNumber(row.cost));
+    existing.sales = roundTwo(existing.sales + toNumber(row.sales));
+    existing.orders += orders;
+    existing.clicks += toNumber(row.clicks);
+    aggregated.set(keyword, existing);
+  }
+
+  return Array.from(aggregated.values())
+    .sort((a, b) => b.sales - a.sales)
+    .slice(0, Math.max(1, input.limit));
+}
+
 export async function getCampaignDashboardSummary(input: {
   connectionId: string;
   profileId: string;
