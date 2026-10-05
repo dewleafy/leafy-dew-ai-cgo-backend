@@ -223,6 +223,12 @@ export function estimateAiUsage(input: AiEstimateInput): {
 
 const ALLOWED_FUTURE_MODULES = new Set([
   "LISTING_DRAFTS",
+  // Added 2026-10-05 for the Listing Optimizer's scoring rubric (PART C-1-style judgement calls,
+  // text-only -- title/bullet readability, clarity, feature/benefit). Also added to this seller's
+  // ai_gateway_settings.allowed_modules in Supabase directly (allowed_modules is a per-seller
+  // allow-list on TOP OF this hardcoded one -- both must include a module for its calls to go
+  // through).
+  "LISTING_OPTIMIZER",
   "CREATIVE_RECOMMENDATIONS",
   "CEO_REPORT",
   "ENGINE_SUMMARY",
