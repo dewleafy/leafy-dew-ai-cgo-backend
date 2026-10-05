@@ -1272,7 +1272,10 @@ export async function runListingOptimizerAnalysis(input: RunAnalysisInput): Prom
     competitorSummary,
     status: "DONE",
     errorMessage: null,
-    warnings
+    warnings,
+    resolvedOwnHasLifestyleImage: ownLifestylePresent,
+    resolvedOwnImageQualityScore: ownQualityScore,
+    resolvedHighVolumeKeywords: keywords
   });
 }
 
@@ -1291,8 +1294,26 @@ async function persistAndReturn(args: {
   status: string;
   errorMessage: string | null;
   warnings: string[];
+  // The three fields below default to the raw RunAnalysisInput values (manual entry only, or
+  // absent) when omitted -- the early-exit/failure call sites above never reach AI vision
+  // judging or Ads-derived keywords, so they have nothing better to pass. The one successful
+  // scoring path passes the ACTUAL resolved values used for scoring (which may be AI-judged or
+  // Ads-derived, not just what the founder typed in) -- without this, a real bug found via live
+  // testing on 2026-10-05: the AI's lifestyle/quality judgement and the auto-derived keyword
+  // list were used correctly to compute the sub-scores, but the row's own top-level
+  // own_has_lifestyle_image / own_image_quality_score / high_volume_keywords columns still saved
+  // the original (null/empty) input, so the next run couldn't see what the AI already determined
+  // and had to re-judge the same photos again at AI Gateway cost.
+  resolvedOwnHasLifestyleImage?: boolean | null;
+  resolvedOwnImageQualityScore?: number | null;
+  resolvedHighVolumeKeywords?: string[];
 }): Promise<SafeListingOptimizerAnalysis> {
   const now = new Date().toISOString();
+  const ownHasLifestyleImage =
+    args.resolvedOwnHasLifestyleImage === undefined ? args.input.ownHasLifestyleImage ?? null : args.resolvedOwnHasLifestyleImage;
+  const ownImageQualityScore =
+    args.resolvedOwnImageQualityScore === undefined ? args.input.ownImageQualityScore ?? null : args.resolvedOwnImageQualityScore;
+  const highVolumeKeywords = args.resolvedHighVolumeKeywords ?? args.input.highVolumeKeywords ?? [];
   const { data, error } = await supabase
     .from("listing_optimizer_analyses")
     .insert({
@@ -1304,9 +1325,9 @@ async function persistAndReturn(args: {
       own_review_count: args.input.ownReviewCount ?? null,
       own_rating: args.input.ownRating ?? null,
       own_has_video: args.input.ownHasVideo ?? null,
-      own_has_lifestyle_image: args.input.ownHasLifestyleImage ?? null,
-      own_image_quality_score: args.input.ownImageQualityScore ?? null,
-      high_volume_keywords: args.input.highVolumeKeywords ?? [],
+      own_has_lifestyle_image: ownHasLifestyleImage,
+      own_image_quality_score: ownImageQualityScore,
+      high_volume_keywords: highVolumeKeywords,
       sub_scores: args.subScores,
       overall_score: args.overallScore,
       grade: args.grade,
