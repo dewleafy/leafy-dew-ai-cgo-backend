@@ -339,7 +339,14 @@ export async function createCompetitorBenchmarkRun(input: { sellerId: string; sk
         asin,
         title: null,
         source: "EXISTING_PASSPORT",
-        confirmed: null,
+        // Opt-out, not opt-in (changed 2026-10-04): auto-discovered/known candidates now start
+        // CONFIRMED by default and "Run comparison" uses them immediately. Found from a real run:
+        // two separate real benchmark runs came back with "no clear gap found" because every
+        // single discovered candidate still sat at confirmed = null (the old opt-in default) --
+        // nothing had been explicitly confirmed, so the compare step correctly had zero
+        // competitors to compare against, but the resulting message read like a real finding
+        // instead of "you haven't picked any competitors yet." Reject still removes a bad match.
+        confirmed: true,
         added_manually: false
       });
     }
@@ -397,7 +404,8 @@ export async function createCompetitorBenchmarkRun(input: { sellerId: string; sk
             asin,
             title,
             source: "CATALOG_SEARCH",
-            confirmed: null,
+            // See the matching comment on EXISTING_PASSPORT above -- opt-out, not opt-in.
+            confirmed: true,
             added_manually: false
           });
         }
@@ -981,9 +989,18 @@ export async function runCompetitorBenchmarkComparison(input: { runId: string; s
       if (error) logError("Could not save competitor benchmark findings.", error);
     }
 
-    const recommendedChanges = imageGapChanges.length > 0
-      ? imageGapChanges
-      : ["No clear image or listing-completeness gap was found versus your confirmed competitors on this pass."];
+    // Distinguish "we compared and found nothing" from "there was nothing to compare against" --
+    // found from a real run (2026-10-04) that read as a dead end: every discovered candidate
+    // still needs your review before compare can use it, and if none have been confirmed yet
+    // the old single generic message made that look like a completed, gap-free comparison
+    // instead of an empty one. (Competitors are now confirmed by default -- see the comment on
+    // the CATALOG_SEARCH/EXISTING_PASSPORT insert above -- so this should mainly show up if
+    // every suggested competitor for this SKU got rejected.)
+    const recommendedChanges = competitorData.length === 0
+      ? [`No competitors are currently confirmed for ${ownSku} -- there's nothing to compare against yet. Go back to the candidate list above, confirm (or add) at least one real competitor ASIN, then run the comparison again.`]
+      : imageGapChanges.length > 0
+        ? imageGapChanges
+        : ["No clear image or listing-completeness gap was found versus your confirmed competitors on this pass."];
 
     // ---- Listing-copy comparison: real words pulled from confirmed competitors' own title +
     // bullet text, that don't appear in yours. NOT keyword/search/rank data -- SP-API gives
@@ -999,8 +1016,10 @@ export async function runCompetitorBenchmarkComparison(input: { runId: string; s
     const contentGapNotes: string[] = [];
     if (!ownCopy || (!ownCopy.title && ownCopy.bullets.length === 0)) {
       contentGapNotes.push("Couldn't read your own title/bullet text from Amazon this run, so no listing-copy comparison could be built.");
+    } else if (competitorData.length === 0) {
+      contentGapNotes.push(`No competitors are currently confirmed for ${ownSku} -- confirm (or add) at least one real competitor ASIN above, then run the comparison again.`);
     } else if (competitorCopies.length === 0) {
-      contentGapNotes.push("None of your confirmed competitors returned readable title/bullet text this run, so no listing-copy comparison could be built.");
+      contentGapNotes.push("Your confirmed competitors didn't return readable title/bullet text this run, so no listing-copy comparison could be built.");
     } else {
       const ownWords = tokenizeListingCopy([ownCopy.title ?? "", ...ownCopy.bullets]);
       const wordCompetitorCount = new Map<string, number>();
