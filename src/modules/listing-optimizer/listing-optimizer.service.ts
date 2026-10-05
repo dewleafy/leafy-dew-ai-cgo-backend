@@ -751,10 +751,23 @@ async function ensureAutomaticCompetitorData(input: {
     if (skipped) {
       return { run: null, autoActions, blockedReason: skipped.reason };
     }
-    run = await findAnyBenchmarkRunForSku(input.sellerId, input.ownSku);
-    if (!run) {
-      return { run: null, autoActions, blockedReason: "Could not create a Competitor Benchmark run for this SKU." };
-    }
+    // Build the row directly from what createCompetitorBenchmarkRun just returned, instead of
+    // re-querying Supabase for it. A live test on 2026-10-05 caught a real bug here: the
+    // immediate re-query (findAnyBenchmarkRunForSku) came back empty even though the run row had
+    // genuinely just been written (confirmed seconds later with a direct SQL check) -- a
+    // read-after-write race against Supabase's API layer, not a real "could not create" failure.
+    // The create call already has every field this run row needs, so there's no reason to read it
+    // back at all.
+    run = {
+      id: created.run.id,
+      seller_id: created.run.sellerId,
+      own_skus: created.run.ownSkus,
+      status: created.run.status,
+      error_message: created.run.errorMessage,
+      created_at: created.run.createdAt,
+      updated_at: created.run.updatedAt,
+      completed_at: created.run.completedAt
+    };
   }
 
   const { data: candidateRows } = await supabase
@@ -801,8 +814,20 @@ async function ensureAutomaticCompetitorData(input: {
 
   if (needsCompare) {
     autoActions.push(`Pulled real Amazon price/image/bullet/title data automatically for ${input.ownSku} and its confirmed competitors.`);
-    await runCompetitorBenchmarkComparison({ runId: run.id, sellerId: input.sellerId });
-    run = await findAnyBenchmarkRunForSku(input.sellerId, input.ownSku);
+    // Same fix as above: use the row the comparison call just returned directly, rather than
+    // re-querying Supabase for it (see the comment above on the read-after-write race that caused
+    // a real false "could not create" failure here on 2026-10-05).
+    const compared = await runCompetitorBenchmarkComparison({ runId: run.id, sellerId: input.sellerId });
+    run = {
+      id: compared.id,
+      seller_id: compared.sellerId,
+      own_skus: compared.ownSkus,
+      status: compared.status,
+      error_message: compared.errorMessage,
+      created_at: compared.createdAt,
+      updated_at: compared.updatedAt,
+      completed_at: compared.completedAt
+    };
   }
 
   return { run, autoActions, blockedReason: null };
