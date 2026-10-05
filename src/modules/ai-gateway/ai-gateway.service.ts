@@ -332,6 +332,232 @@ async function callOpenAiChatCompletion(input: {
   };
 }
 
+async function callOpenAiVisionChatCompletion(input: {
+  prompt: string;
+  imageUrls: string[];
+  maxOutputTokens: number;
+  model: string;
+}): Promise<{ text: string; inputTokens: number; outputTokens: number }> {
+  const content: Array<Record<string, unknown>> = [
+    { type: "text", text: input.prompt },
+    ...input.imageUrls.map((url) => ({ type: "image_url", image_url: { url } }))
+  ];
+
+  const response = await axios.post(
+    OPENAI_CHAT_COMPLETIONS_URL,
+    {
+      model: input.model,
+      messages: [{ role: "user", content }],
+      max_completion_tokens: input.maxOutputTokens
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${env.OPENAI_API_KEY ?? ""}`,
+        "content-type": "application/json"
+      },
+      // Vision calls (multiple images per request) run slower than text-only rubric calls.
+      timeout: 90000
+    }
+  );
+
+  const data = response.data as {
+    choices?: Array<{ message?: { content?: string | null } }>;
+    usage?: { prompt_tokens?: number; completion_tokens?: number };
+  };
+
+  const text = cleanText(data.choices?.[0]?.message?.content) ?? "";
+
+  return {
+    text,
+    inputTokens: toNumber(data.usage?.prompt_tokens),
+    outputTokens: toNumber(data.usage?.completion_tokens)
+  };
+}
+
+// Vision twin of generateAiResponse below: same guardrail/budget/ledger logic (security
+// guardrail, AI_CALLS_DISABLED, module allow-list, daily/monthly budget, provider-configured
+// check), but sends image content parts to OpenAI instead of a text-only prompt, and uses
+// OPENAI_VISION_MODEL (falling back to OPENAI_MODEL) instead of the text model override chain.
+// Kept as a separate function rather than branching inside generateAiResponse so the existing,
+// already-live text-judging path (title/bullet rubric) can't regress from this change.
+export async function generateAiVisionResponse(input: AiGenerateInput & { imageUrls: string[] }): Promise<{
+  ok: boolean;
+  blockedReason: string | null;
+  entry: SafeAiCostLedgerEntry;
+  output: string | null;
+  message: string;
+}> {
+  const sellerId = cleanText(input.sellerId) ?? "default";
+  const settings = await ensureAiGatewaySettings(sellerId);
+  const prompt = cleanText(input.prompt);
+  const imageUrls = (input.imageUrls ?? []).filter((url) => typeof url === "string" && url.trim().length > 0);
+  const maxOutputTokens = Math.min(Math.max(Math.floor(input.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS), 1), 4096);
+  // Vision prompts cost more (each image is billed as input tokens on top of the text prompt) --
+  // estimate conservatively per image until a real response tells us the actual usage.
+  const estimate = estimateAiUsage({
+    ...input,
+    sellerId,
+    inputTokens: (input.inputTokens ?? estimateTokensFromPrompt(prompt)) + imageUrls.length * 1200,
+    outputTokens: input.outputTokens ?? maxOutputTokens
+  });
+  const moduleName = estimate.moduleName;
+  const allowedModules = toJsonArray(settings.allowedModules).map(String);
+  const blockedModules = toJsonArray(settings.blockedModules).map(String);
+  const security = await checkSecurityGuardrail({
+    sellerId,
+    actor: input.actor ?? "system",
+    action: "AI_GENERATE",
+    route: "/api/ai-gateway/generate",
+    metadata: { moduleName, vision: true }
+  }).catch(() => null);
+  let blockedReason: string | null = null;
+
+  if (security && !security.allowed) {
+    blockedReason = security.reason ?? "SECURITY_GUARDRAIL_BLOCKED";
+  } else if (!settings.aiCallsEnabled) {
+    blockedReason = "AI_CALLS_DISABLED";
+  } else if (!ALLOWED_FUTURE_MODULES.has(moduleName)) {
+    blockedReason = "AI_MODULE_NOT_ALLOWED";
+  } else if (allowedModules.length > 0 && !allowedModules.includes(moduleName)) {
+    blockedReason = "AI_MODULE_NOT_ALLOWED_BY_SETTINGS";
+  } else if (blockedModules.includes(moduleName)) {
+    blockedReason = "AI_MODULE_BLOCKED_BY_SETTINGS";
+  } else if (!prompt) {
+    blockedReason = "AI_PROMPT_REQUIRED";
+  } else if (imageUrls.length === 0) {
+    blockedReason = "AI_VISION_NO_IMAGES_PROVIDED";
+  }
+
+  if (!blockedReason) {
+    const todayStart = new Date();
+    todayStart.setUTCHours(0, 0, 0, 0);
+    const monthStart = new Date();
+    monthStart.setUTCDate(1);
+    monthStart.setUTCHours(0, 0, 0, 0);
+    const [todayCost, monthCost] = await Promise.all([
+      sumEstimatedCostSince(sellerId, todayStart.toISOString()),
+      sumEstimatedCostSince(sellerId, monthStart.toISOString())
+    ]);
+    if (settings.dailyBudget <= 0 || todayCost + estimate.estimatedCost > settings.dailyBudget) {
+      blockedReason = "AI_DAILY_BUDGET_EXCEEDED";
+    } else if (settings.monthlyBudget <= 0 || monthCost + estimate.estimatedCost > settings.monthlyBudget) {
+      blockedReason = "AI_MONTHLY_BUDGET_EXCEEDED";
+    }
+  }
+
+  if (!blockedReason && !env.OPENAI_API_KEY) {
+    blockedReason = "AI_PROVIDER_NOT_CONFIGURED";
+  }
+
+  if (blockedReason) {
+    const entry = await recordBlockedAiAttempt({
+      ...input,
+      sellerId,
+      blockedReason,
+      metadata: {
+        ...(input.metadata ?? {}),
+        generateEndpoint: true,
+        vision: true,
+        imageCount: imageUrls.length,
+        estimatedCost: estimate.estimatedCost,
+        providerConfigured: Boolean(env.OPENAI_API_KEY)
+      }
+    });
+
+    return {
+      ok: false,
+      blockedReason,
+      entry,
+      output: null,
+      message: "AI vision generation blocked safely. No provider call executed."
+    };
+  }
+
+  const promptText = prompt ?? "";
+  const model = cleanText(input.modelName) ?? cleanText(settings.defaultModel) ?? env.OPENAI_VISION_MODEL ?? env.OPENAI_MODEL;
+  const provider = cleanText(input.provider) ?? cleanText(settings.defaultProvider) ?? "openai";
+
+  try {
+    const result = await callOpenAiVisionChatCompletion({ prompt: promptText, imageUrls, maxOutputTokens, model });
+    const actualCost = estimateCost(result.inputTokens, result.outputTokens);
+
+    const { data, error } = await supabase
+      .from("ai_cost_ledger")
+      .insert({
+        seller_id: sellerId,
+        request_id: cleanText(input.requestId),
+        module_name: moduleName,
+        purpose: estimate.purpose,
+        provider,
+        model_name: model,
+        input_tokens: result.inputTokens,
+        output_tokens: result.outputTokens,
+        estimated_cost: estimate.estimatedCost,
+        actual_cost: actualCost,
+        status: "COMPLETED",
+        blocked_reason: null,
+        metadata: {
+          ...(input.metadata ?? {}),
+          generateEndpoint: true,
+          vision: true,
+          imageCount: imageUrls.length,
+          aiCallsEnabled: true,
+          externalAiCall: true,
+          outputPreview: result.text.slice(0, 500)
+        }
+      })
+      .select("*")
+      .single<AiCostLedgerRow>();
+
+    if (error || !data) throw new Error(error?.message ?? "Could not record AI vision call result.");
+    const entry = toSafeLedger(data);
+
+    await safeRecordActivityLog({
+      sellerId,
+      eventType: "AI_GATEWAY_CALL_COMPLETED",
+      eventCategory: "AI_GATEWAY",
+      severity: "INFO",
+      actor: "system",
+      title: "AI vision call completed",
+      message: "AI vision judging call completed successfully.",
+      sourceModule: "ai-gateway",
+      metadata: { requestId: entry.requestId, moduleName: entry.moduleName, actualCost: entry.actualCost, imageCount: imageUrls.length }
+    });
+
+    return {
+      ok: true,
+      blockedReason: null,
+      entry,
+      output: result.text || null,
+      message: "AI vision generation completed."
+    };
+  } catch (callError) {
+    const failureReason = "AI_PROVIDER_CALL_FAILED";
+    const entry = await recordBlockedAiAttempt({
+      ...input,
+      sellerId,
+      blockedReason: failureReason,
+      metadata: {
+        ...(input.metadata ?? {}),
+        generateEndpoint: true,
+        vision: true,
+        imageCount: imageUrls.length,
+        estimatedCost: estimate.estimatedCost,
+        providerConfigured: true,
+        providerError: callError instanceof Error ? callError.message : "Unknown provider error"
+      }
+    });
+
+    return {
+      ok: false,
+      blockedReason: failureReason,
+      entry,
+      output: null,
+      message: "AI vision generation failed when calling the provider. The attempt was recorded; no image judgement was produced."
+    };
+  }
+}
+
 export async function generateAiResponse(input: AiGenerateInput): Promise<{
   ok: boolean;
   blockedReason: string | null;
