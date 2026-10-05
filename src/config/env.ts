@@ -42,7 +42,12 @@ const envSchema = z.object({
   // Provider: OpenAI (Chat Completions API). If OpenAI ever rejects OPENAI_MODEL with
   // "model not found," check the exact current model id at platform.openai.com and update this.
   OPENAI_API_KEY: z.string().optional(),
-  OPENAI_MODEL: z.string().min(1).default("gpt-5.6-luna")
+  OPENAI_MODEL: z.string().min(1).default("gpt-5.6-luna"),
+  // Vision (image-input) judging added 2026-10-05 for the Listing Optimizer's automatic
+  // lifestyle-photo / image-quality rubric. Defaults to OPENAI_MODEL itself (most current chat
+  // models accept image content parts under the same model id) -- set this separately only if
+  // OPENAI_MODEL ever stops accepting image input and a dedicated vision model id is needed.
+  OPENAI_VISION_MODEL: z.string().min(1).optional()
 });
 
 const parsedEnv = envSchema.safeParse(process.env);
