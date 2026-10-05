@@ -1,5 +1,7 @@
 import { supabase } from "../../db/supabase";
-import { generateAiResponse } from "../ai-gateway/ai-gateway.service";
+import { generateAiResponse, generateAiVisionResponse } from "../ai-gateway/ai-gateway.service";
+import { extractCatalogImages } from "../product-media/product-media-normalizer";
+import { listConvertingKeywordsForAsin } from "../amazon-ads/amazon-ads-report.service";
 import { requireConnectedConnection } from "../amazon-sp/amazon-sp.service";
 import { safeErrorMessage, toNumberOrNull } from "../amazon-sp/amazon-sp-utils";
 import {
@@ -89,6 +91,14 @@ function computeImageScore(input: {
   imageCount: number | null;
   lifestylePresent: boolean | null;
   qualityScore: number | null; // 0-1
+  // Added 2026-10-05: lifestyle/quality can now come from an automatic AI vision judging call
+  // (judgeOwnListingImagesWithVision) as well as manual entry -- source defaults to
+  // "manual_entry" for backward compatibility with every existing caller that still passes raw
+  // booleans/numbers without a source (e.g. competitor scoring, which never has either).
+  lifestyleSource?: "manual_entry" | "ai_judged";
+  qualitySource?: "manual_entry" | "ai_judged";
+  lifestyleReason?: string | null;
+  qualityReason?: string | null;
 }): SubScoreResult {
   const inputs: Record<string, SubScoreInput> = {};
   let total = 0;
@@ -105,20 +115,26 @@ function computeImageScore(input: {
 
   if (input.lifestylePresent !== null) {
     const lifestyleTerm = (input.lifestylePresent ? 1 : 0) * 20;
-    inputs.lifestyle = manualInput(input.lifestylePresent ? 1 : 0);
+    const lifestyleValue = input.lifestylePresent ? 1 : 0;
+    inputs.lifestyle = input.lifestyleSource === "ai_judged"
+      ? aiInput(lifestyleValue, input.lifestyleReason ?? null)
+      : manualInput(lifestyleValue);
     total += lifestyleTerm;
     anyKnown = true;
   } else {
-    inputs.lifestyle = missingInput("Whether a genuine lifestyle photo is present needs a human look -- answer this manually.");
+    inputs.lifestyle = missingInput("Whether a genuine lifestyle photo is present needs a human look (or AI vision judging, which needs this SKU's own image URLs and AI calls enabled) -- answer this manually otherwise.");
   }
 
   if (input.qualityScore !== null) {
     const qualityTerm = clamp(input.qualityScore, 0, 1) * 20;
-    inputs.quality = manualInput(clamp(input.qualityScore, 0, 1));
+    const qualityValue = clamp(input.qualityScore, 0, 1);
+    inputs.quality = input.qualitySource === "ai_judged"
+      ? aiInput(qualityValue, input.qualityReason ?? null)
+      : manualInput(qualityValue);
     total += qualityTerm;
     anyKnown = true;
   } else {
-    inputs.quality = missingInput("Main-image quality (white background, sharp, 80-90% frame) needs a human look -- answer this manually.");
+    inputs.quality = missingInput("Main-image quality (white background, sharp, 80-90% frame) needs a human look (or AI vision judging, which needs this SKU's own image URLs and AI calls enabled) -- answer this manually otherwise.");
   }
 
   if (!anyKnown) {
@@ -532,6 +548,107 @@ async function judgeListingWithRubric(input: {
   }
 }
 
+// ---- AI vision judging (lifestyle photo + image quality, own listing only) ----
+//
+// Added 2026-10-05. Previously these two Image Score inputs were manual-entry-only because
+// nothing in this app could actually look at a photo. The app already pulls the real Amazon
+// image URLs automatically via SP-API (that's where the image COUNT comes from) -- this just
+// adds the missing step of pointing a vision-capable AI call at those same URLs. Only ever run
+// for the founder's OWN listing: a competitor's image URLs aren't persisted today (see
+// competitor-benchmark.types.ts -- CompetitorBenchmarkDataRow stores image_count only, not the
+// URLs themselves), and more importantly, judging a competitor's photos isn't something SP-API
+// or this feature needs to do to produce the founder's own Conversion Score.
+type VisionJudgement = {
+  lifestylePresent: boolean | null;
+  qualityScore: number | null; // 0-1
+  reason: string | null;
+  aiBlockedReason: string | null;
+};
+
+const MAX_IMAGES_FOR_VISION_JUDGING = 5; // cap request size/cost; main + up to 4 more is enough to judge the set
+
+function buildVisionPrompt(): string {
+  return [
+    "You are an Amazon India listing photo auditor. Look at the product photos above (in listing order) and judge the set as a whole. Return strict JSON only, with exactly this shape and nothing else:",
+    '{"lifestyle_present": true, "quality_score": 0.0, "reason": ""}',
+    "",
+    "Rubric:",
+    "- lifestyle_present: true only if at least one image is a genuine lifestyle/in-context shot (product in real use, a scene, a human interacting with it) -- not true for plain product-on-background shots, infographics, or size charts alone.",
+    "- quality_score (0 to 1, decimals allowed): judge the MAIN (first) image specifically -- 1.0 if it is on a clean pure-white background, sharp/in-focus, well-lit, and the product fills roughly 80-90% of the frame with no awkward cropping; reduce for a busy/non-white background, blur, poor lighting, too much empty space, or the product being cropped oddly.",
+    "- reason: one line explaining both scores together."
+  ].join("\n");
+}
+
+function parseVisionResponse(raw: string): { lifestylePresent: boolean; qualityScore: number; reason: string | null } | null {
+  try {
+    const parsed = JSON.parse(raw) as { lifestyle_present?: unknown; quality_score?: unknown; reason?: unknown };
+    if (typeof parsed.lifestyle_present !== "boolean") return null;
+    const qualityScore = Number(parsed.quality_score);
+    if (!Number.isFinite(qualityScore)) return null;
+    const reason = typeof parsed.reason === "string" && parsed.reason.trim() ? parsed.reason.trim() : null;
+    return { lifestylePresent: parsed.lifestyle_present, qualityScore: clamp(qualityScore, 0, 1), reason };
+  } catch {
+    return null;
+  }
+}
+
+async function judgeOwnListingImagesWithVision(input: {
+  sellerId: string;
+  listingLabel: string;
+  imageUrls: string[];
+  aiState: AiRubricState;
+}): Promise<VisionJudgement> {
+  const noData: VisionJudgement = {
+    lifestylePresent: null,
+    qualityScore: null,
+    reason: null,
+    aiBlockedReason: "NO_IMAGE_URLS_AVAILABLE"
+  };
+
+  if (input.imageUrls.length === 0) return noData;
+  if (input.aiState.calls >= input.aiState.limit) {
+    return { ...noData, aiBlockedReason: "AI_RUN_CALL_LIMIT_REACHED" };
+  }
+
+  try {
+    const result = await generateAiVisionResponse({
+      sellerId: input.sellerId,
+      moduleName: "LISTING_OPTIMIZER",
+      purpose: "listing_optimizer_image_vision",
+      prompt: buildVisionPrompt(),
+      imageUrls: input.imageUrls.slice(0, MAX_IMAGES_FOR_VISION_JUDGING),
+      maxOutputTokens: 200,
+      requestId: `listing-optimizer-vision:${input.listingLabel}`,
+      // Same reasoning as judgeListingWithRubric: only ever triggered from a founder-initiated
+      // "Run analysis" click, never a background job.
+      actor: "founder",
+      metadata: { listingLabel: input.listingLabel, module: "LISTING_OPTIMIZER", imageCount: input.imageUrls.length }
+    });
+
+    if (result.ok || result.blockedReason === "AI_PROVIDER_CALL_FAILED") {
+      input.aiState.calls += 1;
+    }
+
+    if (!result.ok || !result.output) {
+      return { ...noData, aiBlockedReason: result.blockedReason ?? "AI_CALL_DID_NOT_RETURN_OUTPUT" };
+    }
+
+    const parsed = parseVisionResponse(result.output);
+    if (!parsed) {
+      return { ...noData, aiBlockedReason: "AI_RETURNED_UNPARSEABLE_JSON" };
+    }
+
+    return {
+      lifestylePresent: parsed.lifestylePresent,
+      qualityScore: parsed.qualityScore,
+      reason: parsed.reason,
+      aiBlockedReason: null
+    };
+  } catch (error) {
+    return { ...noData, aiBlockedReason: safeErrorMessage(error) };
+  }
+}
+
 // ---- Per-listing sub-score assembly (same formula set for own listing and every competitor) ----
 
 type ListingFacts = {
@@ -552,6 +669,9 @@ async function scoreListing(input: {
   hasVideo: boolean | null;
   lifestylePresent: boolean | null;
   qualityScore: number | null;
+  lifestyleSource?: "manual_entry" | "ai_judged";
+  qualitySource?: "manual_entry" | "ai_judged";
+  imageJudgeReason?: string | null;
   reviewCount: number | null;
   rating: number | null;
   useAiJudging: boolean;
@@ -581,7 +701,15 @@ async function scoreListing(input: {
   const coverage = highVolumeCoverage(input.keywords, input.facts.title, input.facts.bullets);
 
   return {
-    IS: computeImageScore({ imageCount: input.facts.imageCount, lifestylePresent: input.lifestylePresent, qualityScore: input.qualityScore }),
+    IS: computeImageScore({
+      imageCount: input.facts.imageCount,
+      lifestylePresent: input.lifestylePresent,
+      qualityScore: input.qualityScore,
+      lifestyleSource: input.lifestyleSource,
+      qualitySource: input.qualitySource,
+      lifestyleReason: input.imageJudgeReason,
+      qualityReason: input.imageJudgeReason
+    }),
     RS: computeReviewScore({ reviewCount: input.reviewCount, rating: input.rating }),
     PS: computePriceScore({ price: input.facts.price, competitorAveragePrice: input.competitorAveragePrice }),
     TS: computeTitleScore({
@@ -989,7 +1117,76 @@ export async function runListingOptimizerAnalysis(input: RunAnalysisInput): Prom
 
   const useAiJudging = input.useAiJudging !== false;
   const aiState: AiRubricState = { calls: 0, limit: MAX_AI_RUBRIC_CALLS_PER_ANALYSIS };
-  const keywords = (input.highVolumeKeywords ?? []).map((k) => cleanText(k)).filter((k): k is string => Boolean(k));
+  let keywords = (input.highVolumeKeywords ?? []).map((k) => cleanText(k)).filter((k): k is string => Boolean(k));
+
+  // Added 2026-10-05: when the founder hasn't typed a keyword list by hand, auto-derive one from
+  // this ASIN's own REAL Amazon Ads data (search terms that actually drove a real order for ad
+  // groups advertising this ASIN in the last 30 days) instead of leaving KS's coverage half
+  // unscorable. This is official Ads Reporting API data already synced for this seller's own ad
+  // account -- not a scrape, not a guess, and never a competitor's data (see
+  // listConvertingKeywordsForAsin's own comment for the one real limit on this join).
+  if (keywords.length === 0 && ownAsin) {
+    try {
+      const convertingKeywords = await listConvertingKeywordsForAsin({ sellerId, asin: ownAsin, days: 30, limit: 15 });
+      if (convertingKeywords.length > 0) {
+        keywords = convertingKeywords.map((row) => row.keyword);
+        warnings.push(
+          `No keyword list was typed in for this run -- used ${keywords.length} real search term(s) from ${ownAsin}'s own last-30-day Amazon Ads data that actually drove an order, instead of asking you to supply a list by hand.`
+        );
+      } else {
+        warnings.push(
+          `No keyword list was typed in and no converting Amazon Ads search terms were found for ${ownAsin} in the last 30 days -- Keyword Score's coverage half is unscored this run. Either run/let PPC data accumulate for this ASIN, or supply a keyword list manually.`
+        );
+      }
+    } catch (error) {
+      warnings.push(`Could not auto-derive a keyword list from Amazon Ads data for ${ownAsin} (${safeErrorMessage(error)}) -- supply a keyword list manually for this run.`);
+    }
+  }
+
+  // Automatic lifestyle-photo / image-quality judging (own listing only, see
+  // judgeOwnListingImagesWithVision above for why competitors are never attempted here). Only
+  // runs when the founder hasn't manually answered one or both fields AND AI judging is on for
+  // this run -- manual entry always wins over the AI's call when both are present, so this never
+  // silently overrides a value the founder explicitly typed in.
+  let ownLifestylePresent = input.ownHasLifestyleImage ?? null;
+  let ownQualityScore = input.ownImageQualityScore ?? null;
+  let ownLifestyleSource: "manual_entry" | "ai_judged" = "manual_entry";
+  let ownQualitySource: "manual_entry" | "ai_judged" = "manual_entry";
+  let ownImageJudgeReason: string | null = null;
+
+  if (useAiJudging && (input.ownHasLifestyleImage == null || input.ownImageQualityScore == null)) {
+    const ownImageUrls = extractCatalogImages(ownData.raw_catalog_payload).imageUrls;
+    if (ownImageUrls.length > 0) {
+      const vision = await judgeOwnListingImagesWithVision({
+        sellerId,
+        listingLabel: `own:${ownSku}`,
+        imageUrls: ownImageUrls,
+        aiState
+      });
+      if (vision.aiBlockedReason) {
+        warnings.push(
+          `Automatic lifestyle-photo/image-quality judging didn't run for ${ownSku} (${vision.aiBlockedReason}) -- these two Image Score inputs are unanswered unless you enter them manually.`
+        );
+      } else {
+        if (input.ownHasLifestyleImage == null && vision.lifestylePresent !== null) {
+          ownLifestylePresent = vision.lifestylePresent;
+          ownLifestyleSource = "ai_judged";
+        }
+        if (input.ownImageQualityScore == null && vision.qualityScore !== null) {
+          ownQualityScore = vision.qualityScore;
+          ownQualitySource = "ai_judged";
+        }
+        ownImageJudgeReason = vision.reason;
+        warnings.push(
+          `Looked at ${ownSku}'s real listing photos automatically (AI vision) instead of asking you to answer lifestyle-photo/image-quality by hand${vision.reason ? ` -- ${vision.reason}` : ""}.`
+        );
+      }
+    } else {
+      warnings.push(
+        `No image URLs were available to automatically judge ${ownSku}'s photos -- these two Image Score inputs are unanswered unless you enter them manually.`
+      );
+    }
+  }
 
   const ownSubScores = await scoreListing({
     facts: ownFacts,
@@ -997,8 +1194,11 @@ export async function runListingOptimizerAnalysis(input: RunAnalysisInput): Prom
     keywords,
     hasAplus,
     hasVideo: input.ownHasVideo ?? null,
-    lifestylePresent: input.ownHasLifestyleImage ?? null,
-    qualityScore: input.ownImageQualityScore ?? null,
+    lifestylePresent: ownLifestylePresent,
+    qualityScore: ownQualityScore,
+    lifestyleSource: ownLifestyleSource,
+    qualitySource: ownQualitySource,
+    imageJudgeReason: ownImageJudgeReason,
     reviewCount: input.ownReviewCount ?? null,
     rating: input.ownRating ?? null,
     useAiJudging,
