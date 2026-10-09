@@ -12,7 +12,9 @@ import {
   CompetitorBenchmarkCandidateSource,
   CompetitorBenchmarkDataRow,
   CompetitorBenchmarkDimension,
+  CompetitorBenchmarkDimensionsCm,
   CompetitorBenchmarkFindingRow,
+  CompetitorBenchmarkImage,
   CompetitorBenchmarkImageBriefRow,
   CompetitorBenchmarkImageMockupRow,
   CompetitorBenchmarkRunRow,
@@ -198,6 +200,103 @@ function extractTitle(payload: Record<string, unknown>, marketplaceId: string): 
   const summary = readSummary(payload, marketplaceId);
   const itemName = summary?.itemName;
   return typeof itemName === "string" && itemName.trim() ? itemName.trim() : null;
+}
+
+// Added 2026-10-09 for the richer competitor listing-copy display. All read from the already-
+// fetched/stored raw_catalog_payload (same "attributes"/"images" includedData used above) --
+// never a new Amazon API call.
+
+function readAttributeValue(payload: Record<string, unknown>, attributeName: string): string | null {
+  const entries = readAttribute(payload, attributeName);
+  const first = entries && entries[0];
+  if (!first || typeof first !== "object") return null;
+  const value = (first as Record<string, unknown>).value;
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function extractDescription(payload: Record<string, unknown>): string | null {
+  return readAttributeValue(payload, "product_description");
+}
+
+function extractBrand(payload: Record<string, unknown>): string | null {
+  return readAttributeValue(payload, "brand");
+}
+
+// Prefers item_package_weight (the shipped-package weight) over item_weight (the product alone)
+// since package weight is what actually drives Amazon's shipping/FBA fee tier.
+function extractWeightGrams(payload: Record<string, unknown>): number | null {
+  for (const attributeName of ["item_package_weight", "item_weight"]) {
+    const entries = readAttribute(payload, attributeName);
+    const first = entries && entries[0];
+    if (!first || typeof first !== "object") continue;
+    const entry = first as Record<string, unknown>;
+    const value = toNumberOrNull(entry.value);
+    if (value === null) continue;
+    const unit = typeof entry.unit === "string" ? entry.unit.toLowerCase() : "grams";
+    if (unit === "kilograms" || unit === "kg") return value * 1000;
+    if (unit === "pounds" || unit === "lb" || unit === "lbs") return value * 453.59237;
+    return value; // grams (Amazon's India-marketplace default for this attribute)
+  }
+  return null;
+}
+
+// Prefers item_package_dimensions (the shipped-package size) over item_dimensions/
+// item_depth_width_height (the product alone) for the same reason as weight above. All of
+// Amazon's India-marketplace dimension attributes use centimeters already, so no unit math here
+// -- if a future payload ever carries a different unit this returns the raw number unconverted
+// rather than silently guessing, which is why this stays a narrow, explicit read.
+function extractDimensionsCm(payload: Record<string, unknown>): CompetitorBenchmarkDimensionsCm | null {
+  for (const attributeName of ["item_package_dimensions", "item_dimensions", "item_depth_width_height"]) {
+    const entries = readAttribute(payload, attributeName);
+    const first = entries && entries[0];
+    if (!first || typeof first !== "object") continue;
+    const entry = first as Record<string, unknown>;
+    const dim = (key: string): number | null => {
+      const field = entry[key];
+      if (!field || typeof field !== "object") return null;
+      return toNumberOrNull((field as Record<string, unknown>).value);
+    };
+    const width = dim("width");
+    const height = dim("height");
+    const length = dim("length") ?? dim("depth");
+    if (width === null && height === null && length === null) continue;
+    return { width, height, length };
+  }
+  return null;
+}
+
+// Amazon's `images` includedData lists one entry per SIZE RENDITION of every real photo, not one
+// entry per photo (see countCatalogImages above for the full explanation). This picks the
+// largest-resolution rendition per distinct variant slot (MAIN, PT01, PT02, ...) so the frontend
+// gets one real image URL per photo, not every thumbnail/rendition duplicate.
+function extractImages(payload: Record<string, unknown>, marketplaceId: string): CompetitorBenchmarkImage[] {
+  const entries = marketplaceEntries(payload, "images", marketplaceId);
+  const images = entries[0]?.images;
+  if (!Array.isArray(images)) return [];
+
+  const bestByVariant = new Map<string, CompetitorBenchmarkImage>();
+  for (const image of images) {
+    if (!image || typeof image !== "object") continue;
+    const entry = image as Record<string, unknown>;
+    const variant = typeof entry.variant === "string" ? entry.variant.trim() : "";
+    const link = typeof entry.link === "string" ? entry.link.trim() : "";
+    if (!variant || !link) continue;
+    const width = toIntegerOrNull(entry.width);
+    const height = toIntegerOrNull(entry.height);
+    const area = (width ?? 0) * (height ?? 0);
+    const existing = bestByVariant.get(variant);
+    const existingArea = existing ? (existing.width ?? 0) * (existing.height ?? 0) : -1;
+    if (!existing || area > existingArea) {
+      bestByVariant.set(variant, { link, width, height, variant });
+    }
+  }
+
+  // MAIN first, then PT01/PT02/... in order -- matches the order Amazon's own gallery shows.
+  return Array.from(bestByVariant.values()).sort((a, b) => {
+    if (a.variant === "MAIN") return -1;
+    if (b.variant === "MAIN") return 1;
+    return a.variant.localeCompare(b.variant);
+  });
 }
 
 // Added 2026-10-05 for the Listing Optimizer module (src/modules/listing-optimizer/), which scores
@@ -478,6 +577,11 @@ async function loadRunRow(id: string, sellerId: string): Promise<CompetitorBench
 
 function toSafeData(row: CompetitorBenchmarkDataRow | undefined | null): SafeCompetitorBenchmarkData | null {
   if (!row) return null;
+  const payload = row.raw_catalog_payload ?? null;
+  // No marketplaceId filter needed here beyond what's already stored -- marketplaceEntries()
+  // falls back to every entry when none matches, and this app only ever fetches one marketplace
+  // (A21TJRUUN4KGV / Amazon India), so an empty filter is safe and avoids a second connection
+  // lookup just to re-derive a marketplace id this row's payload already reflects.
   return {
     asin: row.asin,
     price: toNumberOrNull(row.price),
@@ -491,7 +595,13 @@ function toSafeData(row: CompetitorBenchmarkDataRow | undefined | null): SafeCom
     categorySalesRankTitle: row.category_sales_rank_title,
     fetchStatus: row.fetch_status,
     fetchError: row.fetch_error,
-    fetchedAt: row.fetched_at
+    fetchedAt: row.fetched_at,
+    brand: payload ? extractBrand(payload) : null,
+    description: payload ? extractDescription(payload) : null,
+    bulletText: payload ? extractBulletText(payload) : [],
+    weightGrams: payload ? extractWeightGrams(payload) : null,
+    dimensionsCm: payload ? extractDimensionsCm(payload) : null,
+    images: payload ? extractImages(payload, "") : []
   };
 }
 
