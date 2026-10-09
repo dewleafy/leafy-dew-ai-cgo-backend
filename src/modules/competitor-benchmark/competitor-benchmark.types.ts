@@ -119,6 +119,19 @@ export type SafeCompetitorBenchmarkCandidate = {
   data: SafeCompetitorBenchmarkData | null;
 };
 
+export type CompetitorBenchmarkImage = {
+  link: string;
+  width: number | null;
+  height: number | null;
+  variant: string;
+};
+
+export type CompetitorBenchmarkDimensionsCm = {
+  width: number | null;
+  height: number | null;
+  length: number | null;
+};
+
 export type SafeCompetitorBenchmarkData = {
   asin: string;
   price: number | null;
@@ -133,6 +146,15 @@ export type SafeCompetitorBenchmarkData = {
   fetchStatus: CompetitorBenchmarkFetchStatus;
   fetchError: string | null;
   fetchedAt: string | null;
+  // Added for the richer listing-copy display (2026-10-09): all of these are read straight out of
+  // the already-stored raw_catalog_payload below -- never a new Amazon API call, same discipline
+  // as extractTitleAndBulletsFromCatalogPayload above.
+  brand: string | null;
+  description: string | null;
+  bulletText: string[];
+  weightGrams: number | null;
+  dimensionsCm: CompetitorBenchmarkDimensionsCm | null;
+  images: CompetitorBenchmarkImage[];
 };
 
 export type SafeCompetitorBenchmarkFinding = {
