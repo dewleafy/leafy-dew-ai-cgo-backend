@@ -155,6 +155,17 @@ export type SafeCompetitorBenchmarkData = {
   weightGrams: number | null;
   dimensionsCm: CompetitorBenchmarkDimensionsCm | null;
   images: CompetitorBenchmarkImage[];
+  // Added 2026-10-12 for the card-grid redesign (mockup v3): a deterministic, non-AI score
+  // (0-100) reusing the same real-data signals (images/price-vs-average/title length/bullet
+  // count) the Listing Optimizer already scores on -- independently re-derived here rather than
+  // imported, since listing-optimizer.service.ts already imports FROM this module and importing
+  // back would create a circular dependency. null when there isn't enough real data to score.
+  listingScore: number | null;
+  // Added 2026-10-12: this candidate's price run through the OWN SKU's real, already-saved cost
+  // structure (amazon_product_economics row) via the same calculateProductEconomics formula used
+  // everywhere else in the app -- never a new/guessed cost model. null when the own SKU has no
+  // saved economics row yet, or this candidate has no price.
+  profitAtThisPrice: number | null;
 };
 
 export type SafeCompetitorBenchmarkFinding = {
