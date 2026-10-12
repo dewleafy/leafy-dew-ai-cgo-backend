@@ -7,6 +7,8 @@ import { AmazonSpConnectionRow } from "../amazon-sp/amazon-sp.types";
 import { cleanText, logSafeAmazonSpError, safeErrorDetails, safeErrorMessage, toIntegerOrNull, toNumberOrNull } from "../amazon-sp/amazon-sp-utils";
 import { listProductPassports } from "../product-passports/product-passports.service";
 import { SafeProductPassportRow } from "../product-passports/product-passports.types";
+import { calculateProductEconomics } from "../product-economics/product-economics.service";
+import { ProductEconomicsInput, ProductEconomicsRow } from "../product-economics/product-economics.types";
 import {
   CompetitorBenchmarkCandidateRow,
   CompetitorBenchmarkCandidateSource,
@@ -557,6 +559,153 @@ export async function createCompetitorBenchmarkRun(input: { sellerId: string; sk
   return { run: await assembleRun(updatedRun ?? runData, sellerId), skippedSkus: skipped };
 }
 
+// ---- Listing Score + profit-at-this-price (added 2026-10-12 for the card-grid redesign) ----
+//
+// Both of these reuse ONLY real, already-persisted data -- no AI calls, no guessed inputs:
+//   - Listing Score re-derives (does not import, to avoid a circular dependency --
+//     listing-optimizer.service.ts already imports FROM this module) the same real-data signals
+//     (image count / price vs. competitor average / title length / bullet count) that the
+//     Listing Optimizer's own scorer uses, renormalized to exclude the AI-dependent components
+//     (review score, keyword rank, creative strength) which aren't available in this module.
+//   - profitAtThisPrice replays the OWN SKU's real, already-saved amazon_product_economics cost
+//     structure through the same calculateProductEconomics formula used everywhere else in the
+//     app, just swapping in this candidate's sellingPrice -- so it answers "what would MY profit
+//     be if I sold at this price," using my real costs, not a guess.
+
+const LISTING_SCORE_WEIGHTS = { images: 0.25, price: 0.15, title: 0.15, bullets: 0.1 };
+
+function computeListingScore(input: {
+  imageCount: number | null;
+  price: number | null;
+  competitorAveragePrice: number | null;
+  titleLength: number | null;
+  bulletCount: number | null;
+}): number | null {
+  let weightedTotal = 0;
+  let weightUsed = 0;
+
+  if (input.imageCount !== null) {
+    const imagesScore = Math.min(100, Math.max(0, Math.min(input.imageCount, 7)) * (100 / 7));
+    weightedTotal += imagesScore * LISTING_SCORE_WEIGHTS.images;
+    weightUsed += LISTING_SCORE_WEIGHTS.images;
+  }
+
+  if (input.price !== null && input.competitorAveragePrice !== null && input.competitorAveragePrice > 0) {
+    const pctDiff = ((input.price - input.competitorAveragePrice) / input.competitorAveragePrice) * 100;
+    const penaltyMultiplier = input.price > input.competitorAveragePrice ? 2 : 1;
+    const priceScore = Math.min(100, Math.max(0, 80 - pctDiff * penaltyMultiplier));
+    weightedTotal += priceScore * LISTING_SCORE_WEIGHTS.price;
+    weightUsed += LISTING_SCORE_WEIGHTS.price;
+  }
+
+  if (input.titleLength !== null) {
+    let lengthFraction: number;
+    if (input.titleLength >= 150 && input.titleLength <= 200) lengthFraction = 1;
+    else if (input.titleLength < 150) lengthFraction = Math.min(1, Math.max(0, input.titleLength / 150));
+    else lengthFraction = Math.min(1, Math.max(0, 1 - (input.titleLength - 200) / 200));
+    weightedTotal += lengthFraction * 100 * LISTING_SCORE_WEIGHTS.title;
+    weightUsed += LISTING_SCORE_WEIGHTS.title;
+  }
+
+  if (input.bulletCount !== null) {
+    const bulletsScore = Math.min(100, Math.max(0, Math.min(input.bulletCount, 5) * 20));
+    weightedTotal += bulletsScore * LISTING_SCORE_WEIGHTS.bullets;
+    weightUsed += LISTING_SCORE_WEIGHTS.bullets;
+  }
+
+  if (weightUsed <= 0) return null;
+  return Math.round((weightedTotal / weightUsed) * 10) / 10;
+}
+
+// cubic cm -> cubic feet, same conversion used elsewhere in the app wherever raw dimensions feed
+// the fee formula's volumeCuFt input.
+const CUBIC_CM_PER_CUBIC_FOOT = 28316.846592;
+
+function computeProfitAtPrice(
+  sellingPrice: number | null,
+  ownEconomicsRow: ProductEconomicsRow,
+  subCategory: string | null,
+  ownWeightGrams: number | null,
+  ownDimensionsCm: CompetitorBenchmarkDimensionsCm | null
+): number | null {
+  if (sellingPrice === null || !(sellingPrice > 0)) return null;
+
+  const volumeCuFt =
+    ownDimensionsCm &&
+    ownDimensionsCm.length !== null &&
+    ownDimensionsCm.width !== null &&
+    ownDimensionsCm.height !== null
+      ? (ownDimensionsCm.length * ownDimensionsCm.width * ownDimensionsCm.height) / CUBIC_CM_PER_CUBIC_FOOT
+      : undefined;
+
+  const input: ProductEconomicsInput = {
+    sellerId: ownEconomicsRow.seller_id,
+    sku: ownEconomicsRow.sku,
+    subCategory,
+    sellingPrice,
+    landedCost: toNumberOrNull(ownEconomicsRow.landed_cost) ?? 0,
+    packagingCost: toNumberOrNull(ownEconomicsRow.packaging_cost) ?? 0,
+    // amazonFeeEstimate/shippingFeeEstimate/taxEstimate are unused by calculateProductEconomics --
+    // the real fee amounts are derived internally from sellingPrice/subCategory/weightKg/
+    // volumeCuFt/fulfillmentType below, so these stay 0 rather than reusing a stale saved estimate.
+    amazonFeeEstimate: 0,
+    shippingFeeEstimate: 0,
+    taxEstimate: toNumberOrNull(ownEconomicsRow.tax_estimate) ?? 0,
+    returnRatePercent: toNumberOrNull(ownEconomicsRow.return_rate_percent) ?? 25,
+    returnCostPerReturn: toNumberOrNull(ownEconomicsRow.return_cost_per_return) ?? 0,
+    influencerCostAllocationPerUnit: toNumberOrNull(ownEconomicsRow.influencer_cost_allocation_per_unit) ?? 0,
+    socialMarketingCostPerUnit: toNumberOrNull(ownEconomicsRow.social_marketing_cost_per_unit) ?? 0,
+    couponDiscountEstimate: toNumberOrNull(ownEconomicsRow.coupon_discount_estimate) ?? 0,
+    otherCostPerUnit: toNumberOrNull(ownEconomicsRow.other_cost_per_unit) ?? 0,
+    targetProfit: toNumberOrNull(ownEconomicsRow.target_profit) ?? 0,
+    returnPenaltyFractionPercent: toNumberOrNull(ownEconomicsRow.return_penalty_fraction_percent) ?? undefined,
+    returnRecoverable: ownEconomicsRow.return_recoverable ?? undefined,
+    repackagingCost: toNumberOrNull(ownEconomicsRow.repackaging_cost) ?? undefined,
+    tcsPercent: toNumberOrNull(ownEconomicsRow.tcs_percent) ?? undefined,
+    weightKg: ownWeightGrams !== null ? ownWeightGrams / 1000 : undefined,
+    volumeCuFt
+  };
+
+  const calculation = calculateProductEconomics(input);
+  return calculation.netProfit;
+}
+
+// Batched lookup of each own SKU's newest saved cost-structure row (amazon_product_economics)
+// plus its subCategory (from the product passport, if one exists) -- one pair of queries per
+// run, not one per SKU, and reused for every competitor candidate under that SKU.
+async function fetchOwnEconomicsContexts(
+  sellerId: string,
+  skus: string[]
+): Promise<Map<string, { row: ProductEconomicsRow; subCategory: string | null }>> {
+  const context = new Map<string, { row: ProductEconomicsRow; subCategory: string | null }>();
+  if (skus.length === 0) return context;
+
+  const [economicsResult, passports] = await Promise.all([
+    supabase
+      .from("amazon_product_economics")
+      .select("*")
+      .eq("seller_id", sellerId)
+      .in("sku", skus)
+      .order("created_at", { ascending: false }),
+    listProductPassports({ sellerId })
+  ]);
+
+  if (economicsResult.error) {
+    logError("Could not load own product economics for competitor benchmark profit calc.", economicsResult.error);
+    return context;
+  }
+
+  const passportBySku = new Map(
+    passports.filter((p): p is SafeProductPassportRow & { sku: string } => !!p.sku).map((p) => [p.sku, p])
+  );
+  const rows = (economicsResult.data ?? []) as ProductEconomicsRow[];
+  for (const row of rows) {
+    if (!row.sku || context.has(row.sku)) continue; // keep only the newest (rows are ordered desc)
+    context.set(row.sku, { row, subCategory: passportBySku.get(row.sku)?.subCategory ?? null });
+  }
+  return context;
+}
+
 // ---- Loading / assembling a run for the frontend ----
 
 async function loadRunRow(id: string, sellerId: string): Promise<CompetitorBenchmarkRunRow | null> {
@@ -601,7 +750,11 @@ function toSafeData(row: CompetitorBenchmarkDataRow | undefined | null): SafeCom
     bulletText: payload ? extractBulletText(payload) : [],
     weightGrams: payload ? extractWeightGrams(payload) : null,
     dimensionsCm: payload ? extractDimensionsCm(payload) : null,
-    images: payload ? extractImages(payload, "") : []
+    images: payload ? extractImages(payload, "") : [],
+    // Filled in afterward by assembleRun, which has the group-level context (competitor average
+    // price, own economics row) that these two require -- this function stays per-row only.
+    listingScore: null,
+    profitAtThisPrice: null
   };
 }
 
@@ -626,15 +779,50 @@ async function assembleRun(run: CompetitorBenchmarkRunRow, sellerId: string): Pr
     ? run.own_skus
     : Array.from(new Set(candidates.map((c) => c.own_sku)));
 
-  const skus: SafeCompetitorBenchmarkSkuGroup[] = skuOrder.map((ownSku) => {
+  // Batched once for the whole run (not once per SKU) -- see fetchOwnEconomicsContexts above.
+  const economicsContexts = await fetchOwnEconomicsContexts(sellerId, skuOrder);
+
+  const skus: SafeCompetitorBenchmarkSkuGroup[] = await Promise.all(skuOrder.map(async (ownSku) => {
     const skuCandidates = candidates.filter((c) => c.own_sku === ownSku);
     const ownCandidate = skuCandidates.find((c) => c.source === "OWN_BASELINE");
     const brief = briefs.find((b) => b.own_sku === ownSku) ?? null;
 
+    const safeCandidatesData = skuCandidates.map((c) => toSafeData(dataByCandidateId.get(c.id)));
+
+    // Same pattern listing-optimizer.service.ts uses: the average of every candidate's real
+    // fetched price in this group, computed once and reused when scoring every candidate
+    // (including the one being scored) -- not recomputed per-candidate.
+    const groupPrices = safeCandidatesData.map((d) => d?.price ?? null).filter((p): p is number => p !== null);
+    const competitorAveragePrice = groupPrices.length > 0 ? groupPrices.reduce((a, b) => a + b, 0) / groupPrices.length : null;
+
+    const ownContext = economicsContexts.get(ownSku) ?? null;
+    const ownSafeData = ownCandidate ? safeCandidatesData[skuCandidates.indexOf(ownCandidate)] : null;
+
+    const enrichedCandidatesData = safeCandidatesData.map((data) => {
+      if (!data) return data;
+      const listingScore = computeListingScore({
+        imageCount: data.imageCount,
+        price: data.price,
+        competitorAveragePrice,
+        titleLength: data.titleLength,
+        bulletCount: data.bulletCount
+      });
+      const profitAtThisPrice = ownContext
+        ? computeProfitAtPrice(
+            data.price,
+            ownContext.row,
+            ownContext.subCategory,
+            ownSafeData?.weightGrams ?? null,
+            ownSafeData?.dimensionsCm ?? null
+          )
+        : null;
+      return { ...data, listingScore, profitAtThisPrice };
+    });
+
     return {
       ownSku,
       ownAsin: ownCandidate?.own_asin ?? null,
-      candidates: skuCandidates.map((c): SafeCompetitorBenchmarkCandidate => ({
+      candidates: skuCandidates.map((c, index): SafeCompetitorBenchmarkCandidate => ({
         id: c.id,
         ownSku: c.own_sku,
         ownAsin: c.own_asin,
@@ -644,7 +832,7 @@ async function assembleRun(run: CompetitorBenchmarkRunRow, sellerId: string): Pr
         confirmed: c.confirmed,
         addedManually: c.added_manually,
         discoveryError: c.discovery_error,
-        data: toSafeData(dataByCandidateId.get(c.id))
+        data: enrichedCandidatesData[index]
       })),
       findings: findings
         .filter((f) => f.own_sku === ownSku)
@@ -674,7 +862,7 @@ async function assembleRun(run: CompetitorBenchmarkRunRow, sellerId: string): Pr
           requestedAt: m.requested_at
         }))
     };
-  });
+  }));
 
   return {
     id: run.id,
