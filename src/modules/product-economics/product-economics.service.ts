@@ -71,50 +71,80 @@ function parseWeightKg(weight: string | null | undefined): number {
   return match ? toNumber(match[1]) : 0;
 }
 
-const FEE_RULES_VERSION = "amazon_fee_engine_v2_real_data_2026_09_28";
+const FEE_RULES_VERSION = "amazon_fee_engine_v3_referral_table_verified_2026_10_13";
 
-// referralFeeRules — 2026-09-28 update.
+// referralFeeRules — 2026-10-13 full re-verification.
 //
-// Amazon introduced a zero-referral-fee-under-Rs.1,000 policy in March 2026 across a large
-// share of its India catalog. Two categories below have been directly, word-for-word confirmed
-// against Amazon's own live Referral Fees table (sell.amazon.in/fees-and-pricing, re-checked
-// 2026-09-25) AND cross-checked against real August 2026 settlement data for this account:
-//   - "home decor products": 0% <= Rs.1,000, 17% above (was wrongly coded here as a flat 12%
-//     above 1000 - the confirmed real rate is 17%, not 12%).
-//   - "home improvement - accessories": 0% <= Rs.1,000, 13.5% above (was wrongly coded as a
-//     flat 12% at ANY price - this category never had its zero-fee tier at all before this fix).
-// Every OTHER category below is still the ORIGINAL, UNVERIFIED flat rate this file has always
-// used. Given how broad Amazon's March 2026 policy change was, it is very likely several of
-// these are also wrong (missing a zero-fee-under-Rs.1,000 tier), but each one needs its own
-// check against Amazon's live fee table before being changed - do not assume the same fix
-// applies without checking, and do not guess a number that hasn't been confirmed (see
-// referralFeeConfidence on the calculation output, which flags exactly this).
-const CONFIRMED_REFERRAL_CATEGORIES = new Set(["home decor products", "home improvement - accessories"]);
+// Every category below was directly checked against Amazon's own live Referral Fees table
+// (sell.amazon.in/fees-and-pricing), fetched twice independently on 2026-10-13 with matching
+// results both times. Before this fix, only "home decor products" and "home improvement -
+// accessories" had been confirmed (2026-09-28) -- every other category was still the original,
+// never-checked flat rate (mostly a guessed 12%, Mattresses a guessed flat 18%), with NO
+// zero-fee-under-Rs.1,000 tier at all. That guess was wrong almost everywhere: every single
+// category on Amazon's real table has a 0% tier for item price <= Rs.1,000, and most of the
+// above-Rs.1,000 percentages are not 12% either (they range from 5% to 18% depending on
+// category). Only "Containers, Boxes, Bottles" and "Safes and Lockers" happened to already have
+// the correct above-Rs.1,000 rate (12%) -- they were still missing the 0% tier below Rs.1,000.
+// "Mattresses" has its own 4-tier schedule, not a simple two-tier one.
+//
+// All categories are now CONFIRMED. Re-verify on the regular schedule below (or sooner if a real
+// settlement shows a referral fee that doesn't match) rather than assuming these stay correct
+// forever -- Amazon can and does change these without notice.
+const CONFIRMED_REFERRAL_CATEGORIES = new Set([
+  "home decor products",
+  "home - other products",
+  "home improvement - other products",
+  "home improvement - accessories",
+  "home storage",
+  "home furnishing",
+  "home - fragrance & candles",
+  "kitchen - glassware & ceramicware",
+  "cookware, tableware & dinnerware",
+  "rugs and doormats",
+  "clocks",
+  "wall art",
+  "bedsheets, blankets and covers",
+  "containers, boxes, bottles",
+  "curtains and accessories",
+  "cushion covers",
+  "indoor lighting",
+  "indoor lighting - others",
+  "led bulbs and battens",
+  "wall paints and tools",
+  "craft materials",
+  "safes and lockers",
+  "mattresses"
+]);
 
 const referralFeeRules: Record<string, Array<{ maxPrice: number; percent: number }>> = {
   "home decor products": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 17 }],
-  "home - other products": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
-  "home improvement - other products": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "home - other products": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 18 }],
+  "home improvement - other products": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 13.5 }],
   "home improvement - accessories": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 13.5 }],
-  "home storage": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
-  "home furnishing": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
-  "home - fragrance & candles": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
-  "kitchen - glassware & ceramicware": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
-  "cookware, tableware & dinnerware": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
-  "rugs and doormats": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
-  "clocks": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
-  "wall art": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
-  "bedsheets, blankets and covers": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
-  "containers, boxes, bottles": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
-  "curtains and accessories": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
-  "cushion covers": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
-  "indoor lighting": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
-  "indoor lighting - others": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
-  "led bulbs and battens": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
-  "wall paints and tools": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
-  "craft materials": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
-  "safes and lockers": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
-  "mattresses": [{ maxPrice: Number.POSITIVE_INFINITY, percent: 18 }]
+  "home storage": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 15 }],
+  "home furnishing": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 11 }],
+  "home - fragrance & candles": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 12.5 }],
+  "kitchen - glassware & ceramicware": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 12.5 }],
+  "cookware, tableware & dinnerware": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 12.5 }],
+  "rugs and doormats": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 9 }],
+  "clocks": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 10 }],
+  "wall art": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 13.5 }],
+  "bedsheets, blankets and covers": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 8.5 }],
+  "containers, boxes, bottles": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "curtains and accessories": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 16.5 }],
+  "cushion covers": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 10 }],
+  "indoor lighting": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 12.5 }],
+  "indoor lighting - others": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 16 }],
+  "led bulbs and battens": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 14 }],
+  "wall paints and tools": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 6 }],
+  "craft materials": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 5 }],
+  "safes and lockers": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
+  "mattresses": [
+    { maxPrice: 500, percent: 25.5 },
+    { maxPrice: 1000, percent: 0 },
+    { maxPrice: 20000, percent: 16 },
+    { maxPrice: Number.POSITIVE_INFINITY, percent: 13.5 }
+  ]
 };
 
 function normalizeCategory(value: string | null | undefined): string | null {
