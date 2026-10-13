@@ -12,6 +12,7 @@ import {
   listAmazonSpListings,
   listAmazonSpOrders,
   listAmazonSpReturns,
+  listAmazonSpSettlements,
   processAmazonSpReportJobs,
   runAmazonSpDoctor,
   syncAmazonSpListingAttributes,
@@ -20,7 +21,8 @@ import {
   syncAmazonSpOrderReport,
   syncAmazonSpOrderReportChunked,
   syncAmazonSpOrders,
-  syncAmazonSpReturnsReport
+  syncAmazonSpReturnsReport,
+  syncAmazonSpSettlementsReport
 } from "./amazon-sp.service";
 import { safeErrorDetails, safeErrorMessage } from "./amazon-sp-utils";
 
@@ -238,6 +240,41 @@ export async function listAmazonSpReturnsController(req: Request, res: Response)
     });
   } catch (error) {
     sendSafeError(res, "Could not load Amazon SP-API returns.", error);
+  }
+}
+
+function getSettlementLimit(req: Request): number {
+  const rawLimit = typeof req.query.limit === "string" ? Number(req.query.limit) : 5;
+  const limit = Number.isFinite(rawLimit) ? Math.floor(rawLimit) : 5;
+  return Math.min(Math.max(limit, 1), 20);
+}
+
+export async function syncAmazonSpSettlementsReportController(req: Request, res: Response): Promise<void> {
+  try {
+    res.json(await syncAmazonSpSettlementsReport({
+      sellerId: getSellerId(req),
+      days: getDays(req, 90, 365),
+      limit: getSettlementLimit(req),
+      reportId: getReportId(req)
+    }));
+  } catch (error) {
+    sendSafeError(res, "Could not sync Amazon SP-API settlement report.", error);
+  }
+}
+
+export async function listAmazonSpSettlementsController(req: Request, res: Response): Promise<void> {
+  try {
+    const days = getDays(req, 90, 365);
+    const rows = await listAmazonSpSettlements(getSellerId(req), days);
+    res.json({
+      ok: true,
+      sellerId: getSellerId(req),
+      days,
+      count: rows.length,
+      rows
+    });
+  } catch (error) {
+    sendSafeError(res, "Could not load Amazon SP-API settlements.", error);
   }
 }
 
