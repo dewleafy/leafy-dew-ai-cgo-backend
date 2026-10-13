@@ -97,6 +97,40 @@ export type AmazonSpReturnRow = {
   updated_at: string;
 };
 
+export type AmazonSpSettlementRow = {
+  id: string;
+  seller_id: string;
+  marketplace_id: string;
+  settlement_line_id: string;
+  settlement_id: string | null;
+  settlement_start_date: string | null;
+  settlement_end_date: string | null;
+  deposit_date: string | null;
+  total_amount: number | string | null;
+  currency: string | null;
+  transaction_type: string | null;
+  amazon_order_id: string | null;
+  merchant_order_id: string | null;
+  adjustment_id: string | null;
+  shipment_id: string | null;
+  marketplace_name: string | null;
+  amount_type: string | null;
+  amount_description: string | null;
+  amount: number | string | null;
+  fulfillment_id: string | null;
+  posted_date: string | null;
+  order_item_code: string | null;
+  merchant_order_item_id: string | null;
+  merchant_adjustment_item_id: string | null;
+  sku: string | null;
+  quantity_purchased: number | null;
+  promotion_id: string | null;
+  raw_payload: Record<string, unknown> | null;
+  last_synced_at: string;
+  created_at: string;
+  updated_at: string;
+};
+
 export type AmazonSpTokenResponse = {
   access_token: string;
   refresh_token?: string;
