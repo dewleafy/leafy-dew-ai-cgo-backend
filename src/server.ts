@@ -36,6 +36,7 @@ import { passportDraftExecutionRoutes } from "./modules/passport-draft-execution
 import { backgroundSyncRouter } from "./modules/background-sync/background-sync.routes";
 import { aplusContentRouter } from "./modules/aplus-content/aplus-content.routes";
 import { startBackgroundAmazonSyncScheduler } from "./modules/background-sync/background-sync.service";
+import { startAmazonFeeConfigScheduler } from "./modules/product-economics/amazon-fee-config.service";
 import { listingReadinessRoutes } from "./modules/listing-readiness/listing-readiness.routes";
 import { liveExecutionRouter } from "./modules/live-execution/live-execution.routes";
 import { notificationOutboxRouter } from "./modules/notification-outbox/notification-outbox.routes";
@@ -301,4 +302,5 @@ app.listen(port, () => {
     logger.warn("API login is OFF: set APP_PASSWORD to require sign-in. Anyone with the URL can call the API.");
   }
   startBackgroundAmazonSyncScheduler();
+  startAmazonFeeConfigScheduler();
 });
