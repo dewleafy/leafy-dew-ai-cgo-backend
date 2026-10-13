@@ -17,6 +17,7 @@ import { AmazonSpListingRow } from "../amazon-sp/amazon-sp.types";
 import { ProductPassportRow } from "../product-passports/product-passports.types";
 import { ensureActionLedgerAction } from "../action-ledger/action-ledger.service";
 import { normalizeProductMedia } from "../product-media/product-media-normalizer";
+import { getClosingFeeBands, getFeeSetting, getReferralFeeConfidence, getReferralFeeRules } from "./amazon-fee-config.service";
 
 function toNumber(value: unknown): number {
   const numeric = Number(value ?? 0);
@@ -71,81 +72,18 @@ function parseWeightKg(weight: string | null | undefined): number {
   return match ? toNumber(match[1]) : 0;
 }
 
-const FEE_RULES_VERSION = "amazon_fee_engine_v3_referral_table_verified_2026_10_13";
+const FEE_RULES_VERSION = "amazon_fee_engine_v4_db_backed_2026_10_13";
 
-// referralFeeRules — 2026-10-13 full re-verification.
-//
-// Every category below was directly checked against Amazon's own live Referral Fees table
-// (sell.amazon.in/fees-and-pricing), fetched twice independently on 2026-10-13 with matching
-// results both times. Before this fix, only "home decor products" and "home improvement -
-// accessories" had been confirmed (2026-09-28) -- every other category was still the original,
-// never-checked flat rate (mostly a guessed 12%, Mattresses a guessed flat 18%), with NO
-// zero-fee-under-Rs.1,000 tier at all. That guess was wrong almost everywhere: every single
-// category on Amazon's real table has a 0% tier for item price <= Rs.1,000, and most of the
-// above-Rs.1,000 percentages are not 12% either (they range from 5% to 18% depending on
-// category). Only "Containers, Boxes, Bottles" and "Safes and Lockers" happened to already have
-// the correct above-Rs.1,000 rate (12%) -- they were still missing the 0% tier below Rs.1,000.
-// "Mattresses" has its own 4-tier schedule, not a simple two-tier one.
-//
-// All categories are now CONFIRMED. Re-verify on the regular schedule below (or sooner if a real
-// settlement shows a referral fee that doesn't match) rather than assuming these stay correct
-// forever -- Amazon can and does change these without notice.
-const CONFIRMED_REFERRAL_CATEGORIES = new Set([
-  "home decor products",
-  "home - other products",
-  "home improvement - other products",
-  "home improvement - accessories",
-  "home storage",
-  "home furnishing",
-  "home - fragrance & candles",
-  "kitchen - glassware & ceramicware",
-  "cookware, tableware & dinnerware",
-  "rugs and doormats",
-  "clocks",
-  "wall art",
-  "bedsheets, blankets and covers",
-  "containers, boxes, bottles",
-  "curtains and accessories",
-  "cushion covers",
-  "indoor lighting",
-  "indoor lighting - others",
-  "led bulbs and battens",
-  "wall paints and tools",
-  "craft materials",
-  "safes and lockers",
-  "mattresses"
-]);
-
-const referralFeeRules: Record<string, Array<{ maxPrice: number; percent: number }>> = {
-  "home decor products": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 17 }],
-  "home - other products": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 18 }],
-  "home improvement - other products": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 13.5 }],
-  "home improvement - accessories": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 13.5 }],
-  "home storage": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 15 }],
-  "home furnishing": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 11 }],
-  "home - fragrance & candles": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 12.5 }],
-  "kitchen - glassware & ceramicware": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 12.5 }],
-  "cookware, tableware & dinnerware": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 12.5 }],
-  "rugs and doormats": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 9 }],
-  "clocks": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 10 }],
-  "wall art": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 13.5 }],
-  "bedsheets, blankets and covers": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 8.5 }],
-  "containers, boxes, bottles": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
-  "curtains and accessories": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 16.5 }],
-  "cushion covers": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 10 }],
-  "indoor lighting": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 12.5 }],
-  "indoor lighting - others": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 16 }],
-  "led bulbs and battens": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 14 }],
-  "wall paints and tools": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 6 }],
-  "craft materials": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 5 }],
-  "safes and lockers": [{ maxPrice: 1000, percent: 0 }, { maxPrice: Number.POSITIVE_INFINITY, percent: 12 }],
-  "mattresses": [
-    { maxPrice: 500, percent: 25.5 },
-    { maxPrice: 1000, percent: 0 },
-    { maxPrice: 20000, percent: 16 },
-    { maxPrice: Number.POSITIVE_INFINITY, percent: 13.5 }
-  ]
-};
+// Referral fee rules — as of 2026-10-13 these live in the amazon_fee_referral_rules Supabase
+// table (see amazon-fee-config.service.ts), not here. That table was seeded from a full
+// re-verification against Amazon's own live Referral Fees table (sell.amazon.in/fees-and-pricing,
+// fetched twice independently on 2026-10-13, matching both times): all 23 categories are now
+// CONFIRMED. Before this, only "home decor products" and "home improvement - accessories" had
+// ever been checked (2026-09-28) — every other category was still a guessed flat rate (mostly
+// 12%, Mattresses a guessed flat 18%) with NO zero-fee-under-Rs.1,000 tier, and that guess was
+// wrong almost everywhere. getReferralFee() below reads the live (Supabase-backed, in-memory
+// cached) table via amazon-fee-config.service.ts, which also carries its own hardcoded copy of
+// these exact verified values as a fallback if that table is ever unreachable.
 
 function normalizeCategory(value: string | null | undefined): string | null {
   const cleaned = cleanText(value);
@@ -184,11 +122,12 @@ const subcategoryAliases: Record<string, string> = {
 };
 
 function resolveCategoryKey(subcategory: string): string {
-  if (referralFeeRules[subcategory]) return subcategory;
+  const rules = getReferralFeeRules();
+  if (rules[subcategory]) return subcategory;
   if (subcategoryAliases[subcategory]) return subcategoryAliases[subcategory];
   const spaced = subcategory.replace(/_/g, " ").trim();
   if (spaced !== subcategory) {
-    if (referralFeeRules[spaced]) return spaced;
+    if (rules[spaced]) return spaced;
     if (subcategoryAliases[spaced]) return subcategoryAliases[spaced];
   }
   return subcategory;
@@ -203,11 +142,9 @@ function getReferralFee(input: ProductEconomicsInput, sellingPrice: number): {
   const rawSubcategory = normalizeCategory(input.subcategoryOverride ?? input.subCategory);
   if (!rawSubcategory) return { source: "MISSING_SUBCATEGORY", percent: null, amount: 0, confidence: "UNVERIFIED_LEGACY" };
   const subcategory = resolveCategoryKey(rawSubcategory);
-  const confidence: "CONFIRMED" | "UNVERIFIED_LEGACY" = CONFIRMED_REFERRAL_CATEGORIES.has(subcategory)
-    ? "CONFIRMED"
-    : "UNVERIFIED_LEGACY";
+  const confidence = getReferralFeeConfidence(subcategory);
 
-  const rules = referralFeeRules[subcategory];
+  const rules = getReferralFeeRules()[subcategory];
   if (!rules) return { source: "NO_MATCH", percent: null, amount: 0, confidence };
 
   const rule = rules.find((item) => sellingPrice <= item.maxPrice);
@@ -221,53 +158,15 @@ function getReferralFee(input: ProductEconomicsInput, sellingPrice: number): {
   };
 }
 
-// getClosingFee — rewritten 2026-09-28.
+// getClosingFee — closing fee bands as of 2026-10-13 live in the amazon_fee_closing_bands
+// Supabase table (see amazon-fee-config.service.ts), not here. Easy Ship is CONFIRMED against
+// real August 2026 settlement data for this account (Rs.2 for <=300, Rs.23 for 301-500, matching
+// EXACTLY); FC, Self Ship, Seller Flex and Easy Ship Prime are Amazon's own published
+// post-Sept-7-2026-increase rate, not yet checked against a real settled order on those channels
+// for this account (real order data seen so far is ~100% Easy Ship).
 //
-// The previous version used ONE flat schedule (<=250:5, <=500:22, <=1000:25, else:50) regardless
-// of fulfillment channel, and had never been updated for Amazon's Sept 7, 2026 closing-fee
-// increase (confirmed live on Amazon's fees page: +Rs.1 for items <=Rs.500, +Rs.3 above). Real
-// August 2026 settlement data for this account's Easy Ship orders confirms the Easy Ship figures
-// below EXACTLY (Rs.2 for <=300, Rs.23 for 301-500). The FC, Self Ship and Seller Flex figures
-// come from Amazon's own published post-increase rate but have NOT been checked against a real
-// settled order on those channels for this account (this account's real order data seen so far
-// is 100% Easy Ship) - safe to use, worth a real-order check if/when this account starts
-// fulfilling through one of those other channels.
-//
-// categoryException keeps its EXISTING meaning from before this change (a flag that fully waives
-// the closing fee to Rs.0) - that behavior is unchanged here, since it was not part of what was
-// checked/confirmed this round.
-const CLOSING_FEE_BANDS: Record<string, Array<{ maxPrice: number; fee: number }>> = {
-  fc: [
-    { maxPrice: 300, fee: 27 },
-    { maxPrice: 500, fee: 23 },
-    { maxPrice: 1000, fee: 25 },
-    { maxPrice: Number.POSITIVE_INFINITY, fee: 75 }
-  ],
-  easy_ship: [
-    { maxPrice: 300, fee: 2 },
-    { maxPrice: 500, fee: 23 },
-    { maxPrice: 1000, fee: 36 },
-    { maxPrice: Number.POSITIVE_INFINITY, fee: 67 }
-  ],
-  easy_ship_prime: [
-    { maxPrice: 300, fee: 2 },
-    { maxPrice: 500, fee: 23 },
-    { maxPrice: 1000, fee: 36 },
-    { maxPrice: Number.POSITIVE_INFINITY, fee: 67 }
-  ],
-  self_ship: [
-    { maxPrice: 300, fee: 20 },
-    { maxPrice: 500, fee: 26 },
-    { maxPrice: 1000, fee: 50 },
-    { maxPrice: Number.POSITIVE_INFINITY, fee: 100 }
-  ],
-  seller_flex: [
-    { maxPrice: 300, fee: 7 },
-    { maxPrice: 500, fee: 13 },
-    { maxPrice: 1000, fee: 36 },
-    { maxPrice: Number.POSITIVE_INFINITY, fee: 67 }
-  ]
-};
+// categoryException keeps its original meaning (a flag that fully waives the closing fee to
+// Rs.0), independent of whatever the bands table says.
 
 function getClosingFee(
   sellingPrice: number,
@@ -276,11 +175,12 @@ function getClosingFee(
 ): { fee: number; channelUsed: string } {
   if (categoryException) return { fee: 0, channelUsed: "category_exception_waived" };
 
+  const closingFeeBands = getClosingFeeBands();
   const normalizedChannel = normalizeFulfillmentType(fulfillmentType);
   // Default to Easy Ship when the channel is missing/unrecognized - this account's real orders
   // are overwhelmingly Easy Ship, so this is the safer fallback than the old channel-blind table.
-  const channelKey = normalizedChannel && CLOSING_FEE_BANDS[normalizedChannel] ? normalizedChannel : "easy_ship";
-  const bands = CLOSING_FEE_BANDS[channelKey];
+  const channelKey = normalizedChannel && closingFeeBands[normalizedChannel] ? normalizedChannel : "easy_ship";
+  const bands = closingFeeBands[channelKey];
   const band = bands.find((item) => sellingPrice <= item.maxPrice) ?? bands[bands.length - 1];
 
   return { fee: band.fee, channelUsed: channelKey };
@@ -289,10 +189,12 @@ function getClosingFee(
 // getRefundCommission — Amazon India's real "Refund Commission" charge, confirmed 2026-09-25
 // against real August 2026 settlement data (7 of 9 real refunded orders matched one of these two
 // figures with no exceptions) and against Amazon India seller-forum reports describing the same
-// fee. Charged INSTEAD of reversing the original referral+closing fee on some refunds.
+// fee. Charged INSTEAD of reversing the original referral+closing fee on some refunds. Threshold
+// and amounts live in amazon_fee_settings (see amazon-fee-config.service.ts) as of 2026-10-13.
 function getRefundCommission(sellingPrice: number): number {
   if (sellingPrice <= 0) return 0;
-  return sellingPrice <= 300 ? 59 : 88.5; // Rs.50+18% GST, or Rs.75+18% GST
+  const threshold = getFeeSetting("refund_commission_threshold_price");
+  return sellingPrice <= threshold ? getFeeSetting("refund_commission_low") : getFeeSetting("refund_commission_high");
 }
 
 // getReturnCostPerUnit — replaces the old flat "10% of selling price" return reserve.
@@ -335,6 +237,10 @@ function getReturnCostPerUnit(input: {
   return roundTwo((totalCostPerReturn * rate) / (1 - rate));
 }
 
+// Weight bands, Pick & Pack fees and the storage rate below are UNVERIFIED_INTERNAL_ESTIMATEs
+// in amazon_fee_settings (see amazon-fee-config.service.ts) -- never checked against Amazon's
+// published rate card or a real settlement. Worth a real check if/when this account starts
+// shipping FC or a wider range of weights.
 function getShippingFee(input: ProductEconomicsInput): number {
   const manualShippingFee = toNumber(input.shippingFeeEstimate);
 
@@ -346,19 +252,21 @@ function getShippingFee(input: ProductEconomicsInput): number {
   const weightKg = toNumber(input.weightKg);
 
   if (fulfillmentType === "self_ship") return 0;
-  if (weightKg <= 0.5) return 50;
-  if (weightKg <= 1) return 70;
-  return 100;
+  if (weightKg <= getFeeSetting("shipping_fee_tier1_max_kg")) return getFeeSetting("shipping_fee_tier1_fee");
+  if (weightKg <= getFeeSetting("shipping_fee_tier2_max_kg")) return getFeeSetting("shipping_fee_tier2_fee");
+  return getFeeSetting("shipping_fee_tier3_fee");
 }
 
 function getPickAndPackFee(input: ProductEconomicsInput): number {
   if (normalizeFulfillmentType(input.fulfillmentType) !== "fc") return 0;
-  return normalizeCategory(input.productType) === "oversize" ? 25 : 17;
+  return normalizeCategory(input.productType) === "oversize"
+    ? getFeeSetting("pick_and_pack_oversize_fee")
+    : getFeeSetting("pick_and_pack_standard_fee");
 }
 
 function getStorageFee(input: ProductEconomicsInput): number {
   if (normalizeFulfillmentType(input.fulfillmentType) !== "fc") return 0;
-  return roundTwo(toNumber(input.volumeCuFt) * 5);
+  return roundTwo(toNumber(input.volumeCuFt) * getFeeSetting("storage_fee_per_cuft"));
 }
 
 function normalizeFulfillmentType(value: string | null | undefined): string | null {
@@ -633,15 +541,15 @@ export function calculateProductEconomics(input: ProductEconomicsInput): Product
   const sellingPrice = toNumber(input.sellingPrice);
   const productCost = toNumber(input.landedCost);
   const { targetProfit, targetProfitRule } = getTargetProfit(input);
-  const productGstRatePercent = toNumber(input.productGstRatePercent ?? 18);
-  const amazonFeeGstRatePercent = toNumber(input.amazonFeeGstRatePercent ?? 18);
-  // Default changed 10 -> 25 on 2026-09-28: the founder's own stated, observed return pattern
-  // is "1 in 4 orders returned" (25%). Still fully overridable per product.
-  const returnRatePercent = toNumber(input.returnRatePercent ?? 25);
-  const returnPenaltyFractionPercent = toNumber(input.returnPenaltyFractionPercent ?? 66.7);
+  const productGstRatePercent = toNumber(input.productGstRatePercent ?? getFeeSetting("default_product_gst_percent"));
+  const amazonFeeGstRatePercent = toNumber(input.amazonFeeGstRatePercent ?? getFeeSetting("default_amazon_fee_gst_percent"));
+  // Default (founder's own stated, observed return pattern is "1 in 4 orders returned", 25%)
+  // lives in amazon_fee_settings as of 2026-10-13. Still fully overridable per product.
+  const returnRatePercent = toNumber(input.returnRatePercent ?? getFeeSetting("default_return_rate_percent"));
+  const returnPenaltyFractionPercent = toNumber(input.returnPenaltyFractionPercent ?? getFeeSetting("default_return_penalty_fraction_percent"));
   const returnRecoverable = input.returnRecoverable ?? true;
-  const repackagingCost = toNumber(input.repackagingCost ?? 10);
-  const tcsPercent = toNumber(input.tcsPercent ?? 0.5);
+  const repackagingCost = toNumber(input.repackagingCost ?? getFeeSetting("default_repackaging_cost"));
+  const tcsPercent = toNumber(input.tcsPercent ?? getFeeSetting("default_tcs_percent"));
   const minimumApprovedProfit = toNumber(input.minimumApprovedProfit ?? targetProfit);
   const profitFlexEnabled = Boolean(input.profitFlexEnabled);
   const referralFee = getReferralFee(input, sellingPrice);
@@ -651,7 +559,7 @@ export function calculateProductEconomics(input: ProductEconomicsInput): Product
   const pickAndPackFee = getPickAndPackFee(input);
   const storageFee = getStorageFee(input);
   const manualOtherFees = toNumber(input.otherFees ?? input.otherCostPerUnit);
-  const hiddenOtherFee = toNumber(input.hiddenOtherFee ?? 10);
+  const hiddenOtherFee = toNumber(input.hiddenOtherFee ?? getFeeSetting("hidden_other_fee"));
   const otherFees = roundTwo(manualOtherFees + hiddenOtherFee);
   const totalAmazonFees = roundTwo(referralFee.amount + closingFee + shippingFee + pickAndPackFee + storageFee + otherFees);
   const gstOnAmazonFees = roundTwo(totalAmazonFees * (amazonFeeGstRatePercent / 100));
@@ -1263,10 +1171,10 @@ export async function saveProductEconomics(input: ProductEconomicsInput): Promis
     notes: buildCalculationNotes(input, calculation),
     updated_at: now,
     // Added 2026-09-28 - see amazon_product_economics_real_profit.sql.
-    return_penalty_fraction_percent: roundTwo(toNumber(input.returnPenaltyFractionPercent ?? 66.7)),
+    return_penalty_fraction_percent: roundTwo(toNumber(input.returnPenaltyFractionPercent ?? getFeeSetting("default_return_penalty_fraction_percent"))),
     return_recoverable: input.returnRecoverable ?? true,
-    repackaging_cost: roundTwo(toNumber(input.repackagingCost ?? 10)),
-    tcs_percent: roundTwo(toNumber(input.tcsPercent ?? 0.5)),
+    repackaging_cost: roundTwo(toNumber(input.repackagingCost ?? getFeeSetting("default_repackaging_cost"))),
+    tcs_percent: roundTwo(toNumber(input.tcsPercent ?? getFeeSetting("default_tcs_percent"))),
     tcs_amount: calculation.tcsAmount,
     amazon_settlement_estimate: calculation.amazonSettlementEstimate,
     real_cash_today: calculation.realCashToday,
@@ -1464,7 +1372,7 @@ export async function getCostCompletionQueue(sellerIdInput: string): Promise<Cos
     });
     const missingFields: string[] = [];
     const normalizedSubcategory = normalizeCategory(subcategory);
-    const hasSubcategoryMatch = Boolean(normalizedSubcategory && referralFeeRules[resolveCategoryKey(normalizedSubcategory)]);
+    const hasSubcategoryMatch = Boolean(normalizedSubcategory && getReferralFeeRules()[resolveCategoryKey(normalizedSubcategory)]);
 
     if (!subcategory || !hasSubcategoryMatch) missingFields.push("subcategory");
     if (!existingEconomics || productCost <= 0) missingFields.push("productCost");
