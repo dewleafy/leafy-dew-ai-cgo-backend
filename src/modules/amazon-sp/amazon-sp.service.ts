@@ -30,6 +30,7 @@ import {
   AmazonSpOrderItemRow,
   AmazonSpOrderRow,
   AmazonSpReturnRow,
+  AmazonSpSettlementRow,
   SafeAmazonSpListing,
   SafeAmazonSpOrder
 } from "./amazon-sp.types";
@@ -65,6 +66,32 @@ const ORDER_REPORT_STOP_STATUSES = new Set(["DONE", "DONE_NO_DATA", "CANCELLED",
 // describe GET_FLAT_FILE_RETURNS_DATA_BY_RETURN_DATE as the merchant-fulfilled/MFN counterpart
 // report, which is what this account actually needs.
 const RETURNS_REPORT_TYPE = "GET_FLAT_FILE_RETURNS_DATA_BY_RETURN_DATE";
+
+// Added 2026-10-13 to pull Amazon's real Settlement Report (per-order fee deductions) into
+// Supabase, closing the gap flagged repeatedly in product-economics.service.ts comments ("not
+// Amazon's real Settlement/Finance report") and in the project's own notes ("no live Amazon
+// Settlement Report table in Supabase"). GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2 is Amazon's
+// standard v2 settlement flat-file report type, documented consistently across Amazon's own
+// SP-API report-type catalog and multiple independent seller-tool integrations.
+//
+// Important difference from every other report type in this file: Amazon generates settlement
+// reports on ITS OWN schedule (roughly every 2 weeks, whenever a settlement period closes) -
+// sellers cannot request Amazon generate a brand-new one on demand for an arbitrary date range
+// the way Orders/Returns/Listings reports can be. So this pipeline does not call
+// waitForOrderReport/createOrderReport (POST a new report) for settlements - it calls
+// listAmazonSpSettlementReports (GET the list of reports Amazon already generated) and downloads
+// whichever of those already-done reports are new. This is the standard, reliable way to reach
+// settlement data regardless of whether on-demand generation is even allowed for this report type.
+//
+// Real column headers for this report type have NOT yet been confirmed against this account's
+// actual live settlement data (same honest caveat the returns report carried before its first
+// real sync). parseSettlementReportText below looks up every field defensively with multiple
+// candidate header spellings (the documented hyphenated flat-file names, which is what Amazon's
+// own schema and every independent reference describe), and the real detected header list is
+// returned in the sync response so any mismatch can be seen and fixed from real data rather than
+// assumed correct.
+const SETTLEMENT_REPORT_TYPE = "GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2";
+const SETTLEMENT_REPORT_LIST_PAGE_SIZE = 20;
 
 type ListingSyncItem = {
   sku: string;
@@ -2559,6 +2586,401 @@ export async function listAmazonSpReturns(sellerIdInput: string, daysInput: numb
   }
 
   return (data ?? []) as AmazonSpReturnRow[];
+}
+
+type AmazonSpReportListEntry = {
+  reportId: string;
+  reportType?: string;
+  processingStatus?: string;
+  createdTime?: string;
+  dataStartTime?: string;
+  dataEndTime?: string;
+  reportDocumentId?: string;
+};
+
+type AmazonSpReportListResponse = {
+  reports?: AmazonSpReportListEntry[];
+  nextToken?: string;
+};
+
+async function listAmazonSpSettlementReports(input: {
+  accessToken: string;
+  region: AmazonSpConnectionRow["region"];
+  marketplaceId: string;
+  createdSince?: string;
+}): Promise<AmazonSpReportListEntry[]> {
+  const response = await amazonSpGet<AmazonSpReportListResponse>({
+    path: "/reports/2021-06-30/reports",
+    accessToken: input.accessToken,
+    region: input.region,
+    stage: "LIST_SETTLEMENT_REPORTS",
+    query: {
+      reportTypes: [SETTLEMENT_REPORT_TYPE],
+      processingStatuses: ["DONE"],
+      marketplaceIds: [input.marketplaceId],
+      pageSize: SETTLEMENT_REPORT_LIST_PAGE_SIZE,
+      createdSince: input.createdSince
+    }
+  });
+
+  return response.reports ?? [];
+}
+
+type SettlementLineItem = {
+  settlementLineId: string;
+  settlementId: string | null;
+  settlementStartDate: string | null;
+  settlementEndDate: string | null;
+  depositDate: string | null;
+  totalAmount: number | null;
+  currency: string | null;
+  transactionType: string | null;
+  amazonOrderId: string | null;
+  merchantOrderId: string | null;
+  adjustmentId: string | null;
+  shipmentId: string | null;
+  marketplaceName: string | null;
+  amountType: string | null;
+  amountDescription: string | null;
+  amount: number | null;
+  fulfillmentId: string | null;
+  postedDate: string | null;
+  orderItemCode: string | null;
+  merchantOrderItemId: string | null;
+  merchantAdjustmentItemId: string | null;
+  sku: string | null;
+  quantityPurchased: number | null;
+  promotionId: string | null;
+  rawPayload: Record<string, unknown>;
+};
+
+type SettlementReportParsedResult = {
+  lines: SettlementLineItem[];
+  skippedCount: number;
+  // Same purpose as ReturnsReportParsedResult.headers: the real detected column names from this
+  // account's actual report, threaded through to the sync response so a header mismatch shows up
+  // as real data (null fields with a visible real header list) rather than a silent guess.
+  headers: string[];
+};
+
+// Settlement report dates (v2 flat file) are documented as ISO 8601 already (e.g.
+// "2026-08-16T07:00:00+00:00"), unlike the returns report's "DD-MMM-YYYY" format - but this is
+// parsed permissively and defensively rather than assumed, the same caution applied everywhere
+// else real Amazon report data meets a typed database column. Never guesses: an unparseable value
+// becomes null, not a fabricated date.
+function normalizeSettlementReportDate(value: string | null): string | null {
+  if (!value) return null;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+}
+
+function parseSettlementReportText(text: string): SettlementReportParsedResult {
+  const withoutBom = text.replace(/^﻿/, "");
+  const lines = withoutBom
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0);
+
+  if (lines.length === 0) {
+    return { lines: [], skippedCount: 0, headers: [] };
+  }
+
+  const headers = splitTabDelimitedLine(lines[0]).map((header) => header.trim().toLowerCase());
+  const settlementLines: SettlementLineItem[] = [];
+  let skippedCount = 0;
+
+  for (const [rowOffset, line] of lines.slice(1).entries()) {
+    const rowIndex = rowOffset + 1;
+    const cells = splitTabDelimitedLine(line);
+    const row: Record<string, string> = {};
+
+    headers.forEach((header, index) => {
+      row[header] = (cells[index] ?? "").trim();
+    });
+
+    if (Object.values(row).every((value) => value.length === 0)) {
+      continue;
+    }
+
+    // Every field below carries the documented hyphenated flat-file header name first, plus a
+    // space-separated alternate - the same defensive style used for the returns report, since
+    // this report type's real headers for this specific account have not yet been confirmed
+    // against a live sync.
+    const settlementId = reportValue(row, ["settlement-id", "settlement id"]);
+    const amazonOrderId = reportValue(row, ["order-id", "amazon-order-id", "order id"]);
+    const orderItemCode = reportValue(row, ["order-item-code", "order item code"]);
+    const merchantOrderItemId = reportValue(row, ["merchant-order-item-id", "merchant order item id"]);
+    const merchantAdjustmentItemId = reportValue(row, ["merchant-adjustment-item-id", "merchant adjustment item id"]);
+    const amountType = reportValue(row, ["amount-type", "amount type"]);
+    const amountDescription = reportValue(row, ["amount-description", "amount description"]);
+    const postedDate = normalizeSettlementReportDate(
+      reportValue(row, ["posted-date", "posted-date-time", "posted date", "posted date time"])
+    );
+
+    // Dedupe key: a single order item legitimately gets SEVERAL distinct settlement lines
+    // (Commission, FixedClosingFee, Principal, Shipping, ...) all sharing the same
+    // merchant-order-item-id - caught by a real test fixture mirroring exactly that shape before
+    // this shipped. Using the order-item id alone as the key would silently collapse those
+    // separate fee lines into one upserted row, losing real fee data. So the key always combines
+    // the best available per-item identifier with amount-type/amount-description/posted-date,
+    // never substitutes the identifier alone - rowIndex is only a last-resort tiebreaker for two
+    // truly identical rows (e.g. the same fee type posted twice on the same date).
+    const settlementLineId = [
+      merchantOrderItemId ?? merchantAdjustmentItemId ?? orderItemCode ?? settlementId ?? "unknown-item",
+      amountType ?? "unknown-type",
+      amountDescription ?? "unknown-description",
+      postedDate ?? "unknown-date",
+      rowIndex
+    ].join("|");
+
+    if (!settlementLineId) {
+      skippedCount += 1;
+      continue;
+    }
+
+    const rawPayload: Record<string, unknown> = { ...row };
+
+    settlementLines.push({
+      settlementLineId,
+      settlementId,
+      settlementStartDate: normalizeSettlementReportDate(reportValue(row, ["settlement-start-date", "settlement start date"])),
+      settlementEndDate: normalizeSettlementReportDate(reportValue(row, ["settlement-end-date", "settlement end date"])),
+      depositDate: normalizeSettlementReportDate(reportValue(row, ["deposit-date", "deposit date"])),
+      totalAmount: reportNumber(row, ["total-amount", "total amount"]),
+      currency: reportValue(row, ["currency"]),
+      transactionType: reportValue(row, ["transaction-type", "transaction type"]),
+      amazonOrderId,
+      merchantOrderId: reportValue(row, ["merchant-order-id", "merchant order id"]),
+      adjustmentId: reportValue(row, ["adjustment-id", "adjustment id"]),
+      shipmentId: reportValue(row, ["shipment-id", "shipment id"]),
+      marketplaceName: reportValue(row, ["marketplace-name", "marketplace name"]),
+      amountType,
+      amountDescription,
+      amount: reportNumber(row, ["amount"]),
+      fulfillmentId: reportValue(row, ["fulfillment-id", "fulfillment id"]),
+      postedDate,
+      orderItemCode,
+      merchantOrderItemId,
+      merchantAdjustmentItemId,
+      sku: reportValue(row, ["sku"]),
+      quantityPurchased: toIntegerOrNull(reportValue(row, ["quantity-purchased", "quantity purchased"])),
+      promotionId: reportValue(row, ["promotion-id", "promotion id"]),
+      rawPayload
+    });
+  }
+
+  return { lines: settlementLines, skippedCount, headers };
+}
+
+async function upsertAmazonSpSettlementLines(input: {
+  sellerId: string;
+  marketplaceId: string;
+  lines: SettlementLineItem[];
+}): Promise<void> {
+  if (input.lines.length === 0) return;
+
+  const now = new Date().toISOString();
+  const { error } = await supabase.from("amazon_sp_settlements").upsert(
+    input.lines.map((item) => ({
+      seller_id: input.sellerId,
+      marketplace_id: input.marketplaceId,
+      settlement_line_id: item.settlementLineId,
+      settlement_id: item.settlementId,
+      settlement_start_date: item.settlementStartDate,
+      settlement_end_date: item.settlementEndDate,
+      deposit_date: item.depositDate,
+      total_amount: item.totalAmount,
+      currency: item.currency,
+      transaction_type: item.transactionType,
+      amazon_order_id: item.amazonOrderId,
+      merchant_order_id: item.merchantOrderId,
+      adjustment_id: item.adjustmentId,
+      shipment_id: item.shipmentId,
+      marketplace_name: item.marketplaceName,
+      amount_type: item.amountType,
+      amount_description: item.amountDescription,
+      amount: item.amount,
+      fulfillment_id: item.fulfillmentId,
+      posted_date: item.postedDate,
+      order_item_code: item.orderItemCode,
+      merchant_order_item_id: item.merchantOrderItemId,
+      merchant_adjustment_item_id: item.merchantAdjustmentItemId,
+      sku: item.sku,
+      quantity_purchased: item.quantityPurchased,
+      promotion_id: item.promotionId,
+      raw_payload: item.rawPayload,
+      last_synced_at: now,
+      updated_at: now
+    })),
+    { onConflict: "seller_id,settlement_line_id" }
+  );
+
+  if (error) {
+    logSafeAmazonSpError("Could not upsert Amazon SP-API settlement lines.", error);
+    const detail = [error.message, error.details, error.hint].filter(Boolean).map((value) => sanitizeAmazonSpValue(value)).join(" | ");
+    throw new Error(`Could not save Amazon SP-API settlement lines in Supabase.${detail ? ` (${detail})` : ""}`);
+  }
+}
+
+export async function syncAmazonSpSettlementsReport(input: {
+  sellerId: string;
+  days: number;
+  limit?: number;
+  reportId?: string;
+}) {
+  const sellerId = sellerIdOrDefault(input.sellerId);
+  const days = Math.min(Math.max(Math.floor(input.days), 1), 365);
+  const limit = Math.min(Math.max(Math.floor(input.limit ?? 5), 1), 20);
+  const requestedReportId = cleanText(input.reportId) ?? undefined;
+  const connection = await requireConnectedConnection(sellerId);
+
+  await logSpActivity({
+    sellerId,
+    action: "SYNC_SETTLEMENTS_REPORT_STARTED",
+    status: "INFO",
+    message: "Amazon SP-API settlement report sync started.",
+    metadata: { source: "REPORTS_API", reportType: SETTLEMENT_REPORT_TYPE, days, limit, requestedReportId: requestedReportId ?? null }
+  });
+
+  try {
+    const accessToken = await getAmazonSpAccessToken(connection.id);
+
+    // A specific reportId can be targeted directly (same pattern as every other report sync in
+    // this file) - useful for re-processing one settlement report Amazon already generated.
+    const reportEntries: AmazonSpReportListEntry[] = requestedReportId
+      ? [{ reportId: requestedReportId }]
+      : await listAmazonSpSettlementReports({
+          accessToken,
+          region: connection.region,
+          marketplaceId: connection.marketplace_id,
+          createdSince: new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString()
+        });
+
+    const reportsToProcess = reportEntries.slice(0, limit);
+
+    if (reportsToProcess.length === 0) {
+      await updateConnectionError(connection.id, null);
+      await logSpActivity({
+        sellerId,
+        action: "SYNC_SETTLEMENTS_REPORT_COMPLETED",
+        status: "SUCCESS",
+        message: "No settlement reports found from Amazon in the requested window.",
+        metadata: { source: "REPORTS_API", reportType: SETTLEMENT_REPORT_TYPE, days }
+      });
+
+      return {
+        ok: true,
+        source: "REPORTS_API",
+        reportType: SETTLEMENT_REPORT_TYPE,
+        days,
+        reportsFound: 0,
+        reportsProcessed: 0,
+        syncedLines: 0,
+        skippedCount: 0,
+        message:
+          "Amazon has not generated a settlement report in this window yet (it generates them on its own schedule, roughly every 2 weeks), or none were returned for this seller/marketplace."
+      };
+    }
+
+    let totalSynced = 0;
+    let totalSkipped = 0;
+    let detectedHeaders: string[] = [];
+    const processedReports: Array<{ reportId: string; status: string; syncedLines: number }> = [];
+
+    for (const entry of reportsToProcess) {
+      const report = entry.reportDocumentId
+        ? entry
+        : await getOrderReportStatus(accessToken, connection.region, entry.reportId);
+      const status = report.processingStatus ?? (report.reportDocumentId ? "DONE" : "UNKNOWN");
+
+      if (status !== "DONE" || !report.reportDocumentId) {
+        processedReports.push({ reportId: entry.reportId, status, syncedLines: 0 });
+        continue;
+      }
+
+      const reportText = await loadAmazonSpReportDocument({
+        accessToken,
+        region: connection.region,
+        reportDocumentId: report.reportDocumentId,
+        stage: "GET_SETTLEMENT_REPORT_DOCUMENT"
+      });
+      const parsed = parseSettlementReportText(reportText);
+
+      await upsertAmazonSpSettlementLines({ sellerId, marketplaceId: connection.marketplace_id, lines: parsed.lines });
+
+      totalSynced += parsed.lines.length;
+      totalSkipped += parsed.skippedCount;
+      if (parsed.headers.length > 0) detectedHeaders = parsed.headers;
+      processedReports.push({ reportId: entry.reportId, status, syncedLines: parsed.lines.length });
+
+      // Small pause between reports - the same connection-pool-safe pattern used when firing many
+      // engine runs or report saves in a row elsewhere in this app (see pending-tasks-list.md item
+      // 17's history), since a settlement report can carry a large number of line items.
+      if (reportsToProcess.length > 1) {
+        await smallDelay(500);
+      }
+    }
+
+    await updateConnectionError(connection.id, null);
+    await logSpActivity({
+      sellerId,
+      action: "SYNC_SETTLEMENTS_REPORT_COMPLETED",
+      status: "SUCCESS",
+      message: "Amazon SP-API settlement report sync completed.",
+      metadata: {
+        source: "REPORTS_API",
+        reportType: SETTLEMENT_REPORT_TYPE,
+        days,
+        reportsFound: reportEntries.length,
+        reportsProcessed: processedReports.length,
+        syncedLines: totalSynced,
+        skippedCount: totalSkipped
+      }
+    });
+
+    return {
+      ok: true,
+      source: "REPORTS_API",
+      reportType: SETTLEMENT_REPORT_TYPE,
+      days,
+      reportsFound: reportEntries.length,
+      reportsProcessed: processedReports.length,
+      reports: processedReports,
+      syncedLines: totalSynced,
+      skippedCount: totalSkipped,
+      detectedHeaders
+    };
+  } catch (error) {
+    await updateConnectionError(connection.id, safeErrorMessage(error));
+    await logSpActivity({
+      sellerId,
+      action: "SYNC_SETTLEMENTS_REPORT_FAILED",
+      status: "ERROR",
+      message: safeErrorMessage(error)
+    });
+    throw error;
+  }
+}
+
+export async function listAmazonSpSettlements(sellerIdInput: string, daysInput: number): Promise<AmazonSpSettlementRow[]> {
+  const sellerId = sellerIdOrDefault(sellerIdInput);
+  const days = Math.min(Math.max(Math.floor(daysInput), 1), 365);
+  const rangeStart = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+
+  const { data, error } = await supabase
+    .from("amazon_sp_settlements")
+    .select("*")
+    .eq("seller_id", sellerId)
+    .gte("posted_date", rangeStart)
+    .order("posted_date", { ascending: false })
+    .limit(5000);
+
+  if (error) {
+    logSafeAmazonSpError("Could not load Amazon SP-API settlements.", error);
+    throw new Error("Could not load Amazon SP-API settlements from Supabase.");
+  }
+
+  return (data ?? []) as AmazonSpSettlementRow[];
 }
 
 export async function syncAmazonSpOrders(sellerIdInput: string, daysInput: number) {
