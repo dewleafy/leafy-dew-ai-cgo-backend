@@ -13,6 +13,7 @@ import {
   listAmazonSpListingsController,
   listAmazonSpOrdersController,
   listAmazonSpReturnsController,
+  listAmazonSpSettlementsController,
   processAmazonSpReportJobsController,
   syncAmazonSpListingAttributesController,
   syncAmazonSpListingDetailsController,
@@ -20,7 +21,8 @@ import {
   syncAmazonSpOrderReportController,
   syncAmazonSpOrderReportChunkedController,
   syncAmazonSpOrdersController,
-  syncAmazonSpReturnsReportController
+  syncAmazonSpReturnsReportController,
+  syncAmazonSpSettlementsReportController
 } from "./amazon-sp.controller";
 
 export const amazonSpRouter = Router();
@@ -42,6 +44,9 @@ amazonSpRouter.get("/sync-order-report", asyncHandler(syncAmazonSpOrderReportCon
 amazonSpRouter.get("/sync-returns-report", asyncHandler(syncAmazonSpReturnsReportController));
 amazonSpRouter.post("/sync-returns-report", asyncHandler(syncAmazonSpReturnsReportController));
 amazonSpRouter.get("/returns", asyncHandler(listAmazonSpReturnsController));
+amazonSpRouter.get("/sync-settlements-report", asyncHandler(syncAmazonSpSettlementsReportController));
+amazonSpRouter.post("/sync-settlements-report", asyncHandler(syncAmazonSpSettlementsReportController));
+amazonSpRouter.get("/settlements", asyncHandler(listAmazonSpSettlementsController));
 amazonSpRouter.get("/sync-order-report-chunked", asyncHandler(syncAmazonSpOrderReportChunkedController));
 amazonSpRouter.get("/debug-order-report", asyncHandler(debugAmazonSpOrderReportController));
 amazonSpRouter.get("/daily-sync", asyncHandler(dailyAmazonSpSyncController));
