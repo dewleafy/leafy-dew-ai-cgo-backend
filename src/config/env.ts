@@ -42,6 +42,11 @@ const envSchema = z.object({
   // Provider: OpenAI (Chat Completions API). If OpenAI ever rejects OPENAI_MODEL with
   // "model not found," check the exact current model id at platform.openai.com and update this.
   OPENAI_API_KEY: z.string().optional(),
+  // Image generation uses a different OpenAI endpoint (Images API) and model family than the chat/
+  // vision models above -- added 2026-10-15 for the Competitor Benchmark Tool's Stage 2 AI image
+  // mockups (see ai-gateway.service.ts's generateAiImageResponse). "gpt-image-1" is OpenAI's current
+  // general-purpose image model; override here if the account uses a different one.
+  OPENAI_IMAGE_MODEL: z.string().min(1).default("gpt-image-1"),
   OPENAI_MODEL: z.string().min(1).default("gpt-5.6-luna"),
   // Vision (image-input) judging added 2026-10-05 for the Listing Optimizer's automatic
   // lifestyle-photo / image-quality rubric. Defaults to OPENAI_MODEL itself (most current chat
