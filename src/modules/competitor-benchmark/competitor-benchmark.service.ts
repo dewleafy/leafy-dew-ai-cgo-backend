@@ -9,6 +9,7 @@ import { listProductPassports } from "../product-passports/product-passports.ser
 import { SafeProductPassportRow } from "../product-passports/product-passports.types";
 import { calculateProductEconomics } from "../product-economics/product-economics.service";
 import { ProductEconomicsInput, ProductEconomicsRow } from "../product-economics/product-economics.types";
+import { generateAiImageResponse } from "../ai-gateway/ai-gateway.service";
 import {
   CompetitorBenchmarkCandidateRow,
   CompetitorBenchmarkCandidateSource,
@@ -45,6 +46,11 @@ const CATALOG_INCLUDED_DATA = ["summaries", "images", "attributes", "salesRanks"
 // absent a confirmed per-category override we never recommend adding past this, so the written
 // checklist can't tell you to do something Amazon's own listing editor will reject.
 const MAX_LISTING_IMAGES = 9;
+
+// Supabase Storage bucket for Stage 2 AI-generated image mockups (added 2026-10-15). This is the
+// first use of .storage anywhere in this codebase, so ensureListingMockupBucket() below creates it
+// on first use rather than assuming a migration already made it.
+const LISTING_MOCKUP_BUCKET = "listing-mockups";
 
 // Generic English filler words excluded from the "words competitors use that you don't" listing-copy
 // comparison below -- keeps that list to real descriptive/product terms instead of noise like "with"/"and".
@@ -1276,24 +1282,24 @@ export async function runCompetitorBenchmarkComparison(input: { runId: string; s
         gap_summary: buildFindingSentence({ dimension: plan.dimension, ownValue, best })
       });
 
+      // Only IMAGE_COUNT feeds the "Image checklist" below -- BULLET_COUNT and TITLE_LENGTH gaps
+      // are already captured above in findingsToInsert (shown under "Findings"). Earlier this also
+      // pushed BULLET_COUNT/TITLE_LENGTH sentences into imageGapChanges, which rendered them a
+      // second time under the image-specific "Image checklist (written, Stage 1)" heading --
+      // reported 2026-10-15 as confusing (bullet/title recommendations appearing as if they were
+      // image recommendations). Fixed by only ever populating imageGapChanges for IMAGE_COUNT.
       const gapFavorsCompetitor = plan.direction === "max" ? best.value > ownValue : best.value < ownValue;
-      if (gapFavorsCompetitor && (plan.dimension === "IMAGE_COUNT" || plan.dimension === "BULLET_COUNT" || plan.dimension === "TITLE_LENGTH")) {
+      if (gapFavorsCompetitor && plan.dimension === "IMAGE_COUNT") {
         basedOnAsins.add(best.asin);
-        if (plan.dimension === "IMAGE_COUNT") {
-          // Never recommend exceeding Amazon's own listing image limit, no matter how many a
-          // competitor's catalog data shows (see MAX_LISTING_IMAGES above -- this is exactly the
-          // fix for the "recommending 24 more images, but a listing can only hold 9" report).
-          const target = Math.min(best.value, MAX_LISTING_IMAGES);
-          const toAdd = target - ownValue;
-          if (toAdd > 0) {
-            imageGapChanges.push(`Add ${toAdd} more listing image(s), up to Amazon's standard ${MAX_LISTING_IMAGES}-image-per-listing limit -- the strongest confirmed competitor (${best.asin}) shows ${best.value} image slot(s) in Amazon's catalog data, you show ${ownValue}.`);
-          } else {
-            imageGapChanges.push(`You're already at Amazon's standard ${MAX_LISTING_IMAGES}-image-per-listing limit (${ownValue}); the competitor's catalog data (${best.asin}, ${best.value}) can't be matched by adding more images -- if ${best.asin} genuinely shows more than ${MAX_LISTING_IMAGES}, that's a wider allowance for their specific category, not something your listing can also do.`);
-          }
-        } else if (plan.dimension === "BULLET_COUNT") {
-          imageGapChanges.push(`Add ${best.value - ownValue} more bullet point(s) -- the strongest confirmed competitor (${best.asin}) has ${best.value}, you have ${ownValue}.`);
-        } else if (plan.dimension === "TITLE_LENGTH") {
-          imageGapChanges.push(`Your title (${ownValue} characters) is noticeably shorter than ${best.asin}'s (${best.value} characters) -- check whether theirs includes search terms yours is missing.`);
+        // Never recommend exceeding Amazon's own listing image limit, no matter how many a
+        // competitor's catalog data shows (see MAX_LISTING_IMAGES above -- this is exactly the
+        // fix for the "recommending 24 more images, but a listing can only hold 9" report).
+        const target = Math.min(best.value, MAX_LISTING_IMAGES);
+        const toAdd = target - ownValue;
+        if (toAdd > 0) {
+          imageGapChanges.push(`Add ${toAdd} more listing image(s), up to Amazon's standard ${MAX_LISTING_IMAGES}-image-per-listing limit -- the strongest confirmed competitor (${best.asin}) shows ${best.value} image slot(s) in Amazon's catalog data, you show ${ownValue}.`);
+        } else {
+          imageGapChanges.push(`You're already at Amazon's standard ${MAX_LISTING_IMAGES}-image-per-listing limit (${ownValue}); the competitor's catalog data (${best.asin}, ${best.value}) can't be matched by adding more images -- if ${best.asin} genuinely shows more than ${MAX_LISTING_IMAGES}, that's a wider allowance for their specific category, not something your listing can also do.`);
         }
       }
     }
@@ -1353,9 +1359,15 @@ export async function runCompetitorBenchmarkComparison(input: { runId: string; s
       if (missingWords.length === 0) {
         contentGapNotes.push(`Your listing copy already covers the same real words your ${competitorCopies.length} confirmed competitor(s) use in their titles/bullets -- no gap found this pass.`);
       } else {
+        // Itemized one word/phrase per line (2026-10-15 fix) -- this used to be a single long
+        // comma-joined sentence, reported as "not properly clear." Each line is now its own list
+        // entry so the word and its competitor-count read as a clean pair.
         contentGapNotes.push(
-          `Words/phrases used in ${competitorCopies.length} confirmed competitor(s)' real title/bullet text that don't appear in yours: ${missingWords.map(([word, count]) => `"${word}" (${count}/${competitorCopies.length})`).join(", ")}.`
+          `Words/phrases used in ${competitorCopies.length} confirmed competitor(s)' real title/bullet text that don't appear in yours (most-used first):`
         );
+        for (const [word, count] of missingWords) {
+          contentGapNotes.push(`"${word}" -- used by ${count}/${competitorCopies.length} confirmed competitor(s).`);
+        }
         contentGapNotes.push(
           "This is a plain text comparison of real, already-pulled listing copy -- not Amazon search-volume or backend keyword data (SP-API doesn't expose that to sellers). Before adding any of these to your title or bullets, check each one is factually true for your product."
         );
@@ -1384,14 +1396,51 @@ export async function runCompetitorBenchmarkComparison(input: { runId: string; s
   return (await getCompetitorBenchmarkRun({ id: run.id, sellerId })) as SafeCompetitorBenchmarkRun;
 }
 
-// ---- Stage 2: image mockup request (not yet configured -- see spec's open items) ----
+// ---- Stage 2: AI-generated image mockup request (built 2026-10-15, using OpenAI's Images
+// Generation API via generateAiImageResponse in ai-gateway.service.ts -- a different endpoint from
+// the chat/vision completions already used elsewhere in this app, e.g. the Listing Optimizer's
+// image-quality rubric. Grounded in this run's own real data: the own SKU's actual Amazon title
+// (from competitor_benchmark_candidates) and the already-computed Stage-1 written image checklist
+// (from competitor_benchmark_image_briefs.recommended_changes) -- never a generic/blind prompt. ----
+
+let listingMockupBucketEnsured = false;
+
+async function ensureListingMockupBucket(): Promise<void> {
+  if (listingMockupBucketEnsured) return;
+  const { data: buckets, error: listError } = await supabase.storage.listBuckets();
+  if (listError) {
+    logError("Could not list Supabase Storage buckets.", listError);
+    return;
+  }
+  const exists = (buckets ?? []).some((bucket) => bucket.name === LISTING_MOCKUP_BUCKET);
+  if (!exists) {
+    const { error: createError } = await supabase.storage.createBucket(LISTING_MOCKUP_BUCKET, { public: true });
+    if (createError) {
+      // A second concurrent request may have created it a moment earlier -- don't fail the whole
+      // mockup request over that race, just log it and let the upload below surface any real problem.
+      logError("Could not create Supabase Storage bucket for listing mockups.", createError);
+    }
+  }
+  listingMockupBucketEnsured = true;
+}
+
+const MOCKUP_BLOCKED_MESSAGES: Record<string, string> = {
+  AI_CALLS_DISABLED: "AI calls are currently disabled in AI Gateway settings, so no mockup was generated. Turn them on in AI Gateway settings, then try again.",
+  AI_MODULE_NOT_ALLOWED_BY_SETTINGS: "This seller's AI Gateway settings don't yet allow the image-mockup module, so no mockup was generated. Add COMPETITOR_BENCHMARK_IMAGE_MOCKUP to the allowed modules in AI Gateway settings, then try again.",
+  AI_MODULE_BLOCKED_BY_SETTINGS: "This seller's AI Gateway settings explicitly block the image-mockup module, so no mockup was generated.",
+  AI_DAILY_BUDGET_EXCEEDED: "Today's AI budget is used up, so no mockup was generated. Try again tomorrow, or raise the daily budget in AI Gateway settings.",
+  AI_MONTHLY_BUDGET_EXCEEDED: "This month's AI budget is used up, so no mockup was generated. Try again next month, or raise the monthly budget in AI Gateway settings.",
+  AI_PROVIDER_NOT_CONFIGURED: "No OpenAI API key is configured, so no mockup was generated.",
+  AI_PROVIDER_CALL_FAILED: "The OpenAI image generation call failed, so no mockup was generated. This was recorded as a failed attempt -- try again in a moment.",
+  SECURITY_GUARDRAIL_BLOCKED: "This request was blocked by a security guardrail, so no mockup was generated."
+};
 
 export async function requestCompetitorBenchmarkImageMockup(input: {
   runId: string;
   sellerId: string;
   ownSku: string;
   imageSlot: number;
-}): Promise<{ ok: boolean; configured: boolean; message: string }> {
+}): Promise<{ ok: boolean; configured: boolean; message: string; mockupUrl?: string | null }> {
   const sellerId = cleanText(input.sellerId) ?? "default";
   const run = await loadRunRow(input.runId, sellerId);
   if (!run) {
@@ -1403,25 +1452,102 @@ export async function requestCompetitorBenchmarkImageMockup(input: {
     throw new CompetitorBenchmarkError("ownSku is required.");
   }
 
-  const message = "Stage 2 (AI-generated image mockups) needs an image-generation service to be chosen and connected first -- this hasn't been set up yet, so no mockup was generated. Stage 1's written image checklist above is ready to use now.";
   const now = new Date().toISOString();
 
-  const { error } = await supabase
-    .from("competitor_benchmark_image_mockups")
-    .upsert({
-      run_id: run.id,
-      own_sku: ownSku,
-      image_slot: input.imageSlot,
-      status: "NOT_CONFIGURED",
-      mockup_url: null,
-      note: message,
-      requested_at: now,
-      updated_at: now
-    }, { onConflict: "run_id,own_sku,image_slot" });
-
-  if (error) {
-    logError("Could not record competitor benchmark image mockup request.", error);
+  async function saveMockupRow(status: "NOT_CONFIGURED" | "FAILED" | "GENERATED", note: string, mockupUrl: string | null) {
+    const { error } = await supabase
+      .from("competitor_benchmark_image_mockups")
+      .upsert({
+        run_id: run!.id,
+        own_sku: ownSku,
+        image_slot: input.imageSlot,
+        status,
+        mockup_url: mockupUrl,
+        note,
+        requested_at: now,
+        updated_at: now
+      }, { onConflict: "run_id,own_sku,image_slot" });
+    if (error) {
+      logError("Could not record competitor benchmark image mockup request.", error);
+    }
   }
 
-  return { ok: true, configured: false, message };
+  const [{ data: ownCandidateRows }, { data: briefRow }] = await Promise.all([
+    supabase
+      .from("competitor_benchmark_candidates")
+      .select("*")
+      .eq("run_id", run.id)
+      .eq("own_sku", ownSku)
+      .eq("source", "OWN_BASELINE")
+      .limit(1),
+    supabase
+      .from("competitor_benchmark_image_briefs")
+      .select("*")
+      .eq("run_id", run.id)
+      .eq("own_sku", ownSku)
+      .maybeSingle<CompetitorBenchmarkImageBriefRow>()
+  ]);
+
+  const ownTitle = cleanText((ownCandidateRows as CompetitorBenchmarkCandidateRow[] | null)?.[0]?.title ?? null);
+  const recommendedChanges = (briefRow?.recommended_changes ?? []) as string[];
+
+  if (!ownTitle && recommendedChanges.length === 0) {
+    const message = "Couldn't find your own listing's title or a written image checklist for this SKU in this run, so there isn't enough real data yet to generate a grounded mockup. Run (or re-run) the comparison for this SKU, then try again.";
+    await saveMockupRow("NOT_CONFIGURED", message, null);
+    return { ok: true, configured: false, message, mockupUrl: null };
+  }
+
+  const promptParts = [
+    `Create a realistic Amazon product listing image, image slot #${input.imageSlot}, for the following product.`,
+    ownTitle ? `Product title: ${ownTitle}` : null,
+    recommendedChanges.length > 0
+      ? `Incorporate these specific, data-backed suggestions where visually relevant: ${recommendedChanges.join(" ")}`
+      : null,
+    "Style: clean e-commerce product photography/infographic suitable for an Amazon listing image. No invented brand names or logos. Avoid rendering any small body text."
+  ].filter((part): part is string => Boolean(part));
+
+  const result = await generateAiImageResponse({
+    sellerId,
+    moduleName: "COMPETITOR_BENCHMARK_IMAGE_MOCKUP",
+    purpose: `Competitor benchmark image mockup for ${ownSku}, slot ${input.imageSlot}`,
+    prompt: promptParts.join(" "),
+    actor: "founder",
+    // generateAiImageResponse() (like generateAiResponse/generateAiVisionResponse) requires a
+    // founder/admin actor -- the security guardrail silently blocks "system" for AI_GENERATE calls,
+    // and this only ever runs from a founder clicking "Request AI image mockup" in the UI, never a
+    // background job.
+    requestId: `competitor-benchmark-${run.id}-${ownSku}-${input.imageSlot}`,
+    metadata: { runId: run.id, ownSku, imageSlot: input.imageSlot }
+  });
+
+  if (!result.ok || !result.imageBase64) {
+    const message = MOCKUP_BLOCKED_MESSAGES[result.blockedReason ?? ""] ?? result.message;
+    const status = result.blockedReason === "AI_PROVIDER_CALL_FAILED" ? "FAILED" : "NOT_CONFIGURED";
+    await saveMockupRow(status, message, null);
+    return { ok: true, configured: false, message, mockupUrl: null };
+  }
+
+  await ensureListingMockupBucket();
+
+  const storagePath = `${sellerId}/${run.id}/${ownSku}/slot-${input.imageSlot}-${Date.now()}.png`;
+  const imageBuffer = Buffer.from(result.imageBase64, "base64");
+
+  const { error: uploadError } = await supabase.storage
+    .from(LISTING_MOCKUP_BUCKET)
+    .upload(storagePath, imageBuffer, { contentType: "image/png", upsert: true });
+
+  if (uploadError) {
+    logError("Could not upload generated competitor benchmark image mockup.", uploadError);
+    const message = "The image was generated, but saving it to storage failed, so nothing is shown yet. Try again -- the AI call succeeded, only the save step failed.";
+    await saveMockupRow("FAILED", message, null);
+    return { ok: true, configured: false, message, mockupUrl: null };
+  }
+
+  const { data: publicUrlData } = supabase.storage.from(LISTING_MOCKUP_BUCKET).getPublicUrl(storagePath);
+  const mockupUrl = publicUrlData?.publicUrl ?? null;
+  const message = "AI image mockup generated below. This is a starting point grounded in your real title and Stage 1's written checklist above -- review it carefully (AI-generated images can misrender text, logos, or exact product details) before using it in your live listing.";
+
+  await saveMockupRow("GENERATED", message, mockupUrl);
+
+  return { ok: true, configured: true, message, mockupUrl };
 }
