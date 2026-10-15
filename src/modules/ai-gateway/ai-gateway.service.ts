@@ -22,6 +22,13 @@ const OUTPUT_COST_PER_1K = 0.0012;
 const OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MAX_OUTPUT_TOKENS = 1024;
 
+// OpenAI's Images Generation API is priced per image, not per token like the chat/vision models
+// above -- this is a flat estimate for the default "1024x1024" standard-quality tier (per OpenAI's
+// published pricing; confirm at platform.openai.com/docs/pricing if a live call ever fails with a
+// pricing-related error or the account's actual rate differs).
+const IMAGE_GENERATION_COST_PER_IMAGE = 0.04;
+const OPENAI_IMAGES_GENERATIONS_URL = "https://api.openai.com/v1/images/generations";
+
 function cleanText(value: unknown): string | null {
   const trimmed = typeof value === "string" ? value.trim() : value == null ? "" : String(value).trim();
   return trimmed ? trimmed : null;
@@ -232,7 +239,12 @@ const ALLOWED_FUTURE_MODULES = new Set([
   "CREATIVE_RECOMMENDATIONS",
   "CEO_REPORT",
   "ENGINE_SUMMARY",
-  "EXPERIMENT_SUMMARY"
+  "EXPERIMENT_SUMMARY",
+  // Added 2026-10-15 for the Competitor Benchmark Tool's Stage 2 AI image mockups
+  // (requestCompetitorBenchmarkImageMockup in competitor-benchmark.service.ts). As with
+  // LISTING_OPTIMIZER above, this seller's ai_gateway_settings.allowed_modules in Supabase must
+  // ALSO include this module name -- both allow-lists are required.
+  "COMPETITOR_BENCHMARK_IMAGE_MOCKUP"
 ]);
 
 async function sumEstimatedCostSince(sellerId: string, sinceIso: string): Promise<number> {
@@ -372,6 +384,216 @@ async function callOpenAiVisionChatCompletion(input: {
     inputTokens: toNumber(data.usage?.prompt_tokens),
     outputTokens: toNumber(data.usage?.completion_tokens)
   };
+}
+
+async function callOpenAiImageGeneration(input: {
+  prompt: string;
+  size: string;
+  model: string;
+}): Promise<{ base64: string }> {
+  const response = await axios.post(
+    OPENAI_IMAGES_GENERATIONS_URL,
+    {
+      model: input.model,
+      prompt: input.prompt,
+      size: input.size,
+      n: 1
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${env.OPENAI_API_KEY ?? ""}`,
+        "content-type": "application/json"
+      },
+      // Image generation runs noticeably slower than a text/vision chat completion.
+      timeout: 120000
+    }
+  );
+
+  const data = response.data as { data?: Array<{ b64_json?: string | null }> };
+  const base64 = cleanText(data.data?.[0]?.b64_json ?? null);
+  if (!base64) {
+    throw new Error("OpenAI image generation returned no image data.");
+  }
+  return { base64 };
+}
+
+// Image twin of generateAiResponse/generateAiVisionResponse below: same guardrail/budget/ledger
+// sequence (security guardrail, AI_CALLS_DISABLED, module allow-list, daily/monthly budget,
+// provider-configured check), but calls OpenAI's Images Generation API -- a different endpoint
+// from the chat/vision completions those two functions use -- and returns a base64-encoded PNG
+// instead of text. Cost is a flat per-image rate (IMAGE_GENERATION_COST_PER_IMAGE) rather than
+// token-based, since that's how OpenAI actually prices this endpoint; inputTokens/outputTokens on
+// the resulting ledger row are recorded as 0 for the same reason (not because nothing was spent).
+export async function generateAiImageResponse(input: AiGenerateInput & { size?: string }): Promise<{
+  ok: boolean;
+  blockedReason: string | null;
+  entry: SafeAiCostLedgerEntry;
+  imageBase64: string | null;
+  message: string;
+}> {
+  const sellerId = cleanText(input.sellerId) ?? "default";
+  const settings = await ensureAiGatewaySettings(sellerId);
+  const prompt = cleanText(input.prompt);
+  const size = cleanText(input.size) ?? "1024x1024";
+  const moduleName = cleanText(input.moduleName) ?? "UNKNOWN_MODULE";
+  const estimatedCost = IMAGE_GENERATION_COST_PER_IMAGE;
+  const allowedModules = toJsonArray(settings.allowedModules).map(String);
+  const blockedModules = toJsonArray(settings.blockedModules).map(String);
+  const security = await checkSecurityGuardrail({
+    sellerId,
+    actor: input.actor ?? "system",
+    action: "AI_GENERATE",
+    route: "/api/ai-gateway/generate",
+    metadata: { moduleName, imageGeneration: true }
+  }).catch(() => null);
+  let blockedReason: string | null = null;
+
+  if (security && !security.allowed) {
+    blockedReason = security.reason ?? "SECURITY_GUARDRAIL_BLOCKED";
+  } else if (!settings.aiCallsEnabled) {
+    blockedReason = "AI_CALLS_DISABLED";
+  } else if (!ALLOWED_FUTURE_MODULES.has(moduleName)) {
+    blockedReason = "AI_MODULE_NOT_ALLOWED";
+  } else if (allowedModules.length > 0 && !allowedModules.includes(moduleName)) {
+    blockedReason = "AI_MODULE_NOT_ALLOWED_BY_SETTINGS";
+  } else if (blockedModules.includes(moduleName)) {
+    blockedReason = "AI_MODULE_BLOCKED_BY_SETTINGS";
+  } else if (!prompt) {
+    blockedReason = "AI_PROMPT_REQUIRED";
+  }
+
+  if (!blockedReason) {
+    const todayStart = new Date();
+    todayStart.setUTCHours(0, 0, 0, 0);
+    const monthStart = new Date();
+    monthStart.setUTCDate(1);
+    monthStart.setUTCHours(0, 0, 0, 0);
+    const [todayCost, monthCost] = await Promise.all([
+      sumEstimatedCostSince(sellerId, todayStart.toISOString()),
+      sumEstimatedCostSince(sellerId, monthStart.toISOString())
+    ]);
+    if (settings.dailyBudget <= 0 || todayCost + estimatedCost > settings.dailyBudget) {
+      blockedReason = "AI_DAILY_BUDGET_EXCEEDED";
+    } else if (settings.monthlyBudget <= 0 || monthCost + estimatedCost > settings.monthlyBudget) {
+      blockedReason = "AI_MONTHLY_BUDGET_EXCEEDED";
+    }
+  }
+
+  if (!blockedReason && !env.OPENAI_API_KEY) {
+    blockedReason = "AI_PROVIDER_NOT_CONFIGURED";
+  }
+
+  if (blockedReason) {
+    const entry = await recordBlockedAiAttempt({
+      ...input,
+      sellerId,
+      moduleName,
+      inputTokens: 0,
+      outputTokens: 0,
+      blockedReason,
+      metadata: {
+        ...(input.metadata ?? {}),
+        generateEndpoint: true,
+        imageGeneration: true,
+        size,
+        estimatedCost,
+        providerConfigured: Boolean(env.OPENAI_API_KEY)
+      }
+    });
+
+    return {
+      ok: false,
+      blockedReason,
+      entry,
+      imageBase64: null,
+      message: "AI image generation blocked safely. No provider call executed."
+    };
+  }
+
+  const promptText = prompt ?? "";
+  const model = cleanText(input.modelName) ?? env.OPENAI_IMAGE_MODEL;
+  const provider = cleanText(input.provider) ?? cleanText(settings.defaultProvider) ?? "openai";
+
+  try {
+    const result = await callOpenAiImageGeneration({ prompt: promptText, size, model });
+
+    const { data, error } = await supabase
+      .from("ai_cost_ledger")
+      .insert({
+        seller_id: sellerId,
+        request_id: cleanText(input.requestId),
+        module_name: moduleName,
+        purpose: cleanText(input.purpose),
+        provider,
+        model_name: model,
+        input_tokens: 0,
+        output_tokens: 0,
+        estimated_cost: estimatedCost,
+        actual_cost: estimatedCost,
+        status: "COMPLETED",
+        blocked_reason: null,
+        metadata: {
+          ...(input.metadata ?? {}),
+          generateEndpoint: true,
+          imageGeneration: true,
+          size,
+          aiCallsEnabled: true,
+          externalAiCall: true
+        }
+      })
+      .select("*")
+      .single<AiCostLedgerRow>();
+
+    if (error || !data) throw new Error(error?.message ?? "Could not record AI image call result.");
+    const entry = toSafeLedger(data);
+
+    await safeRecordActivityLog({
+      sellerId,
+      eventType: "AI_GATEWAY_CALL_COMPLETED",
+      eventCategory: "AI_GATEWAY",
+      severity: "INFO",
+      actor: "system",
+      title: "AI image generation completed",
+      message: "AI image generation call completed successfully.",
+      sourceModule: "ai-gateway",
+      metadata: { requestId: entry.requestId, moduleName: entry.moduleName, actualCost: entry.actualCost, size }
+    });
+
+    return {
+      ok: true,
+      blockedReason: null,
+      entry,
+      imageBase64: result.base64,
+      message: "AI image generation completed."
+    };
+  } catch (callError) {
+    const failureReason = "AI_PROVIDER_CALL_FAILED";
+    const entry = await recordBlockedAiAttempt({
+      ...input,
+      sellerId,
+      moduleName,
+      inputTokens: 0,
+      outputTokens: 0,
+      blockedReason: failureReason,
+      metadata: {
+        ...(input.metadata ?? {}),
+        generateEndpoint: true,
+        imageGeneration: true,
+        size,
+        estimatedCost,
+        providerConfigured: true,
+        providerError: callError instanceof Error ? callError.message : "Unknown provider error"
+      }
+    });
+
+    return {
+      ok: false,
+      blockedReason: failureReason,
+      entry,
+      imageBase64: null,
+      message: "AI image generation failed when calling the provider. The attempt was recorded; no image was produced."
+    };
+  }
 }
 
 // Vision twin of generateAiResponse below: same guardrail/budget/ledger logic (security
