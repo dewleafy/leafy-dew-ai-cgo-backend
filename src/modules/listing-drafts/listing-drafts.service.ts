@@ -783,9 +783,15 @@ export async function createActionForListingDraft(draftId: string): Promise<{ ro
   return { row: toSafeDraft(updated), actionCreated: ensured.created, actionId: ensured.row.id };
 }
 
-export async function generateListingDrafts(sellerIdInput: string): Promise<ListingDraftGenerateResult> {
+export async function generateListingDrafts(sellerIdInput: string, options?: { sku?: string | null }): Promise<ListingDraftGenerateResult> {
   const sellerId = cleanText(sellerIdInput) ?? "default";
-  const products = await loadProductContexts(sellerId);
+  const skuFilter = normalizeKey(options?.sku ?? null);
+  const allProducts = await loadProductContexts(sellerId);
+  // Added 2026-10-15 for the Competitor Benchmark Tool's inline "Generate listing draft for this
+  // SKU" button: scoping to one product here (instead of always scanning the whole catalog) is
+  // what makes it reasonable to call this from a single SKU's card -- without this filter, one
+  // click would re-scan every product in the account just to get one SKU's draft.
+  const products = skuFilter ? allProducts.filter((product) => normalizeKey(product.sku) === skuFilter) : allProducts;
   const rows: SafeListingOptimizationDraft[] = [];
   let skippedCount = 0;
   let actionsCreated = 0;
@@ -899,6 +905,30 @@ export async function listListingDrafts(input: {
     // NO_DATA rows are internal bookkeeping markers (see EXTRACTION_ONLY_NO_DATA_STATUS above) --
     // they never had real proposed content and never got an approval action, so they're excluded
     // from every founder-facing list/count.
+    .neq("status", EXTRACTION_ONLY_NO_DATA_STATUS)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (error) throw new Error(error.message);
+  const rows = ((data ?? []) as ListingOptimizationDraftRow[]).map(toSafeDraft);
+  return attachProductImages(rows, sellerId);
+}
+
+// Added 2026-10-15 for the Competitor Benchmark Tool's inline listing-draft panel: fetches just
+// one SKU's drafts (any status except the internal NO_DATA marker) instead of the page-sized
+// catalog-wide list above, so that page can show a single SKU's draft without pulling in or
+// filtering through every other product's drafts.
+export async function listListingDraftsForSku(input: { sellerId: string; sku: string; limit?: number }): Promise<SafeListingOptimizationDraft[]> {
+  const sellerId = cleanText(input.sellerId) ?? "default";
+  const sku = cleanText(input.sku);
+  if (!sku) return [];
+  const limit = Math.min(Math.max(Math.floor(input.limit ?? 50), 1), 200);
+
+  const { data, error } = await supabase
+    .from("listing_optimization_drafts")
+    .select("*")
+    .eq("seller_id", sellerId)
+    .eq("sku", sku)
     .neq("status", EXTRACTION_ONLY_NO_DATA_STATUS)
     .order("created_at", { ascending: false })
     .limit(limit);
