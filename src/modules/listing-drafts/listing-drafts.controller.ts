@@ -5,7 +5,8 @@ import {
   createActionForListingDraft,
   generateListingDrafts,
   getListingDraftSummary,
-  listListingDrafts
+  listListingDrafts,
+  listListingDraftsForSku
 } from "./listing-drafts.service";
 
 function sellerIdFromQuery(req: Request): string {
@@ -49,8 +50,27 @@ export async function listListingDraftsRoute(req: Request, res: Response): Promi
 }
 
 export async function generateListingDraftsRoute(req: Request, res: Response): Promise<void> {
+  const body = (req.body ?? {}) as { sku?: unknown };
+  const sku = typeof body.sku === "string" && body.sku.trim() ? body.sku.trim() : null;
   try {
-    res.json(await generateListingDrafts(sellerIdFromQuery(req)));
+    res.json(await generateListingDrafts(sellerIdFromQuery(req), { sku }));
+  } catch (error) {
+    sendDraftError(res, error);
+  }
+}
+
+// Added 2026-10-15 for the Competitor Benchmark Tool's inline listing-draft panel (see
+// listListingDraftsForSku in listing-drafts.service.ts).
+export async function listListingDraftsForSkuRoute(req: Request, res: Response): Promise<void> {
+  const sellerId = sellerIdFromQuery(req);
+  const sku = typeof req.query.sku === "string" ? req.query.sku.trim() : "";
+  if (!sku) {
+    res.status(400).json({ ok: false, message: "sku query parameter is required." });
+    return;
+  }
+  try {
+    const rows = await listListingDraftsForSku({ sellerId, sku, limit: limitFromQuery(req) });
+    res.json({ ok: true, sellerId, sku, count: rows.length, rows });
   } catch (error) {
     sendDraftError(res, error);
   }
