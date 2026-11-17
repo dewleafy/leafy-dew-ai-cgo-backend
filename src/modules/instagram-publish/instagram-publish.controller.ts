@@ -11,6 +11,7 @@ const testPostSchema = z.object({
     .refine((value) => /\.(jpe?g)(\?.*)?$/i.test(value), "Instagram needs a JPEG image (.jpg or .jpeg)"),
   caption: z.string().trim().min(1).max(2200),
   confirm: z.literal("POST_NOW"),
+  title: z.string().trim().min(1).max(120).optional(),
   sellerId: z.string().trim().min(1).optional().default("default")
 });
 
@@ -35,6 +36,7 @@ export async function instagramTestPostController(req: Request, res: Response): 
     const result = await publishInstagramTestPhoto({
       imageUrl: parsed.data.imageUrl,
       caption: parsed.data.caption,
+      title: parsed.data.title,
       sellerId: parsed.data.sellerId
     });
     res.status(201).json({ ok: true, ...result });

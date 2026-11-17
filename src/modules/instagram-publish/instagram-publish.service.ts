@@ -66,6 +66,7 @@ export async function getInstagramStatus(): Promise<InstagramStatus> {
 export async function publishInstagramTestPhoto(input: {
   imageUrl: string;
   caption: string;
+  title?: string;
   sellerId: string;
 }): Promise<{ mediaId: string; permalink: string | null; logId: string }> {
   const { token, userId, publishEnabled } = getConfig();
@@ -136,14 +137,14 @@ export async function publishInstagramTestPhoto(input: {
     const logRow = await createSocialContentLogEntry({
       sellerId: input.sellerId,
       platform: "INSTAGRAM",
-      contentType: "Test post",
-      title: "Test post (publishing check)",
+      contentType: "Photo",
+      title: input.title ?? "Instagram post",
       sku: null,
       asin: null,
       status: "POSTED",
       plannedDate: today,
       postedDate: today,
-      notes: `Test post published through the API. Media id ${mediaId}.${permalink ? ` ${permalink}` : ""}`
+      notes: `Published through the API. Media id ${mediaId}.${permalink ? ` ${permalink}` : ""}`
     });
 
     return { mediaId, permalink, logId: logRow.id };
