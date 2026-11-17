@@ -1,0 +1,153 @@
+import axios from "axios";
+import { createSocialContentLogEntry } from "../social-content-log/social-content-log.service";
+
+// Publishes one photo to the connected Instagram professional account through the Instagram API
+// (Facebook Login for Business / system-user token). Only runs when INSTAGRAM_PUBLISH_ENABLED=true.
+// The token is read from INSTAGRAM_ACCESS_TOKEN and is never logged or returned.
+
+const GRAPH_VERSION = process.env.INSTAGRAM_GRAPH_VERSION?.trim() || "v27.0";
+const GRAPH_BASE = `https://graph.facebook.com/${GRAPH_VERSION}`;
+
+export type InstagramStatus = {
+  configured: boolean;
+  publishEnabled: boolean;
+  hasToken: boolean;
+  hasUserId: boolean;
+  username: string | null;
+  error: string | null;
+};
+
+function getConfig() {
+  const token = process.env.INSTAGRAM_ACCESS_TOKEN?.trim() ?? "";
+  const userId = process.env.INSTAGRAM_USER_ID?.trim() ?? "";
+  const publishEnabled = process.env.INSTAGRAM_PUBLISH_ENABLED?.trim().toLowerCase() === "true";
+  return { token, userId, publishEnabled };
+}
+
+function metaErrorMessage(error: unknown): string {
+  if (axios.isAxiosError(error)) {
+    const metaError = (error.response?.data as { error?: { message?: string; code?: number } } | undefined)?.error;
+    if (metaError?.message) {
+      return `Instagram said: ${metaError.message}${metaError.code ? ` (code ${metaError.code})` : ""}`;
+    }
+    return `Instagram request failed (${error.response?.status ?? "no response"}).`;
+  }
+  return error instanceof Error ? error.message : "Unknown Instagram error.";
+}
+
+export async function getInstagramStatus(): Promise<InstagramStatus> {
+  const { token, userId, publishEnabled } = getConfig();
+  const status: InstagramStatus = {
+    configured: Boolean(token && userId),
+    publishEnabled,
+    hasToken: Boolean(token),
+    hasUserId: Boolean(userId),
+    username: null,
+    error: null
+  };
+
+  if (!status.configured) {
+    return status;
+  }
+
+  try {
+    const res = await axios.get(`${GRAPH_BASE}/${encodeURIComponent(userId)}`, {
+      params: { fields: "username", access_token: token },
+      timeout: 15000
+    });
+    status.username = typeof res.data?.username === "string" ? res.data.username : null;
+  } catch (error) {
+    status.error = metaErrorMessage(error);
+  }
+
+  return status;
+}
+
+export async function publishInstagramTestPhoto(input: {
+  imageUrl: string;
+  caption: string;
+  sellerId: string;
+}): Promise<{ mediaId: string; permalink: string | null; logId: string }> {
+  const { token, userId, publishEnabled } = getConfig();
+
+  if (!publishEnabled) {
+    throw new Error("Instagram publishing is switched off. Set INSTAGRAM_PUBLISH_ENABLED=true to allow a test post.");
+  }
+  if (!token || !userId) {
+    throw new Error("Instagram is not configured. Set INSTAGRAM_ACCESS_TOKEN and INSTAGRAM_USER_ID.");
+  }
+
+  try {
+    // 1. Create the media container. Instagram downloads the image from the public URL.
+    const container = await axios.post(
+      `${GRAPH_BASE}/${encodeURIComponent(userId)}/media`,
+      new URLSearchParams({ image_url: input.imageUrl, caption: input.caption, access_token: token }),
+      { timeout: 30000 }
+    );
+    const creationId = String(container.data?.id ?? "");
+    if (!creationId) {
+      throw new Error("Instagram did not return a media container id.");
+    }
+
+    // 2. Wait until the container is ready (photos are usually instant).
+    let ready = false;
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      const check = await axios.get(`${GRAPH_BASE}/${encodeURIComponent(creationId)}`, {
+        params: { fields: "status_code", access_token: token },
+        timeout: 15000
+      });
+      const code = String(check.data?.status_code ?? "");
+      if (code === "FINISHED") {
+        ready = true;
+        break;
+      }
+      if (code === "ERROR" || code === "EXPIRED") {
+        throw new Error(`Instagram could not process the image (${code}).`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+    if (!ready) {
+      throw new Error("Instagram did not finish processing the image in time. Nothing was published.");
+    }
+
+    // 3. Publish.
+    const published = await axios.post(
+      `${GRAPH_BASE}/${encodeURIComponent(userId)}/media_publish`,
+      new URLSearchParams({ creation_id: creationId, access_token: token }),
+      { timeout: 30000 }
+    );
+    const mediaId = String(published.data?.id ?? "");
+    if (!mediaId) {
+      throw new Error("Instagram did not return a published media id.");
+    }
+
+    let permalink: string | null = null;
+    try {
+      const info = await axios.get(`${GRAPH_BASE}/${encodeURIComponent(mediaId)}`, {
+        params: { fields: "permalink", access_token: token },
+        timeout: 15000
+      });
+      permalink = typeof info.data?.permalink === "string" ? info.data.permalink : null;
+    } catch {
+      permalink = null;
+    }
+
+    const today = new Date().toISOString().slice(0, 10);
+    const logRow = await createSocialContentLogEntry({
+      sellerId: input.sellerId,
+      platform: "INSTAGRAM",
+      contentType: "Test post",
+      title: "Test post (publishing check)",
+      sku: null,
+      asin: null,
+      status: "POSTED",
+      plannedDate: today,
+      postedDate: today,
+      notes: `Test post published through the API. Media id ${mediaId}.${permalink ? ` ${permalink}` : ""}`
+    });
+
+    return { mediaId, permalink, logId: logRow.id };
+  } catch (error) {
+    throw new Error(metaErrorMessage(error));
+  }
+}
