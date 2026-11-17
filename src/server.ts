@@ -63,6 +63,7 @@ import { schedulerControlRouter } from "./modules/scheduler-control/scheduler-co
 import { securityGuardrailsRouter } from "./modules/security-guardrails/security-guardrails.routes";
 import { socialContentLogRouter } from "./modules/social-content-log/social-content-log.routes";
 import { socialDraftsRouter } from "./modules/social-drafts/social-drafts.routes";
+import { instagramPublishRouter } from "./modules/instagram-publish/instagram-publish.routes";
 import { todayCommandRouter } from "./modules/today-command/today-command.routes";
 import { asyncHandler } from "./utils/async-handler";
 import { logger } from "./utils/logger";
@@ -260,6 +261,7 @@ app.get("/api/listings", asyncHandler(listAmazonSpListingsController));
 app.use("/api/production-health", productionHealthRouter);
 app.use("/api/social-content-log", socialContentLogRouter);
 app.use("/api/social-drafts", socialDraftsRouter);
+app.use("/api/instagram", instagramPublishRouter);
 app.use("/api/maintenance", maintenanceRouter);
 app.use("/api/qa-smoke", qaSmokeRouter);
 app.use("/api/recommendation-outcomes", recommendationOutcomeRoutes);
