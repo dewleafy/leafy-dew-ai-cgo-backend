@@ -29,6 +29,44 @@ function cleanName(title: string | null, family: string | null): string {
 }
 
 // Public: returns only products marked OK. Never returns SKU, notes or internal status.
+export async function getFeaturedAsin(brand: string): Promise<string | null> {
+  const { data, error } = await supabase
+    .from("social_products")
+    .select("asin")
+    .eq("seller_id", "default")
+    .eq("brand", brand)
+    .eq("post_status", "OK")
+    .not("featured_at", "is", null)
+    .order("featured_at", { ascending: false })
+    .limit(1);
+  if (error) throw new Error(error.message);
+  return (data as { asin: string }[] | null)?.[0]?.asin ?? null;
+}
+
+// Owner action: feature one OK product on the shop page, or clear it with null.
+export async function setFeaturedProduct(asin: string | null, brand = "Leafy Dew"): Promise<boolean> {
+  if (asin === null) {
+    const { error } = await supabase
+      .from("social_products")
+      .update({ featured_at: null })
+      .eq("seller_id", "default")
+      .eq("brand", brand)
+      .not("featured_at", "is", null);
+    if (error) throw new Error(error.message);
+    return true;
+  }
+  const { data, error } = await supabase
+    .from("social_products")
+    .update({ featured_at: new Date().toISOString() })
+    .eq("seller_id", "default")
+    .eq("brand", brand)
+    .eq("asin", asin)
+    .eq("post_status", "OK")
+    .select("asin");
+  if (error) throw new Error(error.message);
+  return (data ?? []).length > 0;
+}
+
 export async function listShopItems(brand: string): Promise<ShopItem[]> {
   const { data, error } = await supabase
     .from("social_products")

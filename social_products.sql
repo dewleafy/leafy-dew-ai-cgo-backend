@@ -24,3 +24,6 @@ create table if not exists public.social_products (
 
 create index if not exists idx_social_products_seller_family on public.social_products (seller_id, family);
 alter table public.social_products enable row level security;
+
+-- Product featured at the top of the public /shop page (latest featured_at wins).
+alter table public.social_products add column if not exists featured_at timestamptz null;
