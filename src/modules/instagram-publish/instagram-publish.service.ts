@@ -152,3 +152,84 @@ export async function publishInstagramTestPhoto(input: {
     throw new Error(metaErrorMessage(error));
   }
 }
+
+async function waitForContainer(creationId: string, token: string): Promise<void> {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const check = await axios.get(`${GRAPH_BASE}/${encodeURIComponent(creationId)}`, {
+      params: { fields: "status_code", access_token: token },
+      timeout: 15000
+    });
+    const code = String(check.data?.status_code ?? "");
+    if (code === "FINISHED") return;
+    if (code === "ERROR" || code === "EXPIRED") throw new Error(`Instagram could not process the image (${code}).`);
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+  throw new Error("Instagram did not finish processing in time. Nothing was published.");
+}
+
+// Publishes one photo, or a carousel when 2 or more image URLs are given. Used by the auto-poster.
+// Does not write the post log: the caller does that. Refuses to run unless publishing is switched on.
+export async function publishInstagramPost(input: {
+  imageUrls: string[];
+  caption: string;
+}): Promise<{ mediaId: string; permalink: string | null }> {
+  const { token, userId, publishEnabled } = getConfig();
+  if (!publishEnabled) throw new Error("Instagram publishing is switched off (INSTAGRAM_PUBLISH_ENABLED is not true).");
+  if (!token || !userId) throw new Error("Instagram is not configured.");
+  if (input.imageUrls.length === 0) throw new Error("No images to publish.");
+
+  try {
+    let creationId: string;
+    if (input.imageUrls.length === 1) {
+      const container = await axios.post(
+        `${GRAPH_BASE}/${encodeURIComponent(userId)}/media`,
+        new URLSearchParams({ image_url: input.imageUrls[0], caption: input.caption, access_token: token }),
+        { timeout: 30000 }
+      );
+      creationId = String(container.data?.id ?? "");
+    } else {
+      const children: string[] = [];
+      for (const url of input.imageUrls.slice(0, 10)) {
+        const child = await axios.post(
+          `${GRAPH_BASE}/${encodeURIComponent(userId)}/media`,
+          new URLSearchParams({ image_url: url, is_carousel_item: "true", access_token: token }),
+          { timeout: 30000 }
+        );
+        const childId = String(child.data?.id ?? "");
+        if (!childId) throw new Error("Instagram did not return a carousel item id.");
+        await waitForContainer(childId, token);
+        children.push(childId);
+      }
+      const parent = await axios.post(
+        `${GRAPH_BASE}/${encodeURIComponent(userId)}/media`,
+        new URLSearchParams({ media_type: "CAROUSEL", children: children.join(","), caption: input.caption, access_token: token }),
+        { timeout: 30000 }
+      );
+      creationId = String(parent.data?.id ?? "");
+    }
+    if (!creationId) throw new Error("Instagram did not return a media container id.");
+    await waitForContainer(creationId, token);
+
+    const published = await axios.post(
+      `${GRAPH_BASE}/${encodeURIComponent(userId)}/media_publish`,
+      new URLSearchParams({ creation_id: creationId, access_token: token }),
+      { timeout: 30000 }
+    );
+    const mediaId = String(published.data?.id ?? "");
+    if (!mediaId) throw new Error("Instagram did not return a published media id.");
+
+    let permalink: string | null = null;
+    try {
+      const info = await axios.get(`${GRAPH_BASE}/${encodeURIComponent(mediaId)}`, {
+        params: { fields: "permalink", access_token: token },
+        timeout: 15000
+      });
+      permalink = typeof info.data?.permalink === "string" ? info.data.permalink : null;
+    } catch {
+      permalink = null;
+    }
+    return { mediaId, permalink };
+  } catch (error) {
+    throw new Error(metaErrorMessage(error));
+  }
+}

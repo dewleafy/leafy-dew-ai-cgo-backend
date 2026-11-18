@@ -67,6 +67,8 @@ import { instagramPublishRouter } from "./modules/instagram-publish/instagram-pu
 import { socialMediaRouter } from "./modules/social-media/social-media.routes";
 import { publicShopRouter, shopFeatureRouter } from "./modules/public-shop/public-shop.routes";
 import { socialWriterRouter } from "./modules/social-writer/social-writer.routes";
+import { socialAutopostRouter } from "./modules/social-autopost/social-autopost.routes";
+import { startSocialAutopostScheduler } from "./modules/social-autopost/social-autopost.service";
 import { todayCommandRouter } from "./modules/today-command/today-command.routes";
 import { asyncHandler } from "./utils/async-handler";
 import { logger } from "./utils/logger";
@@ -269,6 +271,7 @@ app.use("/api/instagram", instagramPublishRouter);
 app.use("/api/social-media", socialMediaRouter);
 app.use("/api/shop-feature", shopFeatureRouter);
 app.use("/api/social-writer", socialWriterRouter);
+app.use("/api/social-autopost", socialAutopostRouter);
 app.use("/api/maintenance", maintenanceRouter);
 app.use("/api/qa-smoke", qaSmokeRouter);
 app.use("/api/recommendation-outcomes", recommendationOutcomeRoutes);
@@ -314,4 +317,5 @@ app.listen(port, () => {
   }
   startBackgroundAmazonSyncScheduler();
   startAmazonFeeConfigScheduler();
+  startSocialAutopostScheduler();
 });

@@ -1,0 +1,4 @@
+-- Applied in Supabase (migration social_autopost). Documented here for reference.
+-- social_autopost_settings: one row per seller, mode OFF | SHADOW | LIVE, shadow_started_at.
+-- social_autopost_log: one row per decision (WOULD_POST, POSTING, POSTED, FAILED, SKIPPED).
+-- Unique indexes make a draft impossible to post twice.
