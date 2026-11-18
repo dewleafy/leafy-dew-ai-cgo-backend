@@ -13,19 +13,34 @@ const PREFIXES = [/^leafy\s*dew\s*-\s*connecting people with nature\s*/i, /^leaf
 function cleanName(title: string | null, family: string | null): string {
   let name = (title ?? "").replace(/\s+/g, " ").trim();
   for (const prefix of PREFIXES) name = name.replace(prefix, "").trim();
-  name = name.replace(/terririum/gi, "Terrarium");
+  name = name.replace(/terririum/gi, "Terrarium").replace(/connecting people with nature\s*/gi, "").trim();
 
   if (family === "Wall propagation station") {
     const design = name.match(/\(([^)]+)\)\s*$/)?.[1]?.trim();
     return design ? `Wall Propagation Station, ${design}` : "Wall Propagation Station";
   }
 
-  name = name.replace(/\s*\|\s*.*$/, "").trim();
-  if (name.length > 80) {
-    const cut = name.slice(0, 80);
-    name = cut.slice(0, Math.max(cut.lastIndexOf(" "), 40)).replace(/[,\-–:|]+$/, "").trim();
+  // The last bracket is usually the variant (colour, design). Size and pack brackets are not.
+  let variant: string | null = null;
+  const tail = name.match(/\(([^()]+)\)\s*$/);
+  if (tail && !/\b(pack of|set of|inch|inches|tealight candles)\b/i.test(tail[1])) {
+    variant = tail[1].trim();
+    name = name.slice(0, tail.index).trim();
   }
-  return name || "Leafy Dew product";
+  const code = name.match(/\s*(L-D-C-G-P-\d+)\s*$/i);
+  if (code) {
+    if (!variant) variant = code[1];
+    name = name.slice(0, code.index).trim();
+  }
+
+  name = name.replace(/\s*\|\s*.*$/, "").replace(/\s*\([^)]*(pack of|set of|inch)[^)]*\)\s*/gi, " ").replace(/\s+/g, " ").trim();
+  if (name.length > 62) {
+    const cut = name.slice(0, 62);
+    name = cut.slice(0, Math.max(cut.lastIndexOf(" "), 36)).replace(/[,\-–:|]+$/, "").trim();
+    name = name.replace(/(\s+(with|and|for|of|the|a|in|on|to|fairy|white|warm))+$/i, "").replace(/[,\-–:|]+$/, "").trim();
+  }
+  name = name.replace(/^\(\s*\d+\s*inch\)\s*/i, "").trim() || "Leafy Dew product";
+  return variant ? `${name} (${variant})` : name;
 }
 
 // Public: returns only products marked OK. Never returns SKU, notes or internal status.
