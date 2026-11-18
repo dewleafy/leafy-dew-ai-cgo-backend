@@ -65,6 +65,7 @@ import { socialContentLogRouter } from "./modules/social-content-log/social-cont
 import { socialDraftsRouter } from "./modules/social-drafts/social-drafts.routes";
 import { instagramPublishRouter } from "./modules/instagram-publish/instagram-publish.routes";
 import { socialMediaRouter } from "./modules/social-media/social-media.routes";
+import { publicShopRouter } from "./modules/public-shop/public-shop.routes";
 import { todayCommandRouter } from "./modules/today-command/today-command.routes";
 import { asyncHandler } from "./utils/async-handler";
 import { logger } from "./utils/logger";
@@ -108,6 +109,7 @@ app.use(express.json());
 // Founder login. /api/auth/* stays open; everything else under /api needs a token once
 // APP_PASSWORD is set (see modules/auth). /health stays open for Railway.
 app.use("/api/auth", authRouter);
+app.use("/api/public/shop", publicShopRouter);
 app.use("/api", requireAuth);
 
 function getSupabaseKeyPrefix(key: string | undefined): "sb_secret" | "sb_publishable" | "jwt" | "other" | "missing" {
