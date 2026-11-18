@@ -244,7 +244,10 @@ const ALLOWED_FUTURE_MODULES = new Set([
   // (requestCompetitorBenchmarkImageMockup in competitor-benchmark.service.ts). As with
   // LISTING_OPTIMIZER above, this seller's ai_gateway_settings.allowed_modules in Supabase must
   // ALSO include this module name -- both allow-lists are required.
-  "COMPETITOR_BENCHMARK_IMAGE_MOCKUP"
+  "COMPETITOR_BENCHMARK_IMAGE_MOCKUP",
+  // Added 2026-11-19 for the Social Media caption writer (social-writer module). This seller's
+  // ai_gateway_settings.allowed_modules also includes it.
+  "SOCIAL_WRITER"
 ]);
 
 async function sumEstimatedCostSince(sellerId: string, sinceIso: string): Promise<number> {

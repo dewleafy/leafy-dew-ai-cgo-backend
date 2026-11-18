@@ -25,6 +25,8 @@ function toSafeDraft(row: SocialDraftRow): SafeSocialDraft {
     hashtags: row.hashtags,
     creativeBrief: row.creative_brief,
     checks: row.checks,
+    productAsin: row.product_asin ?? null,
+    imageUrls: Array.isArray(row.image_urls) ? row.image_urls.filter((u): u is string => typeof u === "string") : [],
     status: row.status,
     decisionNote: row.decision_note,
     decidedAt: row.decided_at,
