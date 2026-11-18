@@ -15,6 +15,8 @@ export type SocialDraftRow = {
   hashtags: string | null;
   creative_brief: string | null;
   checks: string | null;
+  product_asin?: string | null;
+  image_urls?: unknown;
   status: SocialDraftStatus;
   decision_note: string | null;
   decided_at: string | null;
@@ -35,6 +37,8 @@ export type SafeSocialDraft = {
   hashtags: string | null;
   creativeBrief: string | null;
   checks: string | null;
+  productAsin: string | null;
+  imageUrls: string[];
   status: SocialDraftStatus;
   decisionNote: string | null;
   decidedAt: string | null;

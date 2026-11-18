@@ -66,6 +66,7 @@ import { socialDraftsRouter } from "./modules/social-drafts/social-drafts.routes
 import { instagramPublishRouter } from "./modules/instagram-publish/instagram-publish.routes";
 import { socialMediaRouter } from "./modules/social-media/social-media.routes";
 import { publicShopRouter, shopFeatureRouter } from "./modules/public-shop/public-shop.routes";
+import { socialWriterRouter } from "./modules/social-writer/social-writer.routes";
 import { todayCommandRouter } from "./modules/today-command/today-command.routes";
 import { asyncHandler } from "./utils/async-handler";
 import { logger } from "./utils/logger";
@@ -267,6 +268,7 @@ app.use("/api/social-drafts", socialDraftsRouter);
 app.use("/api/instagram", instagramPublishRouter);
 app.use("/api/social-media", socialMediaRouter);
 app.use("/api/shop-feature", shopFeatureRouter);
+app.use("/api/social-writer", socialWriterRouter);
 app.use("/api/maintenance", maintenanceRouter);
 app.use("/api/qa-smoke", qaSmokeRouter);
 app.use("/api/recommendation-outcomes", recommendationOutcomeRoutes);

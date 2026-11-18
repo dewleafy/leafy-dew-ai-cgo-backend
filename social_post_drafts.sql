@@ -34,3 +34,7 @@ create index if not exists idx_social_post_drafts_status
   on public.social_post_drafts (status);
 
 alter table public.social_post_drafts enable row level security;
+
+-- Product and photos used by a draft (added with the photo-post writer).
+alter table public.social_post_drafts add column if not exists product_asin text null;
+alter table public.social_post_drafts add column if not exists image_urls jsonb not null default '[]'::jsonb;
