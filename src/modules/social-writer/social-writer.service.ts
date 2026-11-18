@@ -167,7 +167,7 @@ export async function writeNextDrafts(input: { sellerId: string; days: number; l
           purpose: "Instagram caption draft",
           prompt: buildPrompt({ product, bullets, occasion, idea: plan.idea, format: isCarousel ? "carousel of 3 photos" : "single photo", fix }),
           maxOutputTokens: 500,
-          actor: "social-writer",
+          actor: "founder",
           metadata: { asin: product.asin, logId: log.id }
         });
         if (!ai.ok || !ai.output) {
