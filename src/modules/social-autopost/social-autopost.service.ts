@@ -1,6 +1,7 @@
 import { supabase } from "../../db/supabase";
 import { logger } from "../../utils/logger";
 import { publishInstagramPost } from "../instagram-publish/instagram-publish.service";
+import { prepareUpcomingMedia } from "../creative-studio/creative-studio.service";
 
 // Posts approved drafts on their planned day and time (IST).
 // Modes: OFF = does nothing. SHADOW = checks everything and records "would post", publishes nothing.
@@ -21,6 +22,7 @@ type Draft = {
   hashtags: string | null;
   product_asin: string | null;
   image_urls: unknown;
+  video_url: string | null;
 };
 
 function istNow(): { date: string; minutes: number } {
@@ -85,8 +87,11 @@ function imagesOf(d: Draft): string[] {
 
 async function problemWith(d: Draft): Promise<string | null> {
   const images = imagesOf(d);
-  if (images.length === 0) return "No photo attached to this draft yet";
-  if (images.some((u) => !u.startsWith("https://") || !/\.jpe?g(\?.*)?$/i.test(u))) return "Photo is not a public JPEG link";
+  if (/reel/i.test(d.format ?? "")) {
+    if (!d.video_url) return "Reel video not made yet";
+    if (!d.video_url.startsWith("https://") || !/\.mp4(\?.*)?$/i.test(d.video_url)) return "Video is not a public MP4 link";
+  } else if (images.length === 0) return "No photo attached to this draft yet";
+  if (!d.video_url && images.some((u) => !u.startsWith("https://") || !/\.jpe?g(\?.*)?$/i.test(u))) return "Photo is not a public JPEG link";
   if (d.product_asin) {
     const { data } = await supabase.from("social_products").select("post_status,listing_status").eq("seller_id", SELLER).eq("asin", d.product_asin).maybeSingle();
     const p = data as { post_status: string; listing_status: string } | null;
@@ -103,7 +108,7 @@ export async function runAutopostOnce(): Promise<string> {
 
   const { data: drafts, error } = await supabase
     .from("social_post_drafts")
-    .select("id,content_log_id,planned_date,slot_time,format,caption,hashtags,product_asin,image_urls")
+    .select("id,content_log_id,planned_date,slot_time,format,caption,hashtags,product_asin,image_urls,video_url")
     .eq("seller_id", SELLER)
     .eq("platform", "INSTAGRAM")
     .eq("status", "APPROVED")
@@ -129,7 +134,7 @@ export async function runAutopostOnce(): Promise<string> {
     const images = imagesOf(d);
 
     if (settings.mode === "SHADOW") {
-      const fresh = await record(d.id, "SHADOW", "WOULD_POST", `Would post ${images.length > 1 ? `a ${images.length}-photo carousel` : "1 photo"} at ${d.slot_time ?? "12:30"} IST. Nothing was published.`);
+      const fresh = await record(d.id, "SHADOW", "WOULD_POST", `Would post ${d.video_url ? "a Reel" : images.length > 1 ? `a ${images.length}-photo carousel` : "1 photo"} at ${d.slot_time ?? "12:30"} IST. Nothing was published.`);
       if (fresh) logger.info("Autopost shadow: would post.", { draftId: d.id });
       continue;
     }
@@ -139,7 +144,7 @@ export async function runAutopostOnce(): Promise<string> {
     const claimed = await record(d.id, "LIVE", "POSTING", "Posting now");
     if (!claimed) continue;
     try {
-      const out = await publishInstagramPost({ imageUrls: images, caption });
+      const out = await publishInstagramPost({ imageUrls: images, videoUrl: /reel/i.test(d.format ?? "") ? d.video_url : null, caption });
       await supabase.from("social_autopost_log").update({ outcome: "POSTED", message: "Posted.", media_id: out.mediaId, permalink: out.permalink }).eq("draft_id", d.id).eq("outcome", "POSTING");
       if (d.content_log_id) {
         await supabase.from("social_content_log").update({ status: "POSTED", posted_date: now.date, notes: `Auto-posted. Media id ${out.mediaId}. ${out.permalink ?? ""}`.trim() }).eq("id", d.content_log_id);
@@ -164,7 +169,7 @@ export function startSocialAutopostScheduler(): void {
     const tick = () => {
       if (running) return;
       running = true;
-      runAutopostOnce().catch((e) => logger.error("Autopost check failed.", { message: e instanceof Error ? e.message : String(e) })).finally(() => { running = false; });
+      prepareUpcomingMedia().then(() => runAutopostOnce()).catch((e) => logger.error("Autopost check failed.", { message: e instanceof Error ? e.message : String(e) })).finally(() => { running = false; });
     };
     tick();
     setInterval(tick, 5 * 60 * 1000);

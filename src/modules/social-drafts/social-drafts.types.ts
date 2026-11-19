@@ -17,6 +17,8 @@ export type SocialDraftRow = {
   checks: string | null;
   product_asin?: string | null;
   image_urls?: unknown;
+  video_url?: string | null;
+  media_note?: string | null;
   status: SocialDraftStatus;
   decision_note: string | null;
   decided_at: string | null;
@@ -39,6 +41,8 @@ export type SafeSocialDraft = {
   checks: string | null;
   productAsin: string | null;
   imageUrls: string[];
+  videoUrl: string | null;
+  mediaNote: string | null;
   status: SocialDraftStatus;
   decisionNote: string | null;
   decidedAt: string | null;

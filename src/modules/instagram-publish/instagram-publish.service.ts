@@ -171,16 +171,33 @@ async function waitForContainer(creationId: string, token: string): Promise<void
 // Does not write the post log: the caller does that. Refuses to run unless publishing is switched on.
 export async function publishInstagramPost(input: {
   imageUrls: string[];
+  videoUrl?: string | null;
   caption: string;
 }): Promise<{ mediaId: string; permalink: string | null }> {
   const { token, userId, publishEnabled } = getConfig();
   if (!publishEnabled) throw new Error("Instagram publishing is switched off (INSTAGRAM_PUBLISH_ENABLED is not true).");
   if (!token || !userId) throw new Error("Instagram is not configured.");
-  if (input.imageUrls.length === 0) throw new Error("No images to publish.");
+  if (input.imageUrls.length === 0 && !input.videoUrl) throw new Error("No media to publish.");
 
   try {
     let creationId: string;
-    if (input.imageUrls.length === 1) {
+    if (input.videoUrl) {
+      const reel = await axios.post(
+        `${GRAPH_BASE}/${encodeURIComponent(userId)}/media`,
+        new URLSearchParams({ media_type: "REELS", video_url: input.videoUrl, caption: input.caption, share_to_feed: "true", access_token: token }),
+        { timeout: 30000 }
+      );
+      creationId = String(reel.data?.id ?? "");
+      if (!creationId) throw new Error("Instagram did not return a media container id.");
+      for (let attempt = 0; attempt < 60; attempt += 1) {
+        const check = await axios.get(`${GRAPH_BASE}/${encodeURIComponent(creationId)}`, { params: { fields: "status_code", access_token: token }, timeout: 15000 });
+        const code = String(check.data?.status_code ?? "");
+        if (code === "FINISHED") break;
+        if (code === "ERROR" || code === "EXPIRED") throw new Error(`Instagram could not process the video (${code}).`);
+        if (attempt === 59) throw new Error("Instagram did not finish processing the video in time. Nothing was published.");
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+      }
+    } else if (input.imageUrls.length === 1) {
       const container = await axios.post(
         `${GRAPH_BASE}/${encodeURIComponent(userId)}/media`,
         new URLSearchParams({ image_url: input.imageUrls[0], caption: input.caption, access_token: token }),
@@ -208,7 +225,7 @@ export async function publishInstagramPost(input: {
       creationId = String(parent.data?.id ?? "");
     }
     if (!creationId) throw new Error("Instagram did not return a media container id.");
-    await waitForContainer(creationId, token);
+    if (!input.videoUrl) await waitForContainer(creationId, token);
 
     const published = await axios.post(
       `${GRAPH_BASE}/${encodeURIComponent(userId)}/media_publish`,
