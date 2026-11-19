@@ -101,6 +101,44 @@ function buildPrompt(input: { product: Product; bullets: string[]; occasion: str
   ].filter(Boolean).join("\n");
 }
 
+
+const KNOWN_LANGS = ["Hindi", "Tamil", "Telugu", "Gujarati", "Bengali", "Kannada", "Malayalam", "Punjabi", "Marathi"];
+
+function greetingLanguages(idea: string): string[] {
+  const m = /wish in ([^.|]+)/i.exec(idea);
+  const found = m ? KNOWN_LANGS.filter((l) => new RegExp(`\\b${l}\\b`, "i").test(m[1])) : [];
+  return found.length ? found : ["Hindi"];
+}
+
+function buildGreetingPrompt(input: { festival: string; langs: string[]; fix: string[] }): string {
+  return [
+    "You write a short festival greeting for the Instagram account of Leafy Dew, an Indian home and garden decor brand.",
+    `Festival: ${input.festival}.`,
+    `Write one short, warm greeting sentence in each of these languages, in this order: ${[...input.langs, "English"].join(", ")}.`,
+    "Rules:",
+    "- Use only the standard, widely used greeting wording for this festival in each language. Keep it simple and correct. Do not translate word for word if a standard phrase exists.",
+    "- Native script for every language except English. English ends with: from all of us at Leafy Dew.",
+    "- No promises of wealth, luck, health or blessings that come true. No price, offer, product push or emoji.",
+    "- Also give 3 to 5 hashtags, such as #LeafyDew and a festival hashtag. No hashtags inside the sentences.",
+    input.fix.length ? `Your last attempt broke these rules: ${input.fix.join("; ")}. Fix them.` : "",
+    'Reply with only JSON: {"lines":[{"lang":"Hindi","text":"..."},{"lang":"English","text":"..."}],"hashtags":["#LeafyDew","#..."]}'
+  ].filter(Boolean).join("\n");
+}
+
+function parseGreetingJson(text: string): { lines: string[]; hashtags: string[] } | null {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+  try {
+    const data = JSON.parse(text.slice(start, end + 1)) as { lines?: { text?: unknown }[]; hashtags?: unknown };
+    const lines = Array.isArray(data.lines) ? data.lines.map((l) => String(l?.text ?? "").trim()).filter(Boolean) : [];
+    const tags = Array.isArray(data.hashtags) ? data.hashtags.map((t) => String(t).trim()).filter(Boolean).map((t) => (t.startsWith("#") ? t : `#${t}`)) : [];
+    return lines.length >= 2 ? { lines, hashtags: tags } : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function writeNextDrafts(input: { sellerId: string; days: number; limit: number }): Promise<WriterResult> {
   const result: WriterResult = { created: [], skipped: [], aiBlocked: null };
   const today = new Date().toISOString().slice(0, 10);
@@ -138,12 +176,69 @@ export async function writeNextDrafts(input: { sellerId: string; days: number; l
     if (hasDraft.has(log.id)) continue;
     const type = log.content_type ?? "";
     const isCarousel = /carousel/i.test(type);
+    const plan = parseNotes(log.notes);
+    if (/greeting/i.test(type)) {
+      if (/pitru|shraddh|amavasya|mourning/i.test(log.title ?? "")) {
+        result.skipped.push({ date: log.planned_date, reason: "Quiet day, no greeting written" });
+        continue;
+      }
+      const festival = (log.title ?? "Festival").replace(/\s*\(.*?\)/g, "").trim();
+      const approximate = /\(about\)/i.test(log.title ?? "");
+      const langs = greetingLanguages(plan.idea);
+      let gFix: string[] = [];
+      let greeting: { lines: string[]; hashtags: string[] } | null = null;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const ai = await generateAiResponse({
+          sellerId: input.sellerId,
+          moduleName: "SOCIAL_WRITER",
+          purpose: "Festival greeting draft",
+          prompt: buildGreetingPrompt({ festival, langs, fix: gFix }),
+          maxOutputTokens: 600,
+          actor: "founder",
+          metadata: { logId: log.id, festival }
+        });
+        if (!ai.ok || !ai.output) {
+          result.aiBlocked = ai.blockedReason ?? "AI_FAILED";
+          return result;
+        }
+        const parsed = parseGreetingJson(ai.output);
+        if (!parsed) { gFix = ["reply was not valid JSON"]; continue; }
+        const problems = checkCaption(parsed.lines.join("\n"), parsed.hashtags);
+        if (problems.length === 0) { greeting = parsed; break; }
+        gFix = problems;
+      }
+      if (!greeting) {
+        result.skipped.push({ date: log.planned_date, reason: `Greeting for ${festival} failed checks: ${gFix.join(", ")}` });
+        continue;
+      }
+      const { data: savedG, error: saveGError } = await supabase
+        .from("social_post_drafts")
+        .insert({
+          seller_id: input.sellerId,
+          content_log_id: log.id,
+          planned_date: log.planned_date,
+          slot_time: plan.slot,
+          platform: "INSTAGRAM",
+          format: "Greeting graphic",
+          occasion: approximate ? `${festival} (date to confirm)` : festival,
+          caption: greeting.lines.join("\n"),
+          hashtags: greeting.hashtags.join(" "),
+          creative_brief: "Greeting graphic is drawn automatically on the Leafy Dew template.",
+          checks: `Languages: ${[...langs, "English"].join(", ")}. AI-written standard greeting. Please read the languages you know before approving, and ask a native speaker for the others if you can.${approximate ? " The calendar date is approximate, confirm it before approving." : ""}`,
+          status: "DRAFT"
+        })
+        .select("id")
+        .single();
+      if (saveGError || !savedG) throw new Error(saveGError?.message ?? "Could not save draft.");
+      result.created.push({ draftId: (savedG as { id: string }).id, date: log.planned_date, product: festival, format: "Greeting" });
+      made += 1;
+      continue;
+    }
     if (!/feed photo/i.test(type) && !isCarousel) {
       result.skipped.push({ date: log.planned_date, reason: `${type || "This post type"} needs video, not built yet` });
       continue;
     }
 
-    const plan = parseNotes(log.notes);
     const wantedFamily = FAMILY_HINTS.find(([re]) => re.test(plan.familyText))?.[1] ?? null;
     let candidates = wantedFamily ? pool.filter((p) => p.family === wantedFamily) : [];
     if (candidates.length === 0) candidates = pool;

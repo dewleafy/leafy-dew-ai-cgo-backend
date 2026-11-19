@@ -1,14 +1,14 @@
 import { supabase } from "../../db/supabase";
 import { logger } from "../../utils/logger";
 import { MEDIA_BUCKET } from "../social-media/social-media.service";
-import { hasNonLatin, renderGreeting, stripEmoji } from "./render";
+import { renderGreeting, stripEmoji } from "./render";
 import { makeReelMp4 } from "./video";
 
 // Creative studio: makes the picture or video for approved drafts a day or two before they are due.
 // - Greeting graphics are drawn from the brand template.
 // - Reels are built from the product's Amazon listing photos.
 // - Photo and carousel posts get listing photos.
-// Greetings in Hindi or Tamil, or for a date still to be confirmed, are HELD until the owner checks them.
+// Greetings whose date is still marked to confirm are HELD. The owner's Approve is the release for language lines.
 
 type Draft = {
   id: string;
@@ -106,8 +106,8 @@ export async function prepareUpcomingMedia(opts: { forceIds?: string[]; days?: n
 
     try {
       if (/greeting/i.test(format)) {
-        if (!forced && (hasNonLatin(d.caption) || /confirm/i.test(d.occasion ?? ""))) {
-          await supabase.from("social_post_drafts").update({ media_note: "Held: greeting has Hindi or Tamil lines or a date still to confirm. Owner must check it, then run Prepare with this draft." }).eq("id", d.id);
+        if (!forced && /confirm/i.test(d.occasion ?? "")) {
+          await supabase.from("social_post_drafts").update({ media_note: "Held: the date is still to be confirmed. Owner must confirm it, then run Prepare with this draft." }).eq("id", d.id);
           report.held.push(label);
           continue;
         }

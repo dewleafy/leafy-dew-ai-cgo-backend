@@ -29,14 +29,23 @@ export function stripEmoji(text: string): string {
   return text.replace(/[\p{Extended_Pictographic}️‍]/gu, "").replace(/[ \t]+/g, " ").trim();
 }
 
+const SCRIPTS: [RegExp, string][] = [
+  [/[\u0900-\u097F]/, "Noto Sans Devanagari"],
+  [/[\u0B80-\u0BFF]/, "Noto Sans Tamil"],
+  [/[\u0C00-\u0C7F]/, "Noto Sans Telugu"],
+  [/[\u0A80-\u0AFF]/, "Noto Sans Gujarati"],
+  [/[\u0980-\u09FF]/, "Noto Sans Bengali"],
+  [/[\u0C80-\u0CFF]/, "Noto Sans Kannada"],
+  [/[\u0D00-\u0D7F]/, "Noto Sans Malayalam"],
+  [/[\u0A00-\u0A7F]/, "Noto Sans Gurmukhi"]
+];
+
 export function hasNonLatin(text: string): boolean {
-  return /[ऀ-ॿ஀-௿ఀ-౿ঀ-৿઀-૿]/.test(text);
+  return SCRIPTS.some(([re]) => re.test(text));
 }
 
 function fontFor(text: string): string {
-  if (/[ऀ-ॿ]/.test(text)) return "Noto Sans Devanagari";
-  if (/[஀-௿]/.test(text)) return "Noto Sans Tamil";
-  return "Poppins";
+  return SCRIPTS.find(([re]) => re.test(text))?.[1] ?? "Poppins";
 }
 
 function esc(text: string): string {
