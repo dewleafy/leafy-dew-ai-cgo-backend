@@ -1,6 +1,7 @@
 import { supabase } from "../../db/supabase";
 import { logger } from "../../utils/logger";
 import { publishInstagramPost } from "../instagram-publish/instagram-publish.service";
+import { syncComments } from "../social-comments/social-comments.service";
 import { prepareUpcomingMedia } from "../creative-studio/creative-studio.service";
 
 // Posts approved drafts on their planned day and time (IST).
@@ -163,12 +164,15 @@ export async function runAutopostOnce(): Promise<string> {
 }
 
 let running = false;
+let tickCount = 0;
 export function startSocialAutopostScheduler(): void {
   logger.info("Social auto-post scheduler starting, checks every 5 minutes.");
   setTimeout(() => {
     const tick = () => {
       if (running) return;
       running = true;
+      tickCount += 1;
+      if (tickCount % 6 === 1) syncComments().catch((e) => logger.warn("Comment check skipped.", { message: e instanceof Error ? e.message : String(e) }));
       prepareUpcomingMedia().then(() => runAutopostOnce()).catch((e) => logger.error("Autopost check failed.", { message: e instanceof Error ? e.message : String(e) })).finally(() => { running = false; });
     };
     tick();
