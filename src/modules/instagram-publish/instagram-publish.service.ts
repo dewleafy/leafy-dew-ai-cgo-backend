@@ -250,3 +250,46 @@ export async function publishInstagramPost(input: {
     throw new Error(metaErrorMessage(error));
   }
 }
+
+// ---- Comments (read recent comments, post a reply) ----
+
+export type IgComment = { id: string; mediaId: string; permalink: string | null; username: string | null; text: string; timestamp: string | null };
+
+export async function fetchRecentInstagramComments(mediaLimit = 8, commentLimit = 25): Promise<IgComment[]> {
+  const { token, userId } = getConfig();
+  if (!token || !userId) throw new Error("Instagram is not configured.");
+  try {
+    const media = await axios.get(`${GRAPH_BASE}/${encodeURIComponent(userId)}/media`, {
+      params: { fields: "id,permalink,timestamp", limit: mediaLimit, access_token: token },
+      timeout: 20000
+    });
+    const out: IgComment[] = [];
+    for (const m of (media.data?.data ?? []) as { id: string; permalink?: string }[]) {
+      const res = await axios.get(`${GRAPH_BASE}/${encodeURIComponent(m.id)}/comments`, {
+        params: { fields: "id,text,username,timestamp", limit: commentLimit, access_token: token },
+        timeout: 20000
+      });
+      for (const c of (res.data?.data ?? []) as { id: string; text?: string; username?: string; timestamp?: string }[]) {
+        if (c.id && c.text) out.push({ id: c.id, mediaId: m.id, permalink: m.permalink ?? null, username: c.username ?? null, text: c.text, timestamp: c.timestamp ?? null });
+      }
+    }
+    return out;
+  } catch (error) {
+    throw new Error(metaErrorMessage(error));
+  }
+}
+
+export async function replyToInstagramComment(commentId: string, message: string): Promise<string> {
+  const { token, publishEnabled } = getConfig();
+  if (!publishEnabled) throw new Error("Instagram posting is switched off (INSTAGRAM_PUBLISH_ENABLED is not true).");
+  try {
+    const res = await axios.post(
+      `${GRAPH_BASE}/${encodeURIComponent(commentId)}/replies`,
+      new URLSearchParams({ message, access_token: token }),
+      { timeout: 20000 }
+    );
+    return String(res.data?.id ?? "");
+  } catch (error) {
+    throw new Error(metaErrorMessage(error));
+  }
+}

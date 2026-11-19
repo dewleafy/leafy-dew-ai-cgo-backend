@@ -69,6 +69,8 @@ import { publicShopRouter, shopFeatureRouter } from "./modules/public-shop/publi
 import { socialWriterRouter } from "./modules/social-writer/social-writer.routes";
 import { socialAutopostRouter } from "./modules/social-autopost/social-autopost.routes";
 import { creativeStudioRouter } from "./modules/creative-studio/creative-studio.routes";
+import { socialCommentsRouter } from "./modules/social-comments/social-comments.routes";
+import { socialSummaryRouter } from "./modules/social-summary/social-summary.routes";
 import { startSocialAutopostScheduler } from "./modules/social-autopost/social-autopost.service";
 import { todayCommandRouter } from "./modules/today-command/today-command.routes";
 import { asyncHandler } from "./utils/async-handler";
@@ -274,6 +276,8 @@ app.use("/api/shop-feature", shopFeatureRouter);
 app.use("/api/social-writer", socialWriterRouter);
 app.use("/api/social-autopost", socialAutopostRouter);
 app.use("/api/creative-studio", creativeStudioRouter);
+app.use("/api/social-comments", socialCommentsRouter);
+app.use("/api/social-summary", socialSummaryRouter);
 app.use("/api/maintenance", maintenanceRouter);
 app.use("/api/qa-smoke", qaSmokeRouter);
 app.use("/api/recommendation-outcomes", recommendationOutcomeRoutes);
